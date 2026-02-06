@@ -7,11 +7,10 @@ description: "rch-mac plan interations"
 documents:
   readme: "/data/projects/rch-mac/README.md"
   spec: "/data/projects/rch-mac/PLAN.md"
-  implementation: /data/projects/rch-mac/IMPLEMENTATION.md
   implementation: "/data/projects/rch-mac/IMPLEMENTATION.md"
 
 oracle:
-  model: "5.2 Thinking"
+  model: "gpt-5.2-pro"
   thinking_time: heavy
 
 rounds:
