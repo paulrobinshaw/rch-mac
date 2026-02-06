@@ -143,7 +143,7 @@ class Config:
         if not self.cdp_recovery_ssh_host:
             self.cdp_recovery_ssh_host = os.environ.get(
                 "APR_CDP_RECOVERY_SSH_HOST", ""
-            ) or self.oracle_host
+            ) or f"paul@{self.oracle_host}"
 
         if not self.cdp_recovery_script_path:
             self.cdp_recovery_script_path = os.environ.get(
