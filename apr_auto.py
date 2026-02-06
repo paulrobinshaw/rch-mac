@@ -134,7 +134,7 @@ class Config:
                         pass
                 else:
                     self.oracle_host = host_env
-            if not self.oracle_host:
+            if not self.oracle_host and self.oracle_token:
                 self.oracle_host = DEFAULT_ORACLE_HOST
 
         if not self.notify_cmd:
@@ -306,6 +306,56 @@ def round_file(rounds_dir: Path, round_num: int) -> Path:
     return rounds_dir / f"round_{round_num}.md"
 
 
+def locate_round_file(
+    rounds_dir: Path,
+    round_num: int,
+    workflow_name: Optional[str],
+    logger: logging.Logger,
+) -> Optional[Path]:
+    """Find a round file even if output_dir doesn't match expectations."""
+    expected = round_file(rounds_dir, round_num)
+    if expected.exists():
+        return expected
+
+    candidates: List[Path] = []
+    rounds_root = Path(".apr/rounds")
+    if rounds_root.exists():
+        candidates = list(rounds_root.glob(f"**/round_{round_num}.md"))
+
+    if not candidates:
+        apr_root = Path(".apr")
+        if apr_root.exists():
+            candidates = list(apr_root.glob(f"**/round_{round_num}.md"))
+
+    if not candidates:
+        return None
+
+    selected: Optional[Path] = None
+    if workflow_name:
+        filtered = [c for c in candidates if workflow_name in c.parts]
+        if len(filtered) == 1:
+            selected = filtered[0]
+        elif len(filtered) > 1:
+            candidates = filtered
+
+    if selected is None and len(candidates) == 1:
+        selected = candidates[0]
+
+    if selected is None:
+        sample = ", ".join(str(c) for c in candidates[:5])
+        if len(candidates) > 5:
+            sample += ", ..."
+        logger.warning(
+            f"Round {round_num} found in multiple locations: {sample}"
+        )
+        return None
+
+    logger.warning(
+        f"Round {round_num} output not in expected dir; using {selected}"
+    )
+    return selected
+
+
 def metrics_file(workflow: str) -> Path:
     """Path to the analytics metrics file for a workflow."""
     return Path(f".apr/analytics/{workflow}/metrics.json")
@@ -396,6 +446,7 @@ def read_stability_score(
 def check_output_truncation(
     rounds_dir: Path,
     round_num: int,
+    workflow_name: Optional[str],
     output_sizes: List[int],
     logger: logging.Logger,
 ) -> bool:
@@ -407,8 +458,8 @@ def check_output_truncation(
     - Partial-word detection (GPT truncation cuts mid-word)
     - Relative size comparison against rolling average
     """
-    rf = round_file(rounds_dir, round_num)
-    if not rf.exists():
+    rf = locate_round_file(rounds_dir, round_num, workflow_name, logger)
+    if rf is None:
         logger.warning(f"Round {round_num} output file missing")
         return True
 
@@ -1206,17 +1257,19 @@ class Orchestrator:
                 continue  # retry same round_num
 
             # --- Verify output ---
-            rf = round_file(rounds_dir_path, round_num)
+            rf = locate_round_file(
+                rounds_dir_path, round_num, workflow_name, logger
+            )
             chars, line_count = 0, 0
             truncated = False
 
-            if rf.exists():
+            if rf and rf.exists():
                 content = rf.read_text(encoding="utf-8", errors="replace")
                 chars = len(content)
                 line_count = content.count("\n")
             truncated = check_output_truncation(
                 rounds_dir_path, round_num,
-                self._output_sizes, logger,
+                workflow_name, self._output_sizes, logger,
             )
             if chars > 0 and not truncated:
                 self._output_sizes.append(chars)
@@ -1229,7 +1282,7 @@ class Orchestrator:
                     f"({chars} chars, {line_count} lines)"
                 )
 
-                if rf.exists():
+                if rf and rf.exists():
                     backup = rounds_dir_path / (
                         f"round_{round_num}.truncated.{attempts}.md"
                     )
@@ -1243,10 +1296,11 @@ class Orchestrator:
                 recovered = attempt_cdp_recovery(round_num, config, logger)
                 if recovered:
                     # Write recovered content to the round file
+                    target_path = rf or round_file(rounds_dir_path, round_num)
                     try:
-                        rf.write_text(recovered, encoding="utf-8")
+                        target_path.write_text(recovered, encoding="utf-8")
                         logger.info(
-                            f"  📝 Wrote CDP-recovered content to {rf}"
+                            f"  📝 Wrote CDP-recovered content to {target_path}"
                         )
                     except OSError as e:
                         logger.warning(f"  ⚠️  Could not write recovered content: {e}")
@@ -1258,7 +1312,7 @@ class Orchestrator:
                     line_count = recovered.count("\n")
                     still_truncated = check_output_truncation(
                         rounds_dir_path, round_num,
-                        self._output_sizes, logger,
+                        workflow_name, self._output_sizes, logger,
                     )
                     if not still_truncated:
                         logger.info(
