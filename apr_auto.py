@@ -78,7 +78,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 FAILURE_BACKOFF_SECONDS = 10
 MAX_TRUNCATION_RETRIES = 3
 CDP_RECOVERY_TIMEOUT = 150          # SSH + script total (seconds)
-CDP_RECOVERY_SCRIPT = "~/dev/macgate/scripts/oracle_cdp_recover.js"
+CDP_RECOVERY_SCRIPT = "~/dev/rch-mac/scripts/oracle_cdp_recover.js"
 
 # Truncation heuristics (applied to round output files)
 MIN_OUTPUT_CHARS = 200
