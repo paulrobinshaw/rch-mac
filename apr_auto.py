@@ -714,7 +714,7 @@ def attempt_cdp_recovery(
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=accept-new",
         host,
-        f"NODE_PATH=/opt/homebrew/lib/node_modules /opt/homebrew/bin/node {shlex.quote(script)} --timeout 120 --min-length {MIN_OUTPUT_CHARS}",
+        f"NODE_PATH=/opt/homebrew/lib/node_modules /opt/homebrew/bin/node {script} --timeout 120 --min-length {MIN_OUTPUT_CHARS}",
     ]
 
     try:
@@ -1059,7 +1059,7 @@ class Orchestrator:
                             "-o", "BatchMode=yes",
                             "-o", "ConnectTimeout=5",
                             cdp_host,
-                            f"test -f {shlex.quote(cdp_script)} && echo ok",
+                            f"test -f {cdp_script} && echo ok",
                         ],
                         capture_output=True, text=True, timeout=15,
                     )
