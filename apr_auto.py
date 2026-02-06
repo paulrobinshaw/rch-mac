@@ -714,7 +714,7 @@ def attempt_cdp_recovery(
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=accept-new",
         host,
-        f"/usr/local/bin/node {shlex.quote(script)} --timeout 120 --min-length {MIN_OUTPUT_CHARS}",
+        f"/opt/homebrew/bin/node {shlex.quote(script)} --timeout 120 --min-length {MIN_OUTPUT_CHARS}",
     ]
 
     try:
