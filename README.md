@@ -47,7 +47,9 @@ Recommended:
 - Dedicated macOS user account for RCH runs
 - Dedicated machine (or at least dedicated environment) for lane execution
 - Harden SSH on the worker:
-  - Prefer a forced-command key for `rch-xcode-worker` (no-pty, no-agent-forwarding, no-port-forwarding)
+  - Prefer a forced-command key for `rch-xcode-worker --forced`
+    (harness reads `SSH_ORIGINAL_COMMAND` and only allows `probe`/`run`;
+    no-pty, no-agent-forwarding, no-port-forwarding)
   - Use a separate, restricted rsync key confined to the workspace/staging root (e.g., `rrsync`)
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
@@ -75,7 +77,9 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | Command | Purpose |
 |---------|---------|
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
+| `rch xcode workers [--refresh]` | List/probe eligible macOS workers and summarize capabilities |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
+| `rch xcode plan --profile <name>` | Resolve effective config + select worker + resolve destination (no staging/run) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
@@ -118,7 +122,9 @@ require_pinned_host_key = true
 
 ## Outputs
 
-Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
+Artifacts are written to:
+- Canonical per-attempt dir: `~/.local/share/rch/artifacts/jobs/<job_id>/`
+- Stable run index: `~/.local/share/rch/artifacts/runs/<run_id>/attempt-<n>/` (links/pointers to job dirs)
 
 All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
 `summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.

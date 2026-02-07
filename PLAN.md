@@ -95,6 +95,14 @@ The harness MUST support two verbs:
 - Structured output avoids fragile log parsing.
 - Harness can enforce per-job resource limits and timeouts locally.
 
+**Forced-command mode (Strongly Recommended):**
+
+Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so the remote account cannot execute arbitrary commands. The harness MUST support `rch-xcode-worker --forced`, which:
+
+- Reads the requested verb from `SSH_ORIGINAL_COMMAND`
+- Allows ONLY `probe` and `run` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
+- Ignores argv verbs when `--forced` is set (to prevent bypass)
+
 ---
 
 ## Configuration Model
@@ -156,6 +164,11 @@ store = "host"                         # "host" (default) | "worker" | "object_s
 xcresult_format = "directory"          # "directory" | "tar.zst"
 compression = "none"                   # "none" | "zstd" (applies to large artifacts during transfer)
 
+[profiles.ci.limits]
+max_workspace_bytes = 50_000_000_000   # workspace + DerivedData cap (best effort)
+max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap
+max_log_bytes       = 200_000_000      # build.log cap; truncate with marker
+
 [profiles.release]
 action = "build"
 workspace = "MyApp.xcworkspace"
@@ -176,8 +189,15 @@ name = "mac-mini-1"
 host = "mac-mini-1.local"
 tags = ["macos", "xcode"]
 ssh_user = "rch"
-ssh_key = "~/.ssh/rch_ed25519"
+ssh_port = 22
+ssh_run_key = "~/.ssh/rch_run_ed25519"       # used only for harness probe/run
+ssh_rsync_key = "~/.ssh/rch_rsync_ed25519"   # used only for staging (rrsync-restricted)
 ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
+
+# Worker roots (used to compute per-job workspaces deterministically)
+stage_root = "~/Library/Caches/rch-xcode-lane/stage"
+jobs_root  = "~/Library/Caches/rch-xcode-lane/jobs"
+cache_root = "~/Library/Caches/rch-xcode-lane/cache"
 ```
 
 ### Transport Trust (Normative)
@@ -261,6 +281,13 @@ where `JCS(effective_config)` is UTF-8 bytes and `source_tree_hash_hex` is the l
 
 Rationale: simple, deterministic, and implementation-portable.
 
+### `config_hash` (Recommended)
+
+For cache addressing and reporting, the lane SHOULD compute:
+`config_hash = SHA-256( JCS(effective_config) )` as lowercase hex.
+
+This is distinct from `run_id` (which includes the source tree hash). The `config_hash` enables efficient cache sharing: jobs with identical configuration (toolchain, destination, scheme, build settings) but different source trees can share DerivedData caches.
+
 ### Requirements
 
 - Host MUST preserve partial artifacts for non-success terminals.
@@ -336,6 +363,15 @@ patterns = ["ghp_*", "xox*-*"]  # Optional additional redaction patterns
 
 When `redaction.enabled = true`, the lane SHOULD redact known secret patterns from `build.log` before storage.
 
+### Artifact Sensitivity (Normative for remote storage)
+
+Artifacts MAY contain sensitive information (logs, crash dumps, test output).
+When `store = "object_store"` (or any non-host persistence), the lane MUST:
+
+- Apply configured redaction to `build.log` prior to upload
+- Avoid uploading `environment.json` values (only identifiers/redacted fields)
+- Never upload credentials; object store auth MUST remain on the host only
+
 ### Decision Artifact (Normative)
 
 Every job MUST emit a `decision.json` file in the artifact directory, recording the classification and routing decision made by the host. This supports auditability and debugging of interception behavior.
@@ -407,6 +443,10 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
+| `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
+| `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
+| `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
+| `log_truncated` | build.log exceeded cap and was truncated | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -424,6 +464,17 @@ Implementations MAY define additional codes; consumers MUST tolerate unknown cod
 - Operators SHOULD deploy workers as dedicated, non-sensitive machines/accounts.
 - Operators SHOULD use a dedicated macOS user account with minimal privileges for RCH runs.
 
+### Repo Trust Posture (Recommended)
+
+The host SHOULD classify the source as `trusted` or `untrusted` (e.g., fork PRs, unknown remotes, patch inputs).
+When `untrusted`, the lane SHOULD automatically enforce:
+
+- `code_signing_allowed = false`
+- `cache.mode = "read_only"` (or `"off"` if configured)
+- `allow_mutating = false`
+
+The applied posture MUST be recorded in `decision.json` (as `trust_posture`) and `effective_config.json` (as final resolved values). This ensures the lane is safer-by-default even when configs drift.
+
 ### Worker SSH Hardening (Strongly Recommended)
 
 The lane assumes repos may execute arbitrary code during build/test. Operators SHOULD minimize SSH blast radius:
@@ -437,8 +488,8 @@ The lane assumes repos may execute arbitrary code during build/test. Operators S
 **Example `authorized_keys` entries (illustrative):**
 
 ```
-# Run key (forced to harness):
-command="/usr/local/bin/rch-xcode-worker serve",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-run
+# Run key (forced to harness in --forced mode; verb comes from SSH_ORIGINAL_COMMAND):
+command="/usr/local/bin/rch-xcode-worker --forced",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-run
 
 # Rsync key (confined to staging root):
 command="/usr/local/bin/rrsync -wo ~/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-rsync
@@ -550,10 +601,10 @@ For builds that require a verifiable chain of custody, the lane MAY emit a `prov
 
 ## Required Artifacts
 
-Artifacts are written under a per-job directory on the host. The directory is **append-only during execution**, except for `status.json`, which is updated in-place using atomic replacement.
+Artifacts are written under a per-job directory on the host. The directory is **append-only during execution**, except for `status.json`, which is updated in-place using atomic replacement. The host SHOULD also maintain a stable run index keyed by `run_id` for deduplication and agent/CI ergonomics.
 
 ```
-~/.local/share/rch/artifacts/<job_id>/
+~/.local/share/rch/artifacts/jobs/<job_id>/
 ├── summary.json           # Machine-readable outcome + timings
 ├── effective_config.json  # Fully-resolved config used for the job
 ├── attestation.json       # Toolchain + environment fingerprint
@@ -568,6 +619,17 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
 └── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
 ```
+
+### Run Index (Recommended)
+
+The host SHOULD create:
+`~/.local/share/rch/artifacts/runs/<run_id>/attempt-<attempt>/`
+as a symlink or pointer to `jobs/<job_id>/` for that attempt.
+
+This enables:
+- Easy deduplication and retention decisions ("keep last N runs")
+- Straightforward retrieval of "latest attempt for run_id"
+- Cleaner correlation with caches (run_id/config hashes)
 
 ### `manifest.json` Requirements
 
@@ -640,6 +702,7 @@ When `store` is `"worker"` or `"object_store"`, the `rch xcode fetch <job_id>` c
 - `cpu_seconds` — Total CPU time consumed by the build/test.
 - `disk_usage_bytes` — Workspace disk usage at completion.
 - `cache_hit` — Object with `derived_data` (boolean) and `spm` (boolean) cache hit/miss status.
+- `cache_keys` — Object with `config_hash`, `derived_data_key`, `spm_key` (strings) when available.
 
 ### `events.ndjson` Requirements
 
@@ -659,6 +722,14 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 - `run_id` — Content-derived identifier.
 - `attempt` — Attempt number for this run_id.
 
+**Sequence integrity (Normative):**
+
+- `sequence` MUST start at 1 and MUST increase by exactly 1 for each subsequent event (no gaps).
+
+**Heartbeat (Recommended):**
+
+- The harness SHOULD emit `{"type":"heartbeat",...}` at least every 10 seconds while running.
+
 **Standard event types:**
 
 | Type | Emitted when |
@@ -673,7 +744,13 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 | `test_suite_completed` | A test suite finishes (includes pass/fail counts) |
 | `warning` | Non-fatal issue detected |
 | `error` | Fatal error during execution |
+| `heartbeat` | Periodic liveness signal (at least every 10s) |
 | `complete` | Final event; includes `exit_code` |
+
+**Optional stream digest (Recommended):**
+
+- The `complete` event MAY include `events_sha256` computed over the exact UTF-8 bytes of `events.ndjson` (excluding the `complete` event itself).
+- When present, `summary.json` SHOULD copy the same `events_sha256` for easy validation.
 
 Consumers MUST tolerate unknown event types (forward compatibility).
 
@@ -732,7 +809,9 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 | Command | Purpose |
 |---------|---------|
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
+| `rch xcode workers [--refresh]` | Enumerate/probe workers; show capability summaries |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
+| `rch xcode plan --profile <name>` | Deterministically resolve effective config, worker selection, destination resolution (no staging/run) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
@@ -765,8 +844,11 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - All files listed in `manifest.json` exist and have matching SHA-256 hashes.
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
 - JSON artifacts validate against their schemas (when schemas are available).
-- `events.ndjson` parses as valid NDJSON and ends with a terminal `complete` event.
+- `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
+- If `events_sha256` is present in the `complete` event, recompute and verify it matches.
 - `job_id`, `run_id`, `attempt` are consistent across artifacts.
+- `summary.json` terminal state is consistent with `events.ndjson` terminal `complete` event (exit_code, error_code).
+- If a run index (`runs/<run_id>/attempt-<n>`) exists, it MUST point to the matching `jobs/<job_id>` directory.
 
 **Optional validations (when applicable):**
 
@@ -792,7 +874,7 @@ The `validate` command verifies artifact integrity and consistency for a complet
 
 | Cache | Key Components |
 |-------|----------------|
-| DerivedData | Xcode build + destination runtime + scheme/config + source_tree_hash (or run_id) |
+| DerivedData | cache_namespace + config_hash |
 | SwiftPM | Xcode build + resolved dependencies hash (+ optional toolchain constraints) |
 
 ### Cache Policy (Normative)
