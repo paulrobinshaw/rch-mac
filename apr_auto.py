@@ -916,7 +916,7 @@ def run_integrate(
                 ["claude", "--print", "-"],
                 input=prompt,
                 capture_output=True, text=True,
-                timeout=900,
+                timeout=3600,
             )
             if claude_result.returncode == 0:
                 logger.info("  ✅ Claude Code integration complete")
