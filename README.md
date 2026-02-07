@@ -17,7 +17,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 ## How it works
 
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (Xcode, runtimes, XcodeBuildMCP).
-2. **Stage source** to the worker (rsync/zstd).
+2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
 3. **Run** build/test remotely (via XcodeBuildMCP backend; `xcodebuild` fallback allowed).
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
 5. **Attest** toolchain + environment; emit machine-readable outputs for CI/agents.
@@ -47,6 +47,7 @@ See `PLAN.md` § Safety Rules for the full threat model.
 - SSH access (key-based)
 - `rsync` + `zstd` (fast sync + compression)
 - Node.js + XcodeBuildMCP (recommended backend)
+- `rch-xcode-worker` harness (recommended): stable remote probe/run/collect interface
 
 ### Host
 
@@ -62,6 +63,7 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
+| `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
 
 ## Setup
 
@@ -85,7 +87,7 @@ timeout_seconds = 1800
 [profiles.ci.destination]
 platform = "iOS Simulator"
 name = "iPhone 16"
-os = "latest"
+os = "18.2"  # CI SHOULD pin; floating "latest" is opt-in (see PLAN.md)
 
 [profiles.ci.safety]
 allow_mutating = false
@@ -98,21 +100,26 @@ Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
 
 ```
 <job_id>/
-├── summary.json           # High-level status + timings
+├── summary.json           # High-level status + timings (includes job_id, run_id, attempt)
 ├── effective_config.json  # Resolved/pinned run configuration
+├── decision.json          # Interception/classification decision + refusal reasons
 ├── attestation.json       # Worker identity, tool versions, repo state
 ├── manifest.json          # Artifact listing + SHA-256 hashes
 ├── environment.json       # Worker environment snapshot
 ├── timing.json            # Phase durations (staging/running/collecting)
+├── status.json            # Latest job state snapshot (atomic updates while running)
+├── events.ndjson          # Structured event stream (append-only)
 ├── build.log              # Streamed + finalized stdout/stderr
-└── result.xcresult/       # When tests are executed
+├── result.xcresult/       # When tests are executed
+└── provenance/            # Optional: signatures + verification report
 ```
 
 ## Operational Notes
 
 - Recommended: dedicate a worker user account with minimal privileges
 - Prefer `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled in config
-- Use worker concurrency limits to avoid simulator contention
+- Use worker concurrency limits + leases to avoid simulator contention
+- CI profiles SHOULD pin destination runtime/device; floating resolution is opt-in
 - Failure modes are first-class: timeouts/cancellation preserve partial artifacts
 
 ## Next
