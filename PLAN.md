@@ -47,13 +47,29 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 
 The recommended way to execute jobs on a worker is via the `rch-xcode-worker` harness — a lightweight executable invoked over SSH that accepts a job request on stdin and emits structured results on stdout.
 
-**Protocol:**
+**Protocol (Verbs + Versioning):**
 
-1. Host opens an SSH connection and invokes `rch-xcode-worker`.
-2. Host writes a single JSON object to stdin (the job request: effective config, source path, cache policy).
-3. Harness validates the request, runs the Xcode action, and streams NDJSON events to stdout (one JSON object per line).
-4. On completion, harness writes a final `{"type":"complete","exit_code":N}` event and exits.
-5. Host collects events, extracts artifacts, and assembles the job directory.
+The harness MUST support two verbs:
+
+1) `rch-xcode-worker probe`
+   - Emits a single JSON object to stdout (capabilities) and exits 0 on success.
+   - Used by `rch xcode verify` and worker selection.
+
+2) `rch-xcode-worker run`
+   - Reads exactly one JSON object (the job request) from stdin.
+   - Emits NDJSON events to stdout (one JSON object per line).
+   - Exits after emitting a terminal `complete` event.
+
+**Job request (stdin) MUST include:**
+- `protocol_version` (string, e.g. `"1"`)
+- `job_id`, `run_id`, `attempt`
+- `effective_config` (object)
+- `paths` (object: source/workdir/cache roots)
+
+**Event stream (stdout) requirements:**
+- The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
+- Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`.
+- The FINAL event MUST be `{"type":"complete","exit_code":N,...}` and MUST be the last line. After emitting `complete`, the harness MUST exit promptly.
 
 **Benefits:**
 
@@ -124,7 +140,14 @@ host = "mac-mini-1.local"
 tags = ["macos", "xcode"]
 ssh_user = "rch"
 ssh_key = "~/.ssh/rch_ed25519"
+ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
 ```
+
+### Transport Trust (Normative)
+
+When `ssh_host_key_fingerprint` is configured for a worker, the host MUST verify the remote SSH host key matches before executing any probe/run command. If verification fails, the lane MUST refuse to run and emit a clear error.
+
+`attestation.json` MUST record the observed SSH host key fingerprint used for the session (even if not pinned), so audits can detect worker identity drift.
 
 ### Resolution Rules
 
@@ -140,8 +163,17 @@ ssh_key = "~/.ssh/rch_ed25519"
 3. Query worker for available simulators matching platform + name + os.
 4. If exactly one match, use its UDID.
 5. If zero matches, reject with error listing available runtimes.
-6. If multiple matches, select the one with the highest UDID lexicographic order (deterministic tiebreak) and emit a warning.
+6. If multiple matches:
+   - Default: reject with an error describing the duplicates and how to fix/disambiguate.
+   - If `destination.on_multiple = "select"` is set, select using `destination.selector` (default selector: `"highest_udid"`), and emit a warning.
 7. Record resolved UDID, runtime version, and device type in `effective_config.json`.
+
+### Destination Disambiguation (Config)
+
+Under `[profiles.<name>.destination]`, the following fields MAY be used:
+- `on_multiple` — `"error"` (default) | `"select"`
+- `selector` — `"highest_udid"` | `"lowest_udid"` (future: more selectors)
+- `udid` — optional explicit simulator UDID (generally host/worker-specific; best for local-only profiles)
 
 ---
 
@@ -167,6 +199,18 @@ Every job attempt MUST carry three identity fields:
 
 All three fields MUST appear in `summary.json`, `effective_config.json`, and `attestation.json`.
 
+### Canonicalization + `run_id` (Normative)
+
+To make `run_id` stable across hosts/implementations, the lane MUST define canonicalization.
+
+**Canonical JSON:** The lane MUST canonicalize `effective_config.json` using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing.
+
+**`run_id` bytes:** The lane MUST compute:
+`run_id = SHA-256( JCS(effective_config) || "\n" || source_tree_hash_hex )`
+where `JCS(effective_config)` is UTF-8 bytes and `source_tree_hash_hex` is the lowercase hex string (UTF-8).
+
+Rationale: simple, deterministic, and implementation-portable.
+
 ### Requirements
 
 - Host MUST preserve partial artifacts for non-success terminals.
@@ -179,6 +223,22 @@ All three fields MUST appear in `summary.json`, `effective_config.json`, and `at
 - Lane SHOULD support user cancellation (best-effort SIGINT/remote termination).
 - A canceled job MUST still emit `summary.json` + `manifest.json` referencing available artifacts.
 
+### Cancellation Semantics (Normative)
+
+When `rch xcode cancel <job_id>` is invoked:
+- The host MUST mark `status.json.state = "canceled"` once cancellation is confirmed or best-effort attempted.
+- The worker harness SHOULD terminate the active `xcodebuild` process group (SIGTERM, then SIGKILL after 10s).
+- The lane MUST preserve partial artifacts collected so far and MUST still emit terminal `summary.json` and `manifest.json`.
+
+### Worker Workspace Layout + Retention (Normative)
+
+The worker MUST execute jobs inside a dedicated per-job workspace root, e.g.:
+`~/Library/Caches/rch-xcode-lane/jobs/<job_id>/`
+
+The lane MUST provide a garbage-collection mechanism:
+- `rch xcode gc` cleans host job dirs and worker job workspaces according to retention policy.
+- Default retention SHOULD be time-based (e.g., keep last N days) and SHOULD be configurable.
+
 ---
 
 ## Safety Rules
@@ -189,6 +249,16 @@ All three fields MUST appear in `summary.json`, `effective_config.json`, and `at
 - When classification is uncertain, lane MUST prefer **not** to intercept (false negatives are acceptable).
 - Default signing policy: `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled.
 
+### Invocation Reconstruction (Normative)
+
+When the lane intercepts an incoming command string, it MUST:
+1. Parse/classify the request (for decision/audit), then
+2. Construct the remote invocation exclusively from `effective_config.json`.
+
+The lane MUST NOT pass through arbitrary user-provided `xcodebuild` flags or paths. Any CLI overrides MUST be explicitly modeled as structured config fields and included in `effective_config.json`.
+
+Rationale: prevents flag-based policy bypass and keeps runs deterministic/auditable.
+
 ### Decision Artifact (Normative)
 
 Every job MUST emit a `decision.json` file in the artifact directory, recording the classification and routing decision made by the host. This supports auditability and debugging of interception behavior.
@@ -197,6 +267,7 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
 
 - `command_raw` — The original command string as received.
 - `command_classified` — The classified action (`build`, `test`, `clean`, `archive`, `unknown`).
+- `command_parsed` — Optional structured parse result (recognized flags/fields), for debugging and audit.
 - `profile_used` — The profile name selected.
 - `intercepted` — Boolean: whether the command was intercepted and routed to a worker.
 - `refusal_reason` — If not intercepted, the reason (e.g., `"uncertain_classification"`, `"mutating_disallowed"`). Null if intercepted.
@@ -219,6 +290,15 @@ Every run MUST emit:
 - `effective_config.json` — Fully-resolved configuration used for the job (Xcode path, destination, build settings, cache policy).
 - `attestation.json` — Environment fingerprint: macOS version, Xcode version/build, toolchain versions, worker identity, repo state.
 - `manifest.json` — Artifact inventory + hashes.
+
+### Artifact Schema + Versioning (Normative)
+
+Every JSON artifact emitted by the lane MUST include these top-level fields:
+- `kind` — A stable identifier for the artifact type (e.g., `"summary"`, `"manifest"`, `"attestation"`).
+- `schema_version` — A SemVer-like string for the artifact schema (e.g., `"1.0.0"`).
+- `lane_version` — The lane implementation version (SemVer).
+
+The repository SHOULD provide JSON Schemas under `schemas/rch-xcode-lane/` and CI/agents SHOULD validate outputs against these schemas for early break detection.
 
 Determinism inputs SHOULD include:
 
@@ -280,6 +360,7 @@ Artifacts are written under an immutable job directory on the host:
 ├── decision.json          # Classification + routing decision record
 ├── environment.json       # Captured worker environment snapshot
 ├── timing.json            # Durations for stage/run/collect phases
+├── metrics.json           # Resource + transfer metrics + queue stats
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
 ├── build.log              # stdout/stderr capture
@@ -291,6 +372,7 @@ Artifacts are written under an immutable job directory on the host:
 - MUST include SHA-256 hashes for all material artifacts.
 - MUST include byte sizes.
 - SHOULD include a logical artifact type for each entry (log/json/xcresult/etc.).
+- SHOULD include `kind`/`schema_version` for JSON artifacts (or inferable mapping) to aid verifiers.
 
 ### `environment.json` Requirements
 
@@ -303,6 +385,21 @@ Artifacts are written under an immutable job directory on the host:
 
 - MUST include durations (seconds) for: `staging`, `running`, `collecting`.
 - SHOULD include total wall-clock time.
+
+### `metrics.json` Requirements
+
+`metrics.json` captures resource and transfer metrics for each job run.
+
+**Required fields (when emitted):**
+- `staging_bytes_sent` — Total bytes transferred to worker during staging.
+- `artifact_bytes_received` — Total bytes transferred back from worker.
+- `queue_wait_seconds` — Time spent waiting for a worker lease (mirrors `status.json`).
+
+**Optional fields:**
+- `peak_memory_bytes` — Peak resident memory of the `xcodebuild` process on the worker.
+- `cpu_seconds` — Total CPU time consumed by the build/test.
+- `disk_usage_bytes` — Workspace disk usage at completion.
+- `cache_hit` — Object with `derived_data` (boolean) and `spm` (boolean) cache hit/miss status.
 
 ### `events.ndjson` Requirements
 
@@ -318,6 +415,7 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 
 | Type | Emitted when |
 |------|-------------|
+| `hello` | First event; echoes protocol_version, lane_version, job identity |
 | `job_started` | Job execution begins on worker |
 | `phase_started` | A build phase begins (compile, link, etc.) |
 | `phase_completed` | A build phase ends (includes duration) |
@@ -386,6 +484,9 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
+| `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
+| `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
+| `rch xcode gc` | Garbage-collect old runs + worker workspaces |
 
 ### `doctor` Checks (Host)
 
@@ -415,8 +516,12 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 
 | Cache | Key Components |
 |-------|----------------|
-| DerivedData | Xcode identity + destination + repo content hash |
-| SwiftPM | Xcode identity + resolved dependencies hash |
+| DerivedData | Xcode build + destination runtime + scheme/config + source_tree_hash (or run_id) |
+| SwiftPM | Xcode build + resolved dependencies hash (+ optional toolchain constraints) |
+
+### Cache Policy (Normative)
+
+Cache usage MUST be controlled via `[profiles.<name>.cache]` and MUST be reflected in `effective_config.json`. The lane MUST record cache decisions and hit/miss stats in `metrics.json` (at minimum: derived data + SPM).
 
 ### Simulator Prewarm
 
@@ -456,11 +561,13 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 - **M5**: Determinism outputs: summary.json, effective_config.json, attestation.json, manifest.json, environment.json, timing.json
 - **M5.1**: Decision artifact (`decision.json`) + event stream (`events.ndjson`) + live status (`status.json`)
 - **M5.2**: Source snapshot in attestation + source policy enforcement
+- **M5.3**: Artifact schema versioning (`kind`, `schema_version`, `lane_version`) + metrics.json
 - **M6**: Caching + performance: DerivedData/SPM caches, incremental sync, simulator prewarm, concurrency control
 - **M6.1**: Worker leases + crash recovery + queue-wait metrics
 - **M7**: Ops hardening: timeouts, cancellation, worker harness (`rch-xcode-worker`), partial artifact preservation
 - **M7.1**: Optional provenance (signed attestation + manifest)
 - **M7.2**: Optional CI reports (`junit.xml`, `test_summary.json`)
+- **M7.3**: Garbage collection (`rch xcode gc`) + worker workspace retention
 - **M8**: Compatibility matrix + fixtures: golden configs, sample repos, reproducible failure cases
 
 ---
@@ -473,9 +580,12 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 | Mutating commands | Disallowed | `allow_mutating = true` |
 | Uncertain classification | Refuse (false negative) | N/A |
 | Floating destination (CI) | Disallowed | `allow_floating_destination = true` |
+| Duplicate destinations | Error | `destination.on_multiple = "select"` |
 | Dirty working tree (CI) | Disallowed | `require_clean = false` |
 | Worker user | Dedicated account | Operator responsibility |
 | Provenance signing | Disabled | `[profiles.<name>.provenance] enabled = true` |
+| Flag passthrough | Disallowed | N/A (must model as config fields) |
+| SSH host key pinning | Optional (recorded) | `ssh_host_key_fingerprint` in workers.toml |
 
 ---
 
@@ -486,6 +596,7 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 3. Add classifier + routing + refusal/explanation paths + decision artifact
 4. Implement workspace sync + remote runner + log streaming + worker harness
 5. Add XcodeBuildMCP backend + event stream
-6. Emit determinism artifacts + source snapshot
+6. Emit determinism artifacts + source snapshot + schema versioning
 7. Add caching + performance optimizations + worker leases
 8. Add optional provenance + CI reports
+9. Implement garbage collection + retention policies

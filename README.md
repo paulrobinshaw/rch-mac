@@ -16,6 +16,16 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 
 ## How it works
 
+```
+┌──────────────┐      SSH (+ pinned host key)      ┌───────────────────┐
+│ Host (RCH)   │ ──────────────────────────────▶   │ macOS Worker      │
+│ - classify   │                                   │ - Xcode + Sims    │
+│ - resolve    │   stage (rsync/git snapshot)      │ - caches          │
+│ - attest     │ ◀──────────────────────────────   │ - rch-xcode-worker│
+│ - assemble   │   NDJSON events + artifacts       │   (probe/run)     │
+└──────────────┘                                   └───────────────────┘
+```
+
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (Xcode, runtimes, XcodeBuildMCP).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
 3. **Run** build/test remotely (via XcodeBuildMCP backend; `xcodebuild` fallback allowed).
@@ -36,6 +46,7 @@ Recommended:
 - Dedicated macOS user account for RCH runs
 - Dedicated machine (or at least dedicated environment) for lane execution
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
+- Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
 
 See `PLAN.md` § Safety Rules for the full threat model.
 
@@ -64,6 +75,8 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
 | `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
+| `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
+| `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
 
 ## Setup
 
@@ -98,6 +111,9 @@ code_signing_allowed = false
 
 Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
 
+All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
+Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommended for CI/agents).
+
 ```
 <job_id>/
 ├── summary.json           # High-level status + timings (includes job_id, run_id, attempt)
@@ -107,6 +123,7 @@ Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
 ├── manifest.json          # Artifact listing + SHA-256 hashes
 ├── environment.json       # Worker environment snapshot
 ├── timing.json            # Phase durations (staging/running/collecting)
+├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only)
 ├── build.log              # Streamed + finalized stdout/stderr
@@ -120,6 +137,7 @@ Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
 - Prefer `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled in config
 - Use worker concurrency limits + leases to avoid simulator contention
 - CI profiles SHOULD pin destination runtime/device; floating resolution is opt-in
+- Deterministic IDs: `run_id` is content-derived; `job_id` is per-attempt. Timestamps live in `summary.json`, not config.
 - Failure modes are first-class: timeouts/cancellation preserve partial artifacts
 
 ## Next
