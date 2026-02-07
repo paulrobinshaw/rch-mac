@@ -83,7 +83,9 @@ The harness MUST support two verbs:
 
 **Probe output schema (Normative):**
 
-The probe JSON MUST include at minimum:
+The probe JSON MUST be a self-describing, versioned object and MUST include at minimum:
+- `kind` (string) — MUST be `"probe"`.
+- `schema_version` (SemVer string) — Schema version for the probe payload (e.g., `"1.0.0"`).
 - `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
 - `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
 - `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
@@ -97,7 +99,23 @@ The probe JSON MUST include at minimum:
 - `features` (object) — Feature flags/capabilities beyond versions, e.g.:
   - `event_hash_chain` (boolean) — Whether hash-chained events are supported when enabled in config.
   - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
-- `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load`). Enables capability drift detection.
+- `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load` and `health`). Enables capability drift detection.
+
+**`capabilities_sha256` computation (Normative):**
+
+The harness MUST compute `capabilities_sha256` as:
+`capabilities_sha256 = SHA-256( JCS(stable_capabilities) )` (lowercase hex),
+where `stable_capabilities` is an object containing ONLY stable fields:
+- `kind`, `schema_version`, `protocol_versions`, `contract_versions`
+- `harness_version`, `harness_binary_sha256`, `codesign`
+- `lane_version`, `verbs`, `features`, `limits`
+- `worker`, `xcode`, `simulators`, `backends`, `event_capabilities`, `roots`
+
+and MUST exclude volatile fields such as `load` and `health`.
+
+Before applying JCS, the harness MUST normalize any set-like arrays inside `stable_capabilities`
+(remove duplicates, sort lexicographically by UTF-8 byte order). If these rules change, the harness
+MUST bump `probe.schema_version`.
 - `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
 - `xcode` (object) — `path`, `version`, `build` (Xcode build number).
 - `simulators` (object) — Available runtimes + device types (or a summarized digest).
@@ -165,7 +183,18 @@ The harness MAY support an optional fifth verb:
    - MUST NOT mutate shared caches when `trust.posture` is `"untrusted"` (best-effort).
    - Enables reducing cold-start tax for CI and agent loops.
 
-**Job request (stdin) MUST include:**
+The harness SHOULD support an optional sixth verb:
+
+6) `rch-xcode-worker status` (Optional; Recommended)
+   - Reads a single JSON object from stdin containing at minimum `job_id`.
+   - Emits a single JSON object describing best-effort job state (`running`, `queued`, `terminal`, `unknown`),
+     and the latest observed `events.sequence` written to disk (when available).
+   - Enables watch/fetch resume after transport drops without arbitrary remote commands.
+   - MUST NOT reveal paths outside configured roots.
+
+**Job request (stdin) MUST be a self-describing, versioned object and MUST include:**
+- `kind` (string) — MUST be `"job_request"`.
+- `schema_version` (SemVer string) — Schema version for the job request payload (e.g., `"1.0.0"`).
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
@@ -176,6 +205,7 @@ The harness MAY support an optional fifth verb:
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
   - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
+- `job_request_sha256` (string) — Lowercase hex SHA-256 of `JCS(job_request_without_digest)` computed by the host, where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed. The harness MUST echo this value in `hello` and `complete` so the host can detect any request corruption.
 
 **Path Confinement (Normative):**
 - In `--forced` mode, the harness MUST compute `src/`, `work/`, `dd/` and related paths solely from (`jobs_root`, `stage_root`, `cache_root`) + `job_id` (and optional stable subpaths).
@@ -199,8 +229,18 @@ The harness MAY support an optional fifth verb:
 - The host MUST capture stderr separately and MUST NOT attempt to parse it as JSON.
 - The harness SHOULD route backend build output (e.g., `xcodebuild` stdout/stderr) into harness stderr so it is captured in `build.log`.
 
+**Durable stream tee (Normative):**
+
+The harness MUST tee (write) the same bytes it emits to durable files under the per-job workspace root:
+- `events.ndjson` — Same content as stdout (NDJSON events), written as each event is emitted.
+- `build.log` — Same content as harness stderr (human logs + backend output).
+
+This ensures runs remain inspectable and artifacts are fetchable even if the SSH session is interrupted mid-execution. The `status` verb (when supported) can report the latest durable `events.sequence` to enable resume.
+
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
+- The `hello` event MUST include `event_schema_version` (SemVer string) declaring the schema for all subsequent NDJSON events in the stream.
+- The `hello` event MUST include `job_request_sha256` when provided in the job request.
 - The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `result`, `spm`, `cache`) so audits/debugging can prove where execution happened.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
 - Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
@@ -218,6 +258,7 @@ The terminal `complete` event MUST include:
 - `events_sha256` (string|null) — digest over emitted event bytes (excluding the `complete` line itself)
 - `event_chain_head_sha256` (string|null) — when hash chain enabled, the `event_sha256` of the last non-`complete` event
 - `artifact_summary` (object) — small summary, e.g. `{ "xcresult": true, "xcresult_format": "directory|tar.zst" }`
+- `job_request_sha256` (string|null) — Echoed from `hello` when present; null if not provided in the job request.
 
 This enables streaming consumers to know the terminal outcome without waiting for artifact assembly.
 
@@ -241,7 +282,7 @@ This enables streaming consumers to know the terminal outcome without waiting fo
 Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so the remote account cannot execute arbitrary commands. The harness MUST support `rch-xcode-worker --forced`, which:
 
 - Reads the requested verb from `SSH_ORIGINAL_COMMAND`
-- Allows ONLY `probe`, `run`, `cancel`, and optionally `cache_query` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
+- Allows ONLY `probe`, `run`, `cancel`, `status`, and optionally `cache_query` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
 - **Note:** `cancel` MUST be supported in `--forced` mode to enable clean cancellation without arbitrary remote commands
 
@@ -266,6 +307,24 @@ skip_testing = ["MyAppTests/FlakyTests"]  # optional array (replaces, no concat)
 
 - These fields MUST be included in `effective_config.inputs` when present.
 - The harness MUST translate these into backend-specific invocations (XcodeBuildMCP or xcodebuild) and MUST record the final applied selection in `effective_config.resolved`.
+
+### Structured Execution Controls (Recommended; Normative when present)
+
+Profiles MAY define `xcode_run` controls for commonly-needed behaviors that remain safe when modeled explicitly:
+
+```toml
+[profiles.ci.xcode_run]
+code_coverage = false                  # optional; enable code coverage collection
+parallel_testing_enabled = true        # optional (test only); enable parallel test execution
+max_concurrent_test_simulators = 2     # optional (test only); limit concurrent simulator destinations
+retry_tests_on_failure = true          # optional (test only); Xcode automatic test retry
+test_iterations = 1                    # optional (test only); must be >= 1
+test_repetition_mode = "retry_on_failure" # optional enum: "none"|"retry_on_failure"|"until_failure"
+```
+
+- When present, these fields MUST be included in `effective_config.inputs`.
+- The harness MUST apply them to the selected backend deterministically and MUST record the final applied values in `effective_config.resolved.xcode_run`.
+- The lane MUST reject unknown keys under `xcode_run` (no free-form passthrough).
 
 **Profile inheritance (Normative):**
 
@@ -812,8 +871,10 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
 | `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
+| `object_store_encryption_required` | Remote storage requires explicit encryption policy (untrusted posture disallows none) | No |
 | `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
 | `unsafe_symlink_target` | A symlink target is unsafe under allow_safe policy | No |
+| `hardlinks_disallowed` | Source tree contains hardlinks but policy forbids them | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -991,6 +1052,12 @@ Source snapshot behavior is configured under `[profiles.<name>.source]`:
   - `forbid`: Source tree MUST NOT contain symlinks; if any are found, refuse with `symlinks_disallowed`.
   - `allow_safe`: Allow symlinks only if target is relative, does not start with `/`, and does not contain `..` path segments. Unsafe symlinks cause `unsafe_symlink_target`.
   - `allow_all`: Allow all symlinks (use with caution).
+- **`hardlinks`** — `"forbid"` | `"allow"`. Default: `"forbid"`.
+  - `forbid`: If any hardlinked files (same inode, multiple paths) are detected in the staged tree, refuse with `hardlinks_disallowed`.
+  - `allow`: Allow hardlinks (may cause surprising manifest semantics).
+- **`metadata`** — `"strip"` | `"preserve"`. Default: `"strip"`.
+  - `strip`: Staging MUST NOT preserve xattrs or ACLs. This improves reproducibility by eliminating macOS-specific metadata that can affect execution (quarantine flags, permissions) and cause drift between workers.
+  - `preserve`: Preserve xattrs and ACLs during staging (use with caution; may reduce reproducibility).
 
 ### Provenance (Optional, Strongly Recommended)
 
@@ -1075,6 +1142,7 @@ Each manifest entry MAY include:
 - `encryption` (string|null) — `"server_side"` | `"client_side"` | `"none"` (best-effort, when applicable).
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
 - `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
+- `sensitivity` (string|null) — `"public"` | `"internal"` | `"sensitive"`. Recommended for policy-aware retention/upload decisions. Enables CI to decide what to upload/retain based on sensitivity classification.
 
 ### Artifact Storage & Compression (Normative)
 
@@ -1095,9 +1163,13 @@ Artifact storage and compression are controlled via `[profiles.<name>.artifacts]
 [profiles.ci.artifacts.object_store]
 endpoint = "https://s3.example.com"
 bucket = "rch-artifacts"
-encryption = "server_side"     # "none" | "server_side" | "client_side"
+encryption = "server_side"     # REQUIRED: "server_side" | "client_side" | "none"
 kms_key_id = "..."             # optional when supported
 ```
+
+**Object-store encryption enforcement (Normative):**
+- If `store = "object_store"`, the profile MUST specify `artifacts.object_store.encryption`.
+- If `trust.posture = "untrusted"` and `encryption = "none"`, the lane MUST refuse with error code `object_store_encryption_required`.
 
 #### Compression Options
 
@@ -1174,6 +1246,9 @@ For `backend.actual = "xcodebuildmcp"`:
 - `tooling` — best-effort versions: `rsync`, `zstd` (when used)
 - `compression` — whether compression was used during transfer
 - `errors` — array of non-fatal staging errors/warnings
+- `metadata` (object) — staging metadata handling:
+  - `xattrs_stripped` (boolean) — Whether xattrs were stripped during staging
+  - `acls_stripped` (boolean) — Whether ACLs were stripped during staging
 
 ### `metrics.json` Requirements
 
@@ -1452,7 +1527,8 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
 - `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
 - `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
-- `probe.json` parses successfully and includes required capability fields (`protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
+- If `job_request_sha256` is present in `hello`/`complete` events, recompute and verify it matches `SHA-256(JCS(job_request_without_digest))`.
+- `probe.json` parses successfully and includes required fields (`kind`, `schema_version`, `protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
 - Recompute `run_id` as `SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
@@ -1575,6 +1651,7 @@ To prevent test pollution and flaky behavior from shared simulator state, profil
 strategy = "shared_prebooted"          # "shared_prebooted" | "per_job"
 erase_on_start = false                 # Erase simulator data before test run
 shutdown_on_end = true                 # Shutdown simulator after job completion
+device_set = "shared"                  # "shared" | "per_job" (Recommended for parallel CI)
 ```
 
 - `strategy = "shared_prebooted"` (default): Reuse prebooted simulators across jobs. Faster but may accumulate state.
@@ -1591,6 +1668,15 @@ When `erase_on_start = true`:
 - This is slower but ensures a clean state for each job.
 
 `effective_config.json` MUST record the actual `simulator_strategy` and `simulator_udid` used.
+
+**Device set isolation (Recommended; Normative when enabled):**
+
+When `simulator.device_set = "per_job"`:
+- The harness MUST set `SIMULATOR_DEVICE_SET_PATH` to a per-job path under the confined workspace (e.g., `worker_paths.work/device-set/`).
+- All `simctl` operations and simulator launches for the job MUST use that device set.
+- The harness MUST record `effective_config.resolved.simulator_device_set_path`.
+
+This reduces cross-job CoreSimulator interference and improves parallelism reliability by isolating the device database per job.
 
 ### Backend Path Discipline (Normative)
 

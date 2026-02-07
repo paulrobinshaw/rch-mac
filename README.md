@@ -176,7 +176,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 
 ```
 <job_id>/
-├── probe.json             # Captured worker harness probe output used for selection/verification
+├── probe.json             # Captured harness probe output (versioned: kind/schema_version) used for selection/verification
 ├── summary.json           # High-level status + timings (includes job_id, run_id, attempt, error_code)
 ├── job_request.json       # EXACT JSON sent to `rch-xcode-worker run` (sanitized; no secrets)
 ├── effective_config.json  # Resolved/pinned run configuration
