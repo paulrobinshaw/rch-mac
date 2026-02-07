@@ -661,11 +661,11 @@ def build_env(config: Config) -> Dict[str, str]:
     """Build environment for APR subprocess calls."""
     env = os.environ.copy()
     if config.oracle_host and config.oracle_port:
-        env["ORACLE_REMOTE_HOST"] = (
+        env["APR_ORACLE_REMOTE_HOST"] = (
             f"{config.oracle_host}:{config.oracle_port}"
         )
     if config.oracle_token:
-        env["ORACLE_REMOTE_TOKEN"] = config.oracle_token
+        env["APR_ORACLE_REMOTE_TOKEN"] = config.oracle_token
     env.setdefault("APR_CHECK_UPDATES", "0")
     env.setdefault("NO_COLOR", "1")
     return env
@@ -690,7 +690,7 @@ def run_apr_round(
 
     env = build_env(config)
     logger.debug(f"Running: {' '.join(cmd)}")
-    logger.debug(f"  env: ORACLE_REMOTE_HOST={env.get('ORACLE_REMOTE_HOST', '<unset>')}")
+    logger.debug(f"  env: APR_ORACLE_REMOTE_HOST={env.get('APR_ORACLE_REMOTE_HOST', '<unset>')}")
     logger.debug(f"  env: APR_ORACLE_MIN_STABLE_MS={env.get('APR_ORACLE_MIN_STABLE_MS', '<unset>')}")
     logger.debug(f"  env: APR_ORACLE_SETTLE_WINDOW_MS={env.get('APR_ORACLE_SETTLE_WINDOW_MS', '<unset>')}")
 
