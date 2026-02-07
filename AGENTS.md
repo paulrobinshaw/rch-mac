@@ -45,7 +45,7 @@ If README.md conflicts with PLAN.md, PLAN.md wins.
 
 ### When implementing
 - Start from PLAN.md, not README.md
-- The job lifecycle is: created → queued → staging → running → terminal
+- The job lifecycle is: created → staging → queued → running → collecting → uploading → terminal
 - All JSON artifacts use RFC 8785 (JCS) for canonicalization
 - `run_id = SHA-256(JCS(effective_config.inputs) || \n || source_tree_hash_hex)` — note: only `inputs` is hashed, not `resolved`
 - Worker communication should go through the harness protocol when available

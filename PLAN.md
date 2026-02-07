@@ -63,13 +63,18 @@ The probe JSON MUST include at minimum:
 - `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
 - `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
+- `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel"]` (and optionally `"cache_query"`).
+- `features` (object) — Feature flags/capabilities beyond versions, e.g.:
+  - `event_hash_chain` (boolean) — Whether hash-chained events are supported when enabled in config.
+  - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
+- `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load`). Enables capability drift detection.
 - `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
 - `xcode` (object) — `path`, `version`, `build` (Xcode build number).
 - `simulators` (object) — Available runtimes + device types (or a summarized digest).
 - `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
-- `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/xcresult-derived diagnostics). Enables the host/agents to understand expected event richness.
+- `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/diagnostics). Enables the host/agents to understand expected event richness.
 - `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
-- `load` (object) — Best-effort current load snapshot:
+- `load` (object) — Best-effort current load snapshot (**volatile; excluded from `capabilities_sha256`**):
   - `active_jobs` (integer) — Number of jobs currently executing.
   - `queued_jobs` (integer) — Number of jobs waiting for a lease slot.
   - `updated_at` (ISO 8601 timestamp) — When this snapshot was taken.
@@ -79,18 +84,37 @@ The host MUST select a `protocol_version` supported by both sides. If no overlap
 
 The host MUST also ensure the job's `effective_config.inputs.contract_version` is present in the harness `contract_versions`. If unsupported, the lane MUST refuse with stable error code `contract_version_unsupported`.
 
+**Capability drift (Recommended):**
+- The host SHOULD record `capabilities_sha256` in `attestation.json`.
+- Profiles MAY require `capabilities_sha256` stability across a CI run to detect worker/toolchain drift early (report via `decision.json`/`summary.json.errors[]`).
+
 2) `rch-xcode-worker run`
    - Reads exactly one JSON object (the job request) from stdin.
    - Emits NDJSON events to stdout (one JSON object per line).
    - Exits after emitting a terminal `complete` event.
 
-The harness SHOULD support an optional third verb:
+The harness SHOULD support a third verb:
 
 3) `rch-xcode-worker cancel`
    - Reads a single JSON object from stdin containing at minimum `job_id` (and SHOULD include `lease_id` if known).
    - Terminates the active backend process group for that job (SIGTERM, then SIGKILL after 10s).
    - Emits a single JSON object to stdout describing whether a process was found and terminated.
-   - Enables clean cancellation under forced-command mode without dropping the SSH session.
+   - **REQUIRED for deployments using `rch-xcode-worker --forced`** so the host can cancel without arbitrary remote commands.
+
+The harness MAY support an optional fourth verb:
+
+4) `rch-xcode-worker cache_query` (Optional; Recommended)
+   - Reads a single JSON object from stdin containing at minimum:
+     - `protocol_version`
+     - `config_hash` (lowercase hex SHA-256 of `JCS(effective_config.inputs)`)
+     - `kinds` (array of strings) — e.g. `["derived_data","spm"]`
+   - Emits a single JSON object to stdout and exits 0 on success:
+     - `config_hash`
+     - `namespace` (string) — effective cache namespace/trust boundary
+     - `derived_data` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
+     - `spm` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
+   - MUST NOT reveal any paths outside configured cache roots.
+   - Enables warm-cache worker selection (see Worker Selection below).
 
 **Job request (stdin) MUST include:**
 - `protocol_version` (string, e.g. `"1"`)
@@ -163,8 +187,9 @@ This enables streaming consumers to know the terminal outcome without waiting fo
 Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so the remote account cannot execute arbitrary commands. The harness MUST support `rch-xcode-worker --forced`, which:
 
 - Reads the requested verb from `SSH_ORIGINAL_COMMAND`
-- Allows ONLY `probe`, `run`, and optionally `cancel` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
+- Allows ONLY `probe`, `run`, `cancel`, and optionally `cache_query` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
+- **Note:** `cancel` MUST be supported in `--forced` mode to enable clean cancellation without arbitrary remote commands
 
 ---
 
@@ -233,7 +258,7 @@ require_build = "16C5032a"             # optional; strongest pin when available
 [profiles.ci.worker]
 require_tags = ["macos", "xcode"]      # default derives from lane, but profile may further restrict
 min_macos = "15.0"                     # optional constraint
-selection = "least_busy"               # "least_busy" | "warm_cache" | "random" (future)
+selection = "least_busy"               # "least_busy" | "warm_cache" | "random"
 
 [profiles.ci.cache]
 derived_data = true
@@ -389,6 +414,25 @@ Under `[profiles.<name>.destination]`, the following fields MAY be used:
 - `selector` — `"highest_udid"` | `"lowest_udid"` (future: more selectors)
 - `udid` — optional explicit simulator UDID (generally host/worker-specific; best for local-only profiles)
 
+### Worker Selection (Normative)
+
+Worker selection is controlled via `[profiles.<name>.worker].selection`:
+
+- `"least_busy"` (default): Select the eligible worker with lowest `probe.load.active_jobs`.
+- `"warm_cache"`: Select based on cache warmth (see below).
+- `"random"`: Random selection among eligible workers.
+
+**Worker Selection: `warm_cache` (Normative)**
+
+When `worker.selection = "warm_cache"`:
+- The host MUST compute `config_hash = SHA-256( JCS(effective_config.inputs) )` as lowercase hex.
+- For each eligible worker that advertises `"cache_query"` in `probe.verbs` (or `features.cache_query=true`), the host SHOULD invoke `cache_query` and score the worker:
+  - Scoring SHOULD prioritize DerivedData presence over SPM presence.
+  - Implementations MAY use weighted scoring (e.g., +100 for DerivedData present, +50 for SPM present) but MUST document their algorithm.
+- Tie-breakers (in order): lower `probe.load.active_jobs`, then lexicographic worker name.
+- If no worker supports `cache_query`, the host MUST fall back to `least_busy` selection.
+- The selected worker and selection rationale SHOULD be recorded in `decision.json.worker_candidates`.
+
 ---
 
 ## Job Lifecycle
@@ -396,12 +440,21 @@ Under `[profiles.<name>.destination]`, the following fields MAY be used:
 ### States
 
 ```
-1. created → 2. staging → 3. running → 4. terminal
-                                         ├── succeeded
-                                         ├── failed
-                                         ├── canceled
-                                         └── timed_out
+1. created → 2. staging → 3. queued → 4. running → 5. collecting → 6. uploading → 7. terminal
+                                                                                     ├── succeeded
+                                                                                     ├── failed
+                                                                                     ├── canceled
+                                                                                     └── timed_out
 ```
+
+**State descriptions:**
+- `created`: Job initialized, not yet started.
+- `staging`: Source snapshot being transferred to worker.
+- `queued`: Waiting for a worker lease slot (harness is source of truth).
+- `running`: Backend execution in progress on worker.
+- `collecting`: Artifacts being collected from worker.
+- `uploading`: Artifacts being uploaded to object store (when `store = "object_store"`).
+- Terminal states: `succeeded`, `failed`, `canceled`, `timed_out`.
 
 ### Job Identity (Normative)
 
@@ -475,7 +528,9 @@ This is distinct from `run_id` (which includes the source tree hash). The `confi
 
 When `rch xcode cancel <job_id>` is invoked:
 - The host MUST mark `status.json.state = "canceled"` once cancellation is confirmed or best-effort attempted.
-- The worker harness SHOULD terminate the active `xcodebuild` process group (SIGTERM, then SIGKILL after 10s).
+- The worker harness SHOULD terminate the active backend process group (SIGTERM, then SIGKILL after 10s).
+- If the worker is in `--forced` mode, the host MUST invoke `rch-xcode-worker cancel` and record its response.
+- If the worker does not support `cancel` (not in `verbs`), the host MUST record `cancel_not_supported` in `summary.json.errors[]`.
 - The lane MUST preserve partial artifacts collected so far and MUST still emit terminal `summary.json` and `manifest.json`.
 
 ### Worker Workspace Layout + Retention (Normative)
@@ -637,6 +692,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `dirty_working_tree` | Working tree has uncommitted changes and require_clean=true | No |
 | `timeout` | Job exceeded configured timeout_seconds | No |
 | `canceled` | Job was canceled by user | No |
+| `cancel_failed` | Cancel command executed but worker could not terminate the job | Yes |
+| `cancel_not_supported` | Worker/harness does not support cancel (disallowed in `--forced` deployments) | No |
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
 | `events_quota_exceeded` | Event stream exceeded configured byte cap | No |
 | `event_line_too_long` | A single event exceeded configured per-line cap | No |
@@ -763,6 +820,22 @@ When `verify_after_stage = true`:
 
 This check catches rsync drift, disk corruption, and staging misconfiguration before the build begins.
 
+#### Post-run Source Integrity Check (Optional; Normative when enabled)
+
+Profiles MAY enable a post-run integrity check:
+
+```toml
+[profiles.ci.source]
+verify_after_run = true
+```
+
+When `verify_after_run = true`:
+- The worker harness MUST compute `observed_source_tree_hash_after_run` using the same Canonical Source Manifest rules.
+- If the post-run hash differs from the expected `source_tree_hash`, the job MUST fail with stable error code `source_tree_modified`.
+- `attestation.json` MUST record: `source.verify_after_run` (boolean), and when enabled: `source.observed_tree_hash_after_run`.
+
+This detects if build scripts or plugins silently modified the staged source tree during execution.
+
 #### Canonical Source Manifest (Normative)
 
 The lane MUST produce a canonical manifest of the staged source and MUST use it to compute `source_tree_hash`. This enables reproducibility verification and debugging.
@@ -844,6 +917,7 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ~/.local/share/rch/artifacts/jobs/<job_id>/
 ├── probe.json             # Captured worker harness probe output used for selection/verification
 ├── summary.json           # Machine-readable outcome + timings
+├── job_request.json       # Exact JSON request sent to harness `run` (MUST NOT contain secret values)
 ├── effective_config.json  # Fully-resolved config used for the job
 ├── attestation.json       # Toolchain + environment fingerprint
 ├── source_manifest.json   # Canonical file list + per-entry hashes used to compute source_tree_hash
@@ -1033,9 +1107,23 @@ This enables streaming consumers to verify event integrity incrementally without
 | `test_case_failed` | A single test case fails (includes failure message) |
 | `test_suite_completed` | A test suite finishes (includes pass/fail counts) |
 | `warning` | Non-fatal issue detected |
+| `diagnostic` | Structured diagnostic (file/line/message) suitable for agent consumption |
 | `error` | Fatal error during execution |
 | `heartbeat` | Periodic liveness signal (at least every 10s) |
 | `complete` | Final event; includes terminal state + error model + `exit_code` |
+
+**`diagnostic` event payload (Recommended):**
+
+When emitting `diagnostic` events, the harness SHOULD include:
+- `severity` — `"error"` | `"warning"` | `"note"`
+- `message` (string) — The diagnostic message.
+- `file` (string|null) — Source file path (relative to staged source root).
+- `line` (integer|null) — Line number (1-based).
+- `column` (integer|null) — Column number (1-based).
+- `category` (string|null) — Diagnostic category, e.g. `"compiler"`, `"linker"`, `"test"`.
+- `code` (string|null) — Diagnostic code if available.
+
+This provides a structured middle ground between parsing `xcresult` (heavy) and scraping logs (fragile), enabling real-time "file:line + message" feedback for agents.
 
 **Optional stream digest (Recommended):**
 
@@ -1055,7 +1143,7 @@ Consumers MUST tolerate unknown event types (forward compatibility).
 **Required fields:**
 
 - `job_id`, `run_id`, `attempt` — Job identity fields.
-- `state` — Current lifecycle state (`created`, `staging`, `running`, `succeeded`, `failed`, `canceled`, `timed_out`).
+- `state` — Current lifecycle state (`created`, `staging`, `queued`, `running`, `collecting`, `uploading`, `succeeded`, `failed`, `canceled`, `timed_out`).
 - `updated_at` — ISO 8601 timestamp of last update.
 - `queued_at` — ISO 8601 timestamp of when the job entered the queue (null if never queued).
 - `started_at` — ISO 8601 timestamp of when execution began on the worker (null if not yet started).
@@ -1065,6 +1153,10 @@ Consumers MUST tolerate unknown event types (forward compatibility).
 
 - `progress` — Free-form string (e.g., `"Compiling 42/128 files"`).
 - `worker` — Name of the assigned worker.
+- `bytes` — Optional transfer snapshot:
+  - `staging_sent` (integer|null) — Bytes sent during staging.
+  - `artifacts_received` (integer|null) — Bytes received during collection.
+  - `uploaded` (integer|null) — Bytes uploaded to object store.
 
 ---
 
@@ -1144,6 +1236,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain selection/verification/refusal decisions (human + `--json`) |
 | `rch xcode retry <job_id>` | Retry a failed job with incremented attempt (preserves run_id when unchanged) |
+| `rch xcode reuse <run_id>` | Locate a succeeded attempt for run_id and return its artifact pointer (optionally validates) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
 
 **Machine-readable CLI output (Normative):**
@@ -1172,6 +1265,17 @@ This enables agent/CI integration without log scraping and provides consistent e
 
 This provides a one-command path for agents to understand worker selection, pinning decisions, and refusal reasons without parsing multiple artifacts.
 
+### `reuse` Output (Normative when `--json`)
+
+`rch xcode reuse --json` MUST emit a single envelope object:
+- Standard envelope fields: `kind`, `schema_version`, `lane_version`, `ok`, `error_code`, `errors`
+- `kind`: `"reuse_result"`
+- `run_id` (string) — The run_id that was queried.
+- `selected` (object|null): `{ job_id, attempt, path }` — The selected succeeded attempt, or null if none found.
+- `validated` (boolean) — true if validation was performed and passed.
+
+This enables agents to find and reuse existing succeeded runs without re-executing identical jobs.
+
 ### `doctor` Checks (Host)
 
 - RCH daemon running
@@ -1195,7 +1299,9 @@ The `validate` command verifies artifact integrity and consistency for a complet
 
 - All files listed in `manifest.json` exist and have matching SHA-256 hashes.
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
-- `probe.json` parses successfully and includes required capability fields (`protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`).
+- `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
+- `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
+- `probe.json` parses successfully and includes required capability fields (`protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
 - Recompute `run_id` as `SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
@@ -1479,6 +1585,8 @@ To prevent contract drift between host and harness:
 | Event hash chain | Disabled | `[profiles.<name>.integrity] event_hash_chain = true` |
 | Cache promote on failure | Disabled | `[profiles.<name>.cache] promote_on_failure = true` |
 | Symlinks in source | `forbid` (untrusted) / `allow_safe` (trusted) | `[profiles.<name>.source] symlinks = "allow_all"` |
+| Post-run source verification | Disabled | `[profiles.<name>.source] verify_after_run = true` |
+| Worker selection | `least_busy` | `[profiles.<name>.worker] selection = "warm_cache"` |
 
 ---
 

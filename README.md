@@ -28,7 +28,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 └──────────────┘                                   └───────────────────┘
 ```
 
-1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, Xcode, runtimes, backends).
+1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, supported `verbs`, stable `capabilities_sha256`, Xcode, runtimes, backends).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
 3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
    - Production setups SHOULD use the harness in **forced-command mode** so SSH cannot run arbitrary commands.
@@ -99,9 +99,12 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain worker selection + pinning + refusal reasons (human + `--json`) |
 | `rch xcode retry <job_id>` | Retry a failed job (increments attempt; keeps run_id if inputs/source unchanged) |
+| `rch xcode reuse <run_id>` | Reuse an existing succeeded attempt for a run_id (optionally validates first) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
 
 Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
+
+**Performance tip:** If you enable `worker.selection = "warm_cache"`, the host can optionally query workers for cache presence keyed by `config_hash` and route the job to the warmest eligible worker (see `PLAN.md` Worker Selection and Cache Query verb).
 
 ## Setup
 
@@ -164,6 +167,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 <job_id>/
 ├── probe.json             # Captured worker harness probe output used for selection/verification
 ├── summary.json           # High-level status + timings (includes job_id, run_id, attempt, error_code)
+├── job_request.json       # EXACT JSON sent to `rch-xcode-worker run` (sanitized; no secrets)
 ├── effective_config.json  # Resolved/pinned run configuration
 ├── decision.json          # Interception/classification decision + refusal reasons (stable error codes)
 ├── attestation.json       # Worker identity, tool versions, repo state
