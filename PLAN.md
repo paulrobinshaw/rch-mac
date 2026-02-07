@@ -34,9 +34,9 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 
 - Classifies commands (strict allowlist)
 - Selects an eligible worker (tags: `macos,xcode`)
-- Syncs workspace snapshot (rsync + excludes)
+- Syncs workspace snapshot (data-plane staging; rsync or bundle depending on profile)
 - Executes by invoking the worker harness (`rch-xcode-worker run`) over SSH (single protocol)
-- Streams logs; assembles artifacts; emits manifest + attestation
+- Collects artifacts back to host (data-plane fetch); emits manifest + attestation
 
 ### Worker (macOS)
 
@@ -130,13 +130,18 @@ The terminal `complete` event MUST include:
 - `errors` (array) — array of error objects from the Error Model (may be empty on success)
 - `backend` (object) — `{ "preferred": "...", "actual": "..." }`
 - `events_sha256` (string|null) — digest over emitted event bytes (excluding the `complete` line itself)
+- `event_chain_head_sha256` (string|null) — when hash chain enabled, the `event_sha256` of the last non-`complete` event
 - `artifact_summary` (object) — small summary, e.g. `{ "xcresult": true, "xcresult_format": "directory|tar.zst" }`
 
 This enables streaming consumers to know the terminal outcome without waiting for artifact assembly.
 
 **Robustness (Normative):**
-- If the harness cannot emit valid JSON for an event, it MUST fail the job with a terminal `complete` event whose payload includes error code `event_stream_corrupt`.
 - The harness MUST NOT emit partial JSON lines or unterminated objects to stdout.
+- If the harness detects it cannot encode a non-terminal event as valid JSON, it MUST attempt to:
+  1) emit a terminal `complete` event with `error_code="event_stream_corrupt"`, then
+  2) exit promptly.
+- If the harness cannot emit a valid terminal `complete` event, it MUST exit non-zero and write a diagnostic marker to stderr.
+  In this case, the host MUST record `event_stream_corrupt` in `summary.json` and include an error object indicating the stream ended without a valid terminal event.
 
 **Benefits:**
 
@@ -280,7 +285,8 @@ tags = ["macos", "xcode"]
 ssh_user = "rch"
 ssh_port = 22
 ssh_run_key = "~/.ssh/rch_run_ed25519"       # used only for harness probe/run
-ssh_rsync_key = "~/.ssh/rch_rsync_ed25519"   # used only for staging (rrsync-restricted)
+ssh_stage_key = "~/.ssh/rch_stage_ed25519"   # used only for staging (rrsync write-only, confined to stage_root)
+ssh_fetch_key = "~/.ssh/rch_fetch_ed25519"   # used only for fetching artifacts (rrsync read-only, confined to jobs_root)
 ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
 
 # Worker roots (used to compute per-job workspaces deterministically)
@@ -302,11 +308,26 @@ Profiles MAY define `[profiles.<name>.trust]` to require host key pinning:
 ```toml
 [profiles.ci.trust]
 require_pinned_host_key = true
+posture = "auto"   # "auto" | "trusted" | "untrusted"
 ```
 
 When `require_pinned_host_key = true`, the lane MUST refuse to run unless the selected worker has `ssh_host_key_fingerprint` configured in `workers.toml`. Refusal MUST use error code `unpinned_worker_disallowed` and include a hint describing how to pin the worker.
 
 This enables CI profiles to enforce a stronger trust posture than local development profiles.
+
+### Optional Integrity Controls (Recommended for CI / remote storage)
+
+Profiles MAY enable an event hash chain for tamper-evident streaming verification:
+
+```toml
+[profiles.ci.integrity]
+event_hash_chain = true   # default: false
+```
+
+When enabled, the harness MUST include hash chain fields in event output (see `events.ndjson` Requirements below). This provides:
+- Streaming-time integrity verification (line-by-line validation)
+- Tamper evidence even if someone edits the file and recomputes only a final digest
+- Better forensic confidence for canceled/terminated mid-stream jobs
 
 ### Resolution Rules
 
@@ -599,6 +620,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
+| `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -616,14 +638,19 @@ Implementations MAY define additional codes; consumers MUST tolerate unknown cod
 - Operators SHOULD deploy workers as dedicated, non-sensitive machines/accounts.
 - Operators SHOULD use a dedicated macOS user account with minimal privileges for RCH runs.
 
-### Repo Trust Posture (Recommended)
+### Repo Trust Posture (Normative)
 
-The host SHOULD classify the source as `trusted` or `untrusted` (e.g., fork PRs, unknown remotes, patch inputs).
-When `untrusted`, the lane SHOULD automatically enforce:
+Profiles MAY control trust posture explicitly via `[profiles.<name>.trust]`:
+- `trust.posture = "trusted"` forces trusted posture
+- `trust.posture = "untrusted"` forces untrusted posture
+- `trust.posture = "auto"` (default) lets the host decide based on CI context / repo provenance
 
+When posture is `untrusted`, the lane MUST enforce (regardless of profile defaults):
 - `code_signing_allowed = false`
-- `cache.mode = "read_only"` (or `"off"` if configured)
 - `allow_mutating = false`
+- `cache.mode = "read_only"` (or `"off"` if profile sets caches off)
+- If `action = "test"`, the lane MUST set (or require) `simulator.strategy = "per_job"` unless explicitly overridden for local use.
+- If artifacts may leave the host (`store = "worker"` or `"object_store"`), the lane MUST enable log redaction (`redaction.enabled = true`) or refuse with a stable error code `untrusted_remote_storage_requires_redaction`.
 
 The applied posture MUST be recorded in `decision.json` (as `trust_posture`) and `effective_config.json` (as final resolved values). This ensures the lane is safer-by-default even when configs drift.
 
@@ -634,8 +661,9 @@ The lane assumes repos may execute arbitrary code during build/test. Operators S
 - Use a dedicated macOS user with minimal privileges and no interactive shell access where feasible.
 - Prefer a **forced-command run key** restricted to executing `rch-xcode-worker`:
   - Key options: `no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict`
-- Prefer a separate **restricted rsync key** confined to a staging root (e.g., via `rrsync`):
-  - Limits reads/writes to `~/Library/Caches/rch-xcode-lane/` (or operator-chosen root)
+- Use separate, restricted **data-plane keys** (recommended):
+  - **Stage key**: write-only, confined to the `stage_root/` (push source snapshot)
+  - **Fetch key**: read-only, confined to the `jobs_root/` (pull artifacts back)
 
 **Example `authorized_keys` entries (illustrative):**
 
@@ -643,8 +671,11 @@ The lane assumes repos may execute arbitrary code during build/test. Operators S
 # Run key (forced to harness in --forced mode; verb comes from SSH_ORIGINAL_COMMAND):
 command="/usr/local/bin/rch-xcode-worker --forced",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-run
 
-# Rsync key (confined to staging root):
-command="/usr/local/bin/rrsync -wo ~/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-rsync
+# Stage key (write-only, confined to staging root):
+command="/usr/local/bin/rrsync -wo ~/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-stage
+
+# Fetch key (read-only, confined to jobs root):
+command="/usr/local/bin/rrsync -ro ~/Library/Caches/rch-xcode-lane/jobs",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-fetch
 ```
 
 ---
@@ -901,6 +932,19 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 - `run_id` — Content-derived identifier.
 - `attempt` — Attempt number for this run_id.
 
+**Optional event hash chain (Normative when enabled):**
+
+When `[profiles.<name>.integrity].event_hash_chain = true`:
+- Every non-`complete` event MUST include:
+  - `prev_event_sha256` (string) — lowercase hex SHA-256 of the previous non-`complete` event's JSON line bytes
+  - `event_sha256` (string) — lowercase hex SHA-256 of this event, computed as:
+    `SHA-256( prev_event_sha256 || "\n" || JCS(event_without_chain_fields) )`
+  - Where `event_without_chain_fields` is the full event object with `prev_event_sha256` and `event_sha256` removed.
+- The first event (`hello`) MUST use `prev_event_sha256` = 64 zero hex characters (`"0000...0000"`).
+- The terminal `complete` event MUST include `event_chain_head_sha256` equal to the last non-`complete` event's `event_sha256`.
+
+This enables streaming consumers to verify event integrity incrementally without waiting for the final `events_sha256` digest.
+
 **Sequence integrity (Normative):**
 
 - `sequence` MUST start at 1 and MUST increase by exactly 1 for each subsequent event (no gaps).
@@ -1003,6 +1047,20 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 - `duration_seconds` — Total test execution time.
 - `failures` — Array of `{ suite, test_case, message, file, line }` objects.
 
+### `sarif.json` (Recommended for CI)
+
+Standard SARIF output for build diagnostics and (optionally) test failures:
+- SHOULD be derived from `xcresult` when available (preferred over log scraping).
+- MUST be stable and schema-valid SARIF so CI systems can ingest it without custom tooling.
+- Enables GitHub code scanning, PR annotations, and other SARIF-compatible integrations.
+
+### `annotations.json` (Recommended for agent workflows)
+
+A small, lane-defined diagnostic summary intended for UIs and agents:
+- `{ kind, schema_version, lane_version, items: [...] }`
+- Each item SHOULD include `{ severity, message, file, line, code|null, category }`
+- Provides "file:line + message" format for agent consumption without bespoke xcresult parsing.
+
 ---
 
 ## Commands
@@ -1019,6 +1077,8 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity (+ provenance if enabled) |
 | `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
+| `rch xcode explain <job_id\|run_id\|path>` | Explain selection/verification/refusal decisions (human + `--json`) |
+| `rch xcode retry <job_id>` | Retry a failed job with incremented attempt (preserves run_id when unchanged) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
 
 **Machine-readable CLI output (Normative):**
@@ -1034,6 +1094,18 @@ JSON outputs MUST use a standard envelope with:
 - `errors` (array) — Array of error objects from the Error Model
 
 This enables agent/CI integration without log scraping and provides consistent error handling across all commands.
+
+### `explain` Output (Normative when `--json`)
+
+`rch xcode explain --json` MUST emit a single envelope object:
+- `kind`: `"explain_result"`
+- `schema_version`, `lane_version`, `ok`, `error_code`, `errors` (standard envelope fields)
+- `job` (object|null): `{ job_id, run_id, attempt }`
+- `decision` (object|null): parsed/normalized `decision.json`
+- `selection` (object|null): worker candidates + reasons (when available)
+- `pins` (object|null): resolved Xcode build, runtime/device IDs, backend actual, and whether host key was pinned
+
+This provides a one-command path for agents to understand worker selection, pinning decisions, and refusal reasons without parsing multiple artifacts.
 
 ### `doctor` Checks (Host)
 
@@ -1062,6 +1134,7 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - JSON artifacts validate against their schemas (when schemas are available).
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
+- If hash chain fields are present, verify the chain (`prev_event_sha256`/`event_sha256`) and that `event_chain_head_sha256` matches the final non-`complete` event.
 - `job_id`, `run_id`, `attempt` are consistent across artifacts.
 - `summary.json` terminal state is consistent with `events.ndjson` terminal `complete` event (exit_code, error_code).
 - If a run index (`runs/<run_id>/attempt-<n>`) exists, it MUST point to the matching `jobs/<job_id>` directory.
@@ -1120,6 +1193,27 @@ The worker MUST enforce the cache mode:
 `metrics.json` MUST record:
 - `cache_mode` — The effective cache mode for the job.
 - `cache_writable` — Boolean: whether the cache was writable for this job (false for `off` and `read_only`).
+
+#### Atomic Cache Promotion (Normative)
+
+To prevent cache corruption and poisoning:
+- The worker MUST NOT write directly into the shared cache namespace during a job.
+- The worker MUST use per-job cache work directories (e.g., under `jobs/<job_id>/cache-work/` or `cache_root/tmp/<job_id>/`).
+- When `cache.mode = "read_write"`:
+  - The worker MAY promote updated cache entries ONLY if the job terminal state is `succeeded`, unless explicitly overridden.
+  - Promotion MUST be atomic (e.g., write to a new directory then `rename(2)` swap) so readers never observe partial state.
+- When `cache.mode = "read_only"`:
+  - The worker MUST ensure shared caches are not modified (best-effort via permissions and/or copy-on-write cloning).
+  - Any attempted modification detected by the worker SHOULD emit a warning event and MUST NOT mutate the shared cache namespace.
+
+Profiles MAY opt into "promote on failure" for specialized workflows:
+
+```toml
+[profiles.<name>.cache]
+promote_on_failure = false   # default: false
+```
+
+**Performance note (Non-normative):** On macOS, `clonefile(2)` can provide fast copy-on-write snapshots for DerivedData.
 
 #### Cache Isolation (Normative)
 
@@ -1237,7 +1331,7 @@ retry_on = ["lease_expired", "worker_unreachable", "source_staging_failed", "art
 
 **Manual retry:**
 
-`rch xcode retry <job_id>` MAY be provided to manually retry a failed job with `attempt` incremented. The new attempt inherits the original `run_id` if source and config are unchanged.
+`rch xcode retry <job_id>` SHOULD be provided to manually retry a failed job with `attempt` incremented. The new attempt inherits the original `run_id` if source and config are unchanged.
 
 ---
 
@@ -1269,6 +1363,20 @@ retry_on = ["lease_expired", "worker_unreachable", "source_staging_failed", "art
 
 ---
 
+## Conformance & Fixtures (Recommended; Normative for the repo implementing this spec)
+
+To prevent contract drift between host and harness:
+- The repository implementing the lane SHOULD include a `fixtures/` directory with:
+  - `fixtures/probe/` — probe JSON examples (multiple protocol versions if supported)
+  - `fixtures/events/` — NDJSON event streams covering success/failure/cancel/timeout and corruption cases
+  - `fixtures/jobs/` — minimal artifact directories used to exercise `rch xcode validate`
+- CI SHOULD run a conformance job that:
+  - Validates all JSON artifacts against schemas
+  - Recomputes and verifies `run_id`, `config_hash`, and `source_tree_hash`
+  - Runs `validate` against `fixtures/jobs/*` and asserts stable error codes for known-bad fixtures
+
+---
+
 ## Policies Summary
 
 | Policy | Default | Override |
@@ -1288,6 +1396,9 @@ retry_on = ["lease_expired", "worker_unreachable", "source_staging_failed", "art
 | Environment passthrough | Disallowed | `[profiles.<name>.env] allow = [...]` |
 | Log redaction | Disabled | `[profiles.<name>.redaction] enabled = true` |
 | Backend preference | `xcodebuildmcp` | `[profiles.<name>.backend] preferred = "xcodebuild"` |
+| Trust posture | `auto` | `[profiles.<name>.trust] posture = "untrusted"` |
+| Event hash chain | Disabled | `[profiles.<name>.integrity] event_hash_chain = true` |
+| Cache promote on failure | Disabled | `[profiles.<name>.cache] promote_on_failure = true` |
 
 ---
 

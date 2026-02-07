@@ -52,13 +52,17 @@ Recommended:
   - Prefer a forced-command key for `rch-xcode-worker --forced`
     (harness reads `SSH_ORIGINAL_COMMAND` and only allows `probe`/`run`;
     no-pty, no-agent-forwarding, no-port-forwarding)
-  - Use a separate, restricted rsync key confined to the workspace/staging root (e.g., `rrsync`)
+  - Use separate, restricted data-plane keys (recommended):
+    - **Stage key**: write-only, confined to the `stage_root/` (push source snapshot)
+    - **Fetch key**: read-only, confined to the `jobs_root/` (pull artifacts back)
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
 - Prefer a **read-only staged source root** on the worker so project scripts/plugins cannot silently rewrite inputs
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
 - CI profiles SHOULD require pinning (lane can refuse if worker has no configured fingerprint)
 
 See `PLAN.md` § Safety Rules for the full threat model.
+
+Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untrusted posture" (`trust.posture = "untrusted"`) so the lane automatically disables signing, forces read-only caches, tightens simulator hygiene, and requires log redaction for remote artifact storage.
 
 ## Requirements
 
@@ -67,6 +71,7 @@ See `PLAN.md` § Safety Rules for the full threat model.
 - Xcode installed (pinned version; lane records Xcode build number)
 - SSH access (key-based)
 - `rsync` + `zstd` (fast sync + compression)
+- Optional but recommended: `rrsync` (or equivalent) to confine stage/fetch keys to lane roots
 - Node.js + XcodeBuildMCP (recommended backend)
 - `rch-xcode-worker` harness (**required**): stable remote probe/run/collect interface
   - Strongly recommended: forced-command SSH key (`authorized_keys command=...`) running `rch-xcode-worker --forced`
@@ -86,10 +91,12 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | `rch xcode plan --profile <name>` | Resolve effective config + select worker + resolve destination (no staging/run) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
-| `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
+| `rch xcode fetch <job_id>` | Pull remote artifacts (worker/object store), verify hashes, materialize locally |
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity |
 | `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
+| `rch xcode explain <job_id\|run_id\|path>` | Explain worker selection + pinning + refusal reasons (human + `--json`) |
+| `rch xcode retry <job_id>` | Retry a failed job (increments attempt; keeps run_id if inputs/source unchanged) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
 
 Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
@@ -99,7 +106,9 @@ Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 1. Register the Mac mini in `~/.config/rch/workers.toml` with tags `macos,xcode`
 2. Pin the worker SSH host key fingerprint (CI profiles SHOULD require this)
 3. Install `rch-xcode-worker` on the worker and configure the **run key** as forced-command
-4. Configure a separate restricted **rsync key** (e.g., `rrsync`) confined to the staging root
+4. Configure restricted data-plane keys (recommended):
+   - **Stage key** (rrsync write-only) confined to `stage_root/`
+   - **Fetch key** (rrsync read-only) confined to `jobs_root/`
 5. Add repo config at `.rch/xcode.toml` (see example below)
 6. Start the daemon: `rch daemon start`
 7. Check setup: `rch xcode doctor`
@@ -162,7 +171,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 ├── timing.json            # Phase durations (staging/running/collecting)
 ├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
-├── events.ndjson          # Structured event stream (append-only)
+├── events.ndjson          # Structured event stream (append-only; optional hash chain for tamper-evident verification)
 ├── build.log              # Captured harness stderr (human logs + backend output)
 ├── redaction_report.json  # Optional: what redaction/truncation was applied (no secret values)
 ├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
