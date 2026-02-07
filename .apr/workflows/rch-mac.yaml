@@ -10,7 +10,7 @@ documents:
   implementation: "/data/projects/rch-mac/IMPLEMENTATION.md"
 
 oracle:
-  model: "gpt-5.2-pro"
+  model: "gpt-5.2-thinking"
   thinking_time: heavy
 
 rounds:
