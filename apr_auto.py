@@ -671,6 +671,32 @@ def build_env(config: Config) -> Dict[str, str]:
     return env
 
 
+def _clear_stale_oracle_session(config: Config, logger: logging.Logger) -> None:
+    """Clear stale Oracle sessions that block new runs.
+
+    Oracle refuses to start when a session with the same prompt is already
+    'running'. This clears all stored sessions so the next apr run succeeds.
+    """
+    env = build_env(config)
+    oracle_cmd = ["oracle", "session", "--clear", "--all"]
+    host = env.get("APR_ORACLE_REMOTE_HOST")
+    token = env.get("APR_ORACLE_REMOTE_TOKEN")
+    if host:
+        oracle_cmd.extend(["--remote-host", host])
+    if token:
+        oracle_cmd.extend(["--remote-token", token])
+    try:
+        r = subprocess.run(
+            oracle_cmd, capture_output=True, text=True,
+            env=env, timeout=30,
+        )
+        logger.debug(f"  Session clear exit={r.returncode}")
+        if r.stderr:
+            logger.debug(f"  {r.stderr.strip()[:200]}")
+    except Exception as exc:
+        logger.debug(f"  Session clear failed: {exc}")
+
+
 def run_apr_round(
     round_num: int,
     config: Config,
@@ -712,6 +738,30 @@ def run_apr_round(
 
     if result.returncode == 0:
         return True, ""
+
+    # Detect stale session blocking — Oracle refuses duplicate slugs.
+    # If found, clear it by starting a force-run directly via oracle CLI,
+    # then retry via apr run.
+    combined_output = (result.stdout or "") + (result.stderr or "")
+    if "already running" in combined_output and "rerun with --force" in combined_output:
+        logger.warning("  ⚠️  Stale Oracle session detected — retrying with --force via oracle CLI")
+        _clear_stale_oracle_session(config, logger)
+        # Retry the apr run once more
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=ROUND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"Timed out after {ROUND_TIMEOUT_SECONDS}s (post-force retry)"
+        if result.stderr:
+            for line in result.stderr.strip().splitlines():
+                logger.debug(f"  [apr] {line.rstrip()}")
+        if result.returncode == 0:
+            return True, ""
 
     # Map exit codes
     error_map = {
