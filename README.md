@@ -35,6 +35,16 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
 5. **Attest** toolchain + environment; emit machine-readable outputs for CI/agents.
 
+## Versioning at a Glance (Non-normative)
+
+There are four distinct version streams:
+- **protocol_version**: host↔harness wire protocol for `probe/run/cancel/...` (negotiated).
+- **contract_version**: meaning of `effective_config.inputs` (hashed); changing semantics MUST bump this.
+- **lane_version**: implementation/spec version (may change without affecting hashes).
+- **schema_version**: per-artifact JSON schema version (validators key off this).
+
+If `protocol_version` or `contract_version` don't overlap between host and harness, the lane refuses deterministically.
+
 ## Non-goals
 
 - Not a remote IDE and not a general "run anything on the Mac" executor
@@ -101,6 +111,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode retry <job_id>` | Retry a failed job (increments attempt; keeps run_id if inputs/source unchanged) |
 | `rch xcode reuse <run_id>` | Reuse an existing succeeded attempt for a run_id (optionally validates first) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
+| `rch xcode warm [--profile <name>]` | Ask workers to prewarm simulator runtimes/caches for a profile |
 
 Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 
@@ -175,6 +186,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 ├── manifest.json          # Artifact listing + SHA-256 hashes
 ├── environment.json       # Worker environment snapshot
 ├── timing.json            # Phase durations (staging/running/collecting)
+├── staging.json           # Staging method + excludes + transfer stats (bytes/files/duration)
 ├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only; optional hash chain for tamper-evident verification)

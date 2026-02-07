@@ -28,6 +28,31 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 
 ---
 
+## Versioning & Compatibility (Normative)
+
+### Version Streams
+
+There are four distinct version streams:
+
+- **`protocol_version`**: Negotiated for host↔harness verbs (`probe`, `run`, `cancel`, etc.). Backward compatible changes MUST NOT change the meaning of existing fields.
+- **`contract_version`**: Required overlap; defines semantics of `effective_config.inputs` (hashed). Any semantic change to hashed inputs MUST bump `contract_version`.
+- **`lane_version`**: Implementation/spec version. MAY change without changing `contract_version`.
+- **`schema_version`**: Per-artifact schema version. Validators MUST key off `kind` + `schema_version`.
+
+### Negotiation Rules
+
+- Host MUST select the **highest** common `protocol_version` from the intersection of host-supported and harness-advertised versions.
+- Host MUST refuse if the job's `effective_config.inputs.contract_version` is not present in the harness `contract_versions`. Error code: `contract_version_unsupported`.
+- Host MUST record the selected `protocol_version` and enforced `contract_version` in `attestation.json`.
+
+### Deprecation Policy
+
+- Harness/host SHOULD support at least the current and immediately prior **minor** `protocol_version` (when feasible).
+- Harness MUST be allowed to support multiple `contract_versions` concurrently, but MUST advertise them explicitly in `probe.contract_versions`.
+- When dropping support for a `contract_version`, implementations SHOULD provide at least one release cycle of deprecation warning.
+
+---
+
 ## Core Architecture
 
 ### Host (RCH daemon)
@@ -62,6 +87,11 @@ The probe JSON MUST include at minimum:
 - `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
 - `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
 - `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
+- `harness_binary_sha256` (string) — Lowercase hex SHA-256 of the harness executable bytes (or signed package payload).
+- `codesign` (object|null) — Best-effort code signing identity info when available:
+  - `identifier` (string|null)
+  - `team_id` (string|null)
+  - `signing_sha256` (string|null) — Optional digest of the signing blob/requirement.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
 - `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel"]` (and optionally `"cache_query"`).
 - `features` (object) — Feature flags/capabilities beyond versions, e.g.:
@@ -79,6 +109,11 @@ The probe JSON MUST include at minimum:
   - `queued_jobs` (integer) — Number of jobs waiting for a lease slot.
   - `updated_at` (ISO 8601 timestamp) — When this snapshot was taken.
 - `roots` (object) — Canonical harness roots used to derive per-job paths (especially in `--forced` mode): `stage_root`, `jobs_root`, `cache_root`.
+- `health` (object) — Best-effort worker health snapshot (**volatile; excluded from `capabilities_sha256`**):
+  - `disk_free_bytes` (integer|null)
+  - `disk_total_bytes` (integer|null)
+  - `degraded` (boolean) — true if the harness believes the worker is not in a healthy execution state
+  - `notes` (array of strings) — human hints; MUST NOT contain secrets
 
 The host MUST select a `protocol_version` supported by both sides. If no overlap exists, the lane MUST refuse with stable error code `protocol_version_unsupported`.
 
@@ -116,6 +151,20 @@ The harness MAY support an optional fourth verb:
    - MUST NOT reveal any paths outside configured cache roots.
    - Enables warm-cache worker selection (see Worker Selection below).
 
+The harness MAY support an optional fifth verb:
+
+5) `rch-xcode-worker prewarm` (Optional; Recommended)
+   - Reads a single JSON object from stdin containing:
+     - `protocol_version`
+     - `destination` (optional) — runtime/device identifiers to prewarm
+     - `kinds` (array) — e.g., `["simulator_boot", "spm_prefetch"]`
+   - Emits a single JSON object to stdout and exits 0 on success:
+     - `ok` (boolean)
+     - `performed` (array) — list of prewarm actions completed
+     - `warnings` (array) — non-fatal issues encountered
+   - MUST NOT mutate shared caches when `trust.posture` is `"untrusted"` (best-effort).
+   - Enables reducing cold-start tax for CI and agent loops.
+
 **Job request (stdin) MUST include:**
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
@@ -130,6 +179,11 @@ The harness MAY support an optional fourth verb:
 
 **Path Confinement (Normative):**
 - In `--forced` mode, the harness MUST compute `src/`, `work/`, `dd/` and related paths solely from (`jobs_root`, `stage_root`, `cache_root`) + `job_id` (and optional stable subpaths).
+- The harness MUST validate `job_id`, `run_id`, and `attempt` before using them for path derivation:
+  - `job_id` MUST match `^[0-9a-fA-F-]{16,64}$` (UUID v7 recommended).
+  - `run_id` MUST be 64 lowercase hex chars.
+  - `attempt` MUST be an integer >= 1.
+  On validation failure: fail with stable error code `invalid_job_identity`.
 - The harness MUST reject any request whose effective paths would escape the configured roots (after resolving `..` and symlinks) with stable error code `path_out_of_bounds`.
 - The harness MUST treat `paths` from the host as *hints only* (or ignore entirely) when `--forced` is active.
 
@@ -259,6 +313,8 @@ require_build = "16C5032a"             # optional; strongest pin when available
 require_tags = ["macos", "xcode"]      # default derives from lane, but profile may further restrict
 min_macos = "15.0"                     # optional constraint
 selection = "least_busy"               # "least_busy" | "warm_cache" | "random"
+min_disk_free_bytes = 20_000_000_000   # refuse/de-prioritize if worker is low on disk
+disallow_degraded = true               # refuse workers reporting health.degraded=true
 
 [profiles.ci.cache]
 derived_data = true
@@ -339,6 +395,8 @@ ssh_run_key = "~/.ssh/rch_run_ed25519"       # used only for harness probe/run
 ssh_stage_key = "~/.ssh/rch_stage_ed25519"   # used only for staging (rrsync write-only, confined to stage_root)
 ssh_fetch_key = "~/.ssh/rch_fetch_ed25519"   # used only for fetching artifacts (rrsync read-only, confined to jobs_root)
 ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
+expected_harness_binary_sha256 = "0123...abcd"       # optional pin for supply-chain integrity
+expected_codesign_team_id = "ABCDE12345"             # optional pin when codesign is used
 
 # Worker roots (used to compute per-job workspaces deterministically)
 stage_root = "~/Library/Caches/rch-xcode-lane/stage"
@@ -351,6 +409,10 @@ cache_root = "~/Library/Caches/rch-xcode-lane/cache"
 When `ssh_host_key_fingerprint` is configured for a worker, the host MUST verify the remote SSH host key matches before executing any probe/run command. If verification fails, the lane MUST refuse to run and emit a clear error with code `ssh_host_key_mismatch`.
 
 `attestation.json` MUST record the observed SSH host key fingerprint used for the session (even if not pinned), so audits can detect worker identity drift.
+
+#### Harness Identity Enforcement (Recommended)
+
+If `expected_harness_binary_sha256` and/or `expected_codesign_team_id` are configured for a worker, the host SHOULD verify probe-reported values match before running. On mismatch, the lane MUST refuse with stable error code `harness_identity_mismatch`.
 
 #### Profile-Level Host Key Enforcement
 
@@ -433,6 +495,21 @@ When `worker.selection = "warm_cache"`:
 - If no worker supports `cache_query`, the host MUST fall back to `least_busy` selection.
 - The selected worker and selection rationale SHOULD be recorded in `decision.json.worker_candidates`.
 
+**Default scoring algorithm (Recommended; MUST be recorded if used):**
+```
+score = 0
+if DerivedData present: score += 100
+if SPM present: score += 50
+score -= (probe.load.active_jobs * 10)
+tie-breakers: lower active_jobs, then lexicographic worker name
+```
+
+**Selection recording (Normative):**
+The host MUST record in `decision.json.worker_candidates[]`:
+- `selection_strategy` (string) — e.g., `"warm_cache"`, `"least_busy"`
+- `selection_algorithm` (string|null) — algorithm identifier when applicable, e.g., `"default_v1"`
+- Per-candidate: `cache_query` summary (when queried) + computed `score`
+
 ---
 
 ## Job Lifecycle
@@ -498,6 +575,22 @@ All three fields MUST appear in `summary.json`, `effective_config.json`, and `at
 To make `run_id` stable across hosts/implementations, the lane MUST define canonicalization.
 
 **Canonical JSON:** The lane MUST canonicalize **`effective_config.inputs`** using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing. `effective_config.inputs` MUST include `contract_version`.
+
+#### Semantic Normalization (Normative)
+
+Before applying JCS, the lane MUST normalize "set-like" arrays in `effective_config.inputs` by:
+1. Removing duplicates
+2. Sorting lexicographically by UTF-8 byte order
+
+**Fields treated as sets (MUST be documented and versioned):**
+- `worker.require_tags`
+- `env.allow`
+- `retry.retry_on`
+- `source.excludes`
+
+If the meaning of this normalization changes (fields added/removed, sort order changed), `contract_version` MUST be bumped.
+
+Rationale: JCS does not normalize array order. Without semantic normalization, two semantically identical configs could produce different `run_id`s purely due to ordering, causing cache fragmentation.
 
 **`run_id` bytes:** The lane MUST compute:
 `run_id = SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )`
@@ -628,8 +721,16 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
 **Required fields:**
 
 - `command_raw` — The original command string as received.
+- `command_normalized` — Normalized form used for classification (whitespace/quoting normalized).
 - `command_classified` — The classified action (`build`, `test`, `clean`, `archive`, `unknown`).
 - `command_parsed` — Optional structured parse result (recognized flags/fields), for debugging and audit.
+
+**Classifier provenance (Required):**
+- `classifier` (object):
+  - `name` (string) — Classifier identifier
+  - `version` (string) — Classifier version
+  - `policy_sha256` (string) — Digest of the active allowlist/policy bundle
+  - `confidence` (number) — Classification confidence (0..1)
 - `profile_used` — The profile name selected.
 - `intercepted` — Boolean: whether the command was intercepted and routed to a worker.
 - `refusal_reason` — If not intercepted, a stable error code (e.g., `"uncertain_classification"`, `"mutating_disallowed"`). Null if intercepted. MUST use stable error codes from the Error Model.
@@ -676,6 +777,9 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `destination_ambiguous` | Multiple matching destinations found | No |
 | `core_ids_required` | Profile requires CoreSimulator IDs but they are missing | No |
 | `ssh_host_key_mismatch` | Worker SSH host key does not match pinned fingerprint | No |
+| `harness_identity_mismatch` | Harness binary hash or codesign identity does not match expected pins | No |
+| `insufficient_disk_space` | Worker did not meet `min_disk_free_bytes` threshold | Yes |
+| `worker_degraded` | Worker reported degraded execution state | Yes |
 | `unpinned_worker_disallowed` | Profile requires pinned host key but worker has none | No |
 | `lease_expired` | Worker lease TTL exceeded without renewal | Yes |
 | `lease_unavailable` | No worker lease slots available | Yes |
@@ -703,6 +807,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
 | `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
 | `path_out_of_bounds` | Requested/derived path escaped configured roots | No |
+| `invalid_job_identity` | job_id/run_id/attempt failed validation | No |
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
@@ -925,6 +1030,7 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ├── decision.json          # Classification + routing decision record
 ├── environment.json       # Captured worker environment snapshot
 ├── timing.json            # Durations for stage/run/collect phases
+├── staging.json           # Staging report (method, excludes, bytes/files, duration, tool versions)
 ├── metrics.json           # Resource + transfer metrics + queue stats
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
@@ -965,6 +1071,8 @@ Each manifest entry SHOULD include:
 Each manifest entry MAY include:
 - `storage` (string) — `"host"` | `"worker"` | `"object_store"` (where the artifact is stored).
 - `uri` (string|null) — For remote storage, a stable URI for retrieval.
+- `etag` (string|null) — Best-effort remote integrity hint (when provided by storage backend).
+- `encryption` (string|null) — `"server_side"` | `"client_side"` | `"none"` (best-effort, when applicable).
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
 - `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
 
@@ -977,6 +1085,19 @@ Artifact storage and compression are controlled via `[profiles.<name>.artifacts]
 - `store = "host"` (default): Host collects all configured artifacts into `~/.local/share/rch/artifacts/<job_id>/`. All artifacts are stored locally.
 - `store = "worker"`: Worker retains large artifacts (xcresult, logs); host stores JSON metadata artifacts + manifest with pointers. `rch xcode fetch <job_id>` retrieves on demand.
 - `store = "object_store"`: Host uploads artifacts after collection; manifest MUST include stable URIs for retrieval. Requires additional `[profiles.<name>.artifacts.object_store]` configuration (endpoint, bucket, credentials).
+  - When configured, object-store uploads SHOULD use TLS and SHOULD enable encryption at rest.
+  - `manifest.json` entries for remote artifacts SHOULD include remote metadata when available (e.g., `etag`).
+  - Uploads MUST happen only after redaction policy has been applied.
+
+#### Object Store Options (Recommended)
+
+```toml
+[profiles.ci.artifacts.object_store]
+endpoint = "https://s3.example.com"
+bucket = "rch-artifacts"
+encryption = "server_side"     # "none" | "server_side" | "client_side"
+kms_key_id = "..."             # optional when supported
+```
 
 #### Compression Options
 
@@ -1034,6 +1155,25 @@ For `backend.actual = "xcodebuildmcp"`:
 
 - MUST include durations (seconds) for: `staging`, `running`, `collecting`.
 - SHOULD include total wall-clock time.
+
+### `staging.json` Requirements (Normative)
+
+`staging.json` provides detailed information about the source staging phase, enabling debugging and performance tuning.
+
+**Required fields:**
+- `kind`: `"staging"`
+- `schema_version`, `lane_version`, `job_id`, `run_id`, `attempt`
+- `method` — `"rsync"` | `"git_snapshot"` | `"bundle"` (future)
+- `excludes` — the effective exclude globs applied
+- `bytes_sent` — total bytes transferred
+- `files_total` — total files considered
+- `files_changed` — files actually transferred (changed or new)
+- `duration_seconds` — staging phase duration
+
+**Optional fields:**
+- `tooling` — best-effort versions: `rsync`, `zstd` (when used)
+- `compression` — whether compression was used during transfer
+- `errors` — array of non-fatal staging errors/warnings
 
 ### `metrics.json` Requirements
 
@@ -1108,6 +1248,7 @@ This enables streaming consumers to verify event integrity incrementally without
 | `test_suite_completed` | A test suite finishes (includes pass/fail counts) |
 | `warning` | Non-fatal issue detected |
 | `diagnostic` | Structured diagnostic (file/line/message) suitable for agent consumption |
+| `artifact_ready` | A named artifact became available (e.g., build.log, result bundle) |
 | `error` | Fatal error during execution |
 | `heartbeat` | Periodic liveness signal (at least every 10s) |
 | `complete` | Final event; includes terminal state + error model + `exit_code` |
@@ -1124,6 +1265,15 @@ When emitting `diagnostic` events, the harness SHOULD include:
 - `code` (string|null) — Diagnostic code if available.
 
 This provides a structured middle ground between parsing `xcresult` (heavy) and scraping logs (fragile), enabling real-time "file:line + message" feedback for agents.
+
+**`artifact_ready` event payload (Recommended):**
+
+When emitting `artifact_ready` events, the harness SHOULD include:
+- `artifact` (string) — logical name (e.g., `"build.log"`, `"result.xcresult"`)
+- `path` (string) — relative-to-job-root path (never absolute)
+- `bytes` (integer|null) — size when known, else null
+
+This enables streaming consumers (e.g., `rch xcode watch`) to know when artifacts become available for progressive fetching.
 
 **Optional stream digest (Recommended):**
 
@@ -1238,6 +1388,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode retry <job_id>` | Retry a failed job with incremented attempt (preserves run_id when unchanged) |
 | `rch xcode reuse <run_id>` | Locate a succeeded attempt for run_id and return its artifact pointer (optionally validates) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
+| `rch xcode warm [--profile <name>]` | Ask workers to prewarm simulator runtimes/caches for a profile |
 
 **Machine-readable CLI output (Normative):**
 
@@ -1559,6 +1710,18 @@ To prevent contract drift between host and harness:
   - Validates all JSON artifacts against schemas
   - Recomputes and verifies `run_id`, `config_hash`, and `source_tree_hash`
   - Runs `validate` against `fixtures/jobs/*` and asserts stable error codes for known-bad fixtures
+
+### Hashing Test Vectors (Recommended)
+
+To prevent cross-language JCS/run_id drift, the repo SHOULD include `fixtures/hashing/` with:
+- `inputs.json` — sample `effective_config.inputs`
+- `inputs.jcs` — expected canonical bytes after JCS
+- `config_hash.sha256` — expected lowercase hex SHA-256 of `inputs.jcs`
+- `source_manifest.entries.json` — sample entries array
+- `source_tree_hash.sha256` — expected lowercase hex hash
+- `run_id.sha256` — expected lowercase hex run_id
+
+CI SHOULD recompute and assert exact matches to catch canonicalization drift (Unicode normalization, integer/float encoding, array ordering).
 
 ---
 
