@@ -65,6 +65,7 @@ The probe JSON MUST include at minimum:
 - `xcode` (object) — `path`, `version`, `build` (Xcode build number).
 - `simulators` (object) — Available runtimes + device types (or a summarized digest).
 - `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
+- `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/xcresult-derived diagnostics). Enables the host/agents to understand expected event richness.
 - `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
 
 The host MUST select a `protocol_version` supported by both sides. If no overlap exists, the lane MUST refuse with stable error code `protocol_version_unsupported`.
@@ -89,6 +90,10 @@ The harness SHOULD support an optional third verb:
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, destination UDID)
 - `paths` (object: source/workdir/cache roots)
 
+**Job request (stdin) SHOULD include:**
+- `trace` (object) — correlation identifiers for cross-system log correlation:
+  - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
+
 **Backend Selection (Normative):**
 - `effective_config.backend.preferred` MAY be `"xcodebuildmcp"` or `"xcodebuild"`.
 - The harness MUST select an available backend consistent with policy and capabilities.
@@ -103,9 +108,23 @@ The harness SHOULD support an optional third verb:
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
-- Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`.
+- Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
+- Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
 - Every event SHOULD include: `monotonic_ms` — Milliseconds since harness process start (monotonic clock) to provide stable ordering under clock skew.
-- The FINAL event MUST be `{"type":"complete","exit_code":N,...}` and MUST be the last line. After emitting `complete`, the harness MUST exit promptly.
+- The FINAL event MUST be `{"type":"complete", ...}` and MUST be the last line. After emitting `complete`, the harness MUST exit promptly.
+
+**`complete` event payload (Normative):**
+
+The terminal `complete` event MUST include:
+- `exit_code` (integer)
+- `state` (string) — one of: `succeeded`, `failed`, `canceled`, `timed_out`
+- `error_code` (string|null) — primary stable error code (null on success)
+- `errors` (array) — array of error objects from the Error Model (may be empty on success)
+- `backend` (object) — `{ "preferred": "...", "actual": "..." }`
+- `events_sha256` (string|null) — digest over emitted event bytes (excluding the `complete` line itself)
+- `artifact_summary` (object) — small summary, e.g. `{ "xcresult": true, "xcresult_format": "directory|tar.zst" }`
+
+This enables streaming consumers to know the terminal outcome without waiting for artifact assembly.
 
 **Robustness (Normative):**
 - If the harness cannot emit valid JSON for an event, it MUST fail the job with a terminal `complete` event whose payload includes error code `event_stream_corrupt`.
@@ -134,14 +153,35 @@ Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so 
 
 Configuration uses **named profiles** (`[profiles.<name>]`). Select a profile with `--profile <name>`.
 
+**Profile inheritance (Normative):**
+
+A profile MAY declare `extends` to inherit fields from one or more other profiles:
+- `extends` (string or array of strings) — parent profile name(s), applied in order
+
+**Merge rules (Normative):**
+- Tables are deep-merged (child keys override parent keys at each level)
+- Scalars override (child value replaces parent value)
+- Arrays replace (no concatenation) to keep resolution predictable
+- The final resolved profile MUST be what is encoded into `effective_config.inputs`
+
 ```toml
 # Example: .rch/xcode.toml
-[profiles.ci]
-action = "test"                        # "build" | "test"
-workspace = "MyApp.xcworkspace"        # or project = "MyApp.xcodeproj"
+
+# Base profile with shared settings
+[profiles.base]
+workspace = "MyApp.xcworkspace"
 scheme = "MyApp"
-configuration = "Debug"
 timeout_seconds = 1800
+
+[profiles.base.safety]
+allow_mutating = false
+code_signing_allowed = false
+
+# CI profile extends base (inherits workspace, scheme, timeout_seconds, safety)
+[profiles.ci]
+extends = "base"
+action = "test"                        # "build" | "test"
+configuration = "Debug"                # CI-specific override
 
 [profiles.ci.destination]
 platform = "iOS Simulator"
@@ -194,16 +234,16 @@ max_workspace_bytes = 50_000_000_000   # workspace + DerivedData cap (best effor
 max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap
 max_log_bytes       = 200_000_000      # build.log cap; truncate with marker
 
+# Release profile extends base but overrides safety for signing
 [profiles.release]
+extends = "base"
 action = "build"
-workspace = "MyApp.xcworkspace"
-scheme = "MyApp"
 configuration = "Release"
-timeout_seconds = 3600
+timeout_seconds = 3600                 # longer timeout for release builds
 
 [profiles.release.safety]
-allow_mutating = true
-code_signing_allowed = true
+allow_mutating = true                  # override base: allow archive
+code_signing_allowed = true            # override base: enable signing
 ```
 
 ### Host Config: `~/.config/rch/workers.toml`
@@ -255,6 +295,7 @@ This enables CI profiles to enforce a stronger trust posture than local developm
 
 1. Read `destination.platform`, `destination.name`, `destination.os` from effective config.
    - If `destination.device_type_id` and/or `destination.runtime_id` are present, prefer them for matching (stable CoreSimulator identifiers).
+   - Profiles MAY require CoreSimulator identifiers via `destination.require_core_ids = true` (recommended for CI).
 2. If `os` is `"latest"` and `allow_floating_destination` is false, reject with error.
 3. Query worker for available simulators matching the destination spec.
 4. If exactly one match, use its UDID for execution, but record it only under `effective_config.resolved.destination_udid`.
@@ -263,6 +304,12 @@ This enables CI profiles to enforce a stronger trust posture than local developm
    - Default: reject with an error describing the duplicates and how to fix/disambiguate.
    - If `destination.on_multiple = "select"` is set, select using `destination.selector` (default selector: `"highest_udid"`), and emit a warning.
 7. Record device/runtime identifiers in `effective_config.inputs` and record resolved UDID in `effective_config.resolved`.
+
+**CoreSimulator ID requirement (Recommended):**
+
+If `destination.require_core_ids = true` and either `device_type_id` or `runtime_id` is missing, the lane SHOULD refuse with a stable error code `core_ids_required` and include a hint describing how to obtain CoreSimulator IDs from the worker probe output.
+
+This catches human-friendly destination strings that may drift across Xcode/runtime versions, improving CI stability.
 
 ### Destination Disambiguation (Config)
 
@@ -364,6 +411,17 @@ When `rch xcode cancel <job_id>` is invoked:
 The worker MUST execute jobs inside a dedicated per-job workspace root, e.g.:
 `~/Library/Caches/rch-xcode-lane/jobs/<job_id>/`
 
+**Workspace subpaths (Normative):**
+- `src/` — staged source tree
+- `work/` — scratch/workdir for transient files
+- `dd/` — DerivedData (or equivalent) root
+
+**Read-only source (Normative):**
+
+After staging completes and (when enabled) the post-stage hash check passes, the harness MUST make `src/` read-only (best-effort via filesystem permissions) prior to backend execution. This prevents build scripts and plugins from silently mutating the staged source tree.
+
+If backend execution modifies `src/` (detected via an optional post-run hash check when `verify_after_run = true`), the job MUST fail with stable error code `source_tree_modified`.
+
 The lane MUST provide a garbage-collection mechanism:
 - `rch xcode gc` cleans host job dirs and worker job workspaces according to retention policy.
 - Default retention SHOULD be time-based (e.g., keep last N days) and SHOULD be configurable.
@@ -414,6 +472,16 @@ patterns = ["ghp_*", "xox*-*"]  # Optional additional redaction patterns
 ```
 
 When `redaction.enabled = true`, the lane SHOULD redact known secret patterns from `build.log` before storage.
+
+**Redaction reporting (Recommended):**
+
+When redaction is enabled, the lane SHOULD emit `redaction_report.json` containing:
+- `enabled` (boolean) — Whether redaction was enabled
+- `patterns` (array of strings) — Identifiers for patterns applied (no secret values)
+- `replacements` (integer) — Best-effort count of redactions performed
+- `log_truncated` (boolean) — Whether build.log was truncated
+
+This enables auditing that redaction policy was applied without exposing what was redacted.
 
 ### Artifact Sensitivity (Normative for remote storage)
 
@@ -477,6 +545,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 |------|---------|-----------|
 | `destination_not_found` | Requested simulator destination not available | No |
 | `destination_ambiguous` | Multiple matching destinations found | No |
+| `core_ids_required` | Profile requires CoreSimulator IDs but they are missing | No |
 | `ssh_host_key_mismatch` | Worker SSH host key does not match pinned fingerprint | No |
 | `unpinned_worker_disallowed` | Profile requires pinned host key but worker has none | No |
 | `lease_expired` | Worker lease TTL exceeded without renewal | Yes |
@@ -496,6 +565,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
 | `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
+| `source_tree_modified` | Source tree was modified during execution | No |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
 | `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
@@ -687,6 +757,7 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
 ├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
+├── redaction_report.json  # Optional: redaction/truncation report (no secret values; emitted when redaction enabled)
 └── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
 ```
 
@@ -811,6 +882,8 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 | Type | Emitted when |
 |------|-------------|
 | `hello` | First event; echoes protocol_version, lane_version, job identity |
+| `queued` | Job is waiting for a lease slot (periodic, at least every 10s) |
+| `lease_acquired` | Lease slot acquired; job may begin backend execution |
 | `job_started` | Job execution begins on worker |
 | `phase_started` | A build phase begins (compile, link, etc.) |
 | `phase_completed` | A build phase ends (includes duration) |
@@ -821,7 +894,7 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 | `warning` | Non-fatal issue detected |
 | `error` | Fatal error during execution |
 | `heartbeat` | Periodic liveness signal (at least every 10s) |
-| `complete` | Final event; includes `exit_code` |
+| `complete` | Final event; includes terminal state + error model + `exit_code` |
 
 **Optional stream digest (Recommended):**
 
@@ -915,6 +988,20 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 | `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
+
+**Machine-readable CLI output (Normative):**
+
+Commands SHOULD accept `--json` to emit a single JSON object to stdout instead of human-readable text.
+
+JSON outputs MUST use a standard envelope with:
+- `kind` (string) — Command-specific result type, e.g. `"doctor_result"`, `"verify_result"`, `"plan_result"`, `"validate_result"`
+- `schema_version` (string) — Schema version for this result type
+- `lane_version` (string) — Lane implementation version
+- `ok` (boolean) — Whether the command succeeded
+- `error_code` (string|null) — Stable error code on failure (null on success)
+- `errors` (array) — Array of error objects from the Error Model
+
+This enables agent/CI integration without log scraping and provides consistent error handling across all commands.
 
 ### `doctor` Checks (Host)
 
@@ -1044,6 +1131,7 @@ shutdown_on_end = true                 # Shutdown simulator after job completion
 
 When `strategy = "per_job"`:
 - The worker MUST create a new simulator device matching the destination spec.
+- The worker SHOULD name the device deterministically for cleanup and debugging (e.g., `rch-<job_id>` or `rch-<run_id>-<attempt>`).
 - The worker MUST record the created UDID in `effective_config.json`.
 - The worker MUST delete the simulator device on job completion (best-effort cleanup).
 
@@ -1075,6 +1163,19 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 
 **Hello event (lease fields, Normative):**
 - The harness `hello` event MUST include `lease_id` and `lease_ttl_seconds` so the host can correlate execution with concurrency state and debug lease failures.
+
+**Lease acquisition protocol (Normative):**
+
+Before starting backend execution, the harness MUST acquire a lease slot consistent with `limits.max_concurrent_jobs`.
+
+- If no slot is available, the harness MUST emit periodic `queued` events (at least every 10s) including:
+  - `queue_position` (integer|null) — best-effort position in queue
+  - `queue_wait_seconds` (number) — elapsed time queued
+- Once a slot is acquired, the harness MUST emit `lease_acquired` including:
+  - `lease_id` (string)
+  - `lease_ttl_seconds` (integer)
+  - `queue_wait_seconds` (number)
+- Backend execution MUST NOT begin until after `lease_acquired` is emitted.
 
 ### Retry Policy (Normative)
 

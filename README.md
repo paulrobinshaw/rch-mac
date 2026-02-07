@@ -54,6 +54,7 @@ Recommended:
     no-pty, no-agent-forwarding, no-port-forwarding)
   - Use a separate, restricted rsync key confined to the workspace/staging root (e.g., `rrsync`)
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
+- Prefer a **read-only staged source root** on the worker so project scripts/plugins cannot silently rewrite inputs
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
 - CI profiles SHOULD require pinning (lane can refuse if worker has no configured fingerprint)
 
@@ -91,6 +92,8 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
 
+Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
+
 ## Setup
 
 1. Register the Mac mini in `~/.config/rch/workers.toml` with tags `macos,xcode`
@@ -112,11 +115,17 @@ workspace = "MyApp.xcworkspace"
 scheme = "MyApp"
 configuration = "Debug"
 timeout_seconds = 1800
+#
+# Larger repos MAY define a base profile and have others extend it (see PLAN.md).
 
 [profiles.ci.destination]
 platform = "iOS Simulator"
 name = "iPhone 16"
 os = "18.2"  # CI SHOULD pin; floating "latest" is opt-in (see PLAN.md)
+#
+# Strongly recommended for CI (more stable than human-friendly names):
+# device_type_id = "com.apple.CoreSimulator.SimDeviceType.iPhone-16"
+# runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-18-2"
 
 [profiles.ci.safety]
 allow_mutating = false
@@ -136,6 +145,10 @@ All JSON artifacts are **versioned** (`schema_version`) and self-describing (`ki
 `summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.
 Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommended for CI/agents).
 
+**Event correlation:** `events.ndjson` lines include `job_id`, `run_id`, and `attempt` so tooling can safely correlate
+streaming output to the run index. Deployments MAY also surface a `trace_id` for cross-system correlation
+(CI logs ↔ host logs ↔ worker logs).
+
 ```
 <job_id>/
 ├── summary.json           # High-level status + timings (includes job_id, run_id, attempt, error_code)
@@ -150,6 +163,7 @@ Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommen
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only)
 ├── build.log              # Captured harness stderr (human logs + backend output)
+├── redaction_report.json  # Optional: what redaction/truncation was applied (no secret values)
 ├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
 └── provenance/            # Optional: signatures + verification report
 ```
