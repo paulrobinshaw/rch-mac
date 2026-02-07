@@ -4,7 +4,7 @@
 
 ## Vision
 
-Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed to a remote macOS worker (Mac mini) using XcodeBuildMCP, producing deterministic, machine-readable results.
+Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed to a remote macOS worker via a stable worker harness (`rch-xcode-worker`), producing deterministic, machine-readable results. The harness may use XcodeBuildMCP or `xcodebuild` as its backend, but the host speaks one protocol and always receives structured NDJSON events.
 
 ## Goals
 
@@ -34,7 +34,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - Classifies commands (strict allowlist)
 - Selects an eligible worker (tags: `macos,xcode`)
 - Syncs workspace snapshot (rsync + excludes)
-- Executes via backend (XcodeBuildMCP preferred, `rch-xcode-worker` harness recommended)
+- Executes by invoking the worker harness (`rch-xcode-worker run`) over SSH (single protocol)
 - Streams logs; assembles artifacts; emits manifest + attestation
 
 ### Worker (macOS)
@@ -43,9 +43,9 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - Maintains caches (DerivedData, SPM) keyed by effective config
 - Returns xcresult + logs + tool metadata
 
-### Worker Harness (Normative, Recommended)
+### Worker Harness (Normative)
 
-The recommended way to execute jobs on a worker is via the `rch-xcode-worker` harness — a lightweight executable invoked over SSH that accepts a job request on stdin and emits structured results on stdout.
+The lane MUST use the `rch-xcode-worker` harness for remote execution. This is a lightweight executable invoked over SSH that accepts a job request on stdin and emits structured results on stdout. The harness may use XcodeBuildMCP or `xcodebuild` as its backend, but the host always speaks one protocol and always receives a consistent event/log contract.
 
 **Protocol (Verbs + Versioning):**
 
@@ -66,10 +66,17 @@ The harness MUST support two verbs:
 - `effective_config` (object)
 - `paths` (object: source/workdir/cache roots)
 
+**Backend Selection (Normative):**
+- `effective_config.backend.preferred` MAY be `"xcodebuildmcp"` or `"xcodebuild"`.
+- The harness MUST select an available backend consistent with policy and capabilities.
+- The harness MUST record the chosen backend in `effective_config.json` as `backend.actual`.
+- If the preferred backend is unavailable and fallback is disallowed, the harness MUST fail with a terminal `complete` event and stable error code `backend_unavailable`.
+
 **Stdout/Stderr Separation (Normative):**
 - Stdout MUST contain ONLY NDJSON event objects. No banners, no debug lines, no progress text, no non-JSON output.
 - Stderr MAY contain human-readable logs and MUST be treated as the source for `build.log` capture/streaming.
 - The host MUST capture stderr separately and MUST NOT attempt to parse it as JSON.
+- The harness SHOULD route backend build output (e.g., `xcodebuild` stdout/stderr) into harness stderr so it is captured in `build.log`.
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
@@ -112,10 +119,25 @@ os = "18.2"                            # pinned version; required for CI unless 
 
 [profiles.ci.xcode]
 path = "/Applications/Xcode.app"       # optional; uses worker default if omitted
+require_version = "16.2"               # optional; Xcode version constraint
+require_build = "16C5032a"             # optional; strongest pin when available
+
+[profiles.ci.worker]
+require_tags = ["macos", "xcode"]      # default derives from lane, but profile may further restrict
+min_macos = "15.0"                     # optional constraint
+selection = "least_busy"               # "least_busy" | "warm_cache" | "random" (future)
 
 [profiles.ci.cache]
 derived_data = true
 spm = true
+mode = "read_only"                     # "off" | "read_only" | "read_write" (prevents cache poisoning)
+
+[profiles.ci.backend]
+preferred = "xcodebuildmcp"            # "xcodebuildmcp" | "xcodebuild"
+allow_fallback = true                  # allow fallback to xcodebuild if preferred unavailable
+
+[profiles.ci.env]
+allow = ["CI", "RCH_*"]                # env vars forwarded to worker (default: none)
 
 [profiles.ci.safety]
 allow_mutating = false                 # disallow implicit clean/archive
@@ -287,6 +309,33 @@ The lane MUST NOT pass through arbitrary user-provided `xcodebuild` flags or pat
 
 Rationale: prevents flag-based policy bypass and keeps runs deterministic/auditable.
 
+### Secrets & Environment (Normative)
+
+To prevent accidental secret leakage in build logs and environment artifacts:
+
+- The host MUST NOT forward ambient host environment variables to the worker by default.
+- If environment variables are required, profiles MUST declare an allowlist:
+
+```toml
+[profiles.ci.env]
+allow = ["CI", "RCH_*"]     # Values forwarded if present (literal names or prefix globs)
+```
+
+- `environment.json` MUST be sanitized:
+  - MUST NOT include secret values (tokens, private keys, credentials).
+  - SHOULD include only non-sensitive machine/tool identifiers (Xcode, macOS, runtimes).
+  - MAY include allowlisted env variable names with values omitted or redacted.
+
+**Optional log redaction:**
+
+```toml
+[profiles.ci.redaction]
+enabled = true              # Default: false (for local debugging)
+patterns = ["ghp_*", "xox*-*"]  # Optional additional redaction patterns
+```
+
+When `redaction.enabled = true`, the lane SHOULD redact known secret patterns from `build.log` before storage.
+
 ### Decision Artifact (Normative)
 
 Every job MUST emit a `decision.json` file in the artifact directory, recording the classification and routing decision made by the host. This supports auditability and debugging of interception behavior.
@@ -301,6 +350,15 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
 - `refusal_reason` — If not intercepted, a stable error code (e.g., `"uncertain_classification"`, `"mutating_disallowed"`). Null if intercepted. MUST use stable error codes from the Error Model.
 - `worker_selected` — Worker name, or null if refused.
 - `timestamp` — ISO 8601 timestamp of the decision.
+
+**Optional fields (for CI explainability):**
+
+- `worker_candidates` — Array describing considered workers and reject reasons.
+
+`worker_candidates` element (when present) SHOULD include:
+- `name` — Worker name.
+- `eligible` — Boolean: whether the worker was eligible.
+- `reasons` — Array of stable codes explaining rejection (e.g., `xcode_version_mismatch`, `runtime_not_found`, `lease_unavailable`).
 
 ---
 
@@ -338,6 +396,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `worker_unreachable` | Cannot establish SSH connection to worker | Yes |
 | `xcode_not_found` | Xcode not found at expected path on worker | No |
 | `xcode_version_mismatch` | Xcode version does not match constraint | No |
+| `backend_unavailable` | Preferred backend unavailable and fallback disallowed | No |
 | `runtime_not_found` | Requested simulator runtime not installed | No |
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
@@ -364,6 +423,26 @@ Implementations MAY define additional codes; consumers MUST tolerate unknown cod
 - Lane does not attempt to sandbox Xcode beyond best-effort OS/user isolation.
 - Operators SHOULD deploy workers as dedicated, non-sensitive machines/accounts.
 - Operators SHOULD use a dedicated macOS user account with minimal privileges for RCH runs.
+
+### Worker SSH Hardening (Strongly Recommended)
+
+The lane assumes repos may execute arbitrary code during build/test. Operators SHOULD minimize SSH blast radius:
+
+- Use a dedicated macOS user with minimal privileges and no interactive shell access where feasible.
+- Prefer a **forced-command run key** restricted to executing `rch-xcode-worker`:
+  - Key options: `no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict`
+- Prefer a separate **restricted rsync key** confined to a staging root (e.g., via `rrsync`):
+  - Limits reads/writes to `~/Library/Caches/rch-xcode-lane/` (or operator-chosen root)
+
+**Example `authorized_keys` entries (illustrative):**
+
+```
+# Run key (forced to harness):
+command="/usr/local/bin/rch-xcode-worker serve",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-run
+
+# Rsync key (confined to staging root):
+command="/usr/local/bin/rrsync -wo ~/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-rsync
+```
 
 ---
 
@@ -471,7 +550,7 @@ For builds that require a verifiable chain of custody, the lane MAY emit a `prov
 
 ## Required Artifacts
 
-Artifacts are written under an immutable job directory on the host:
+Artifacts are written under a per-job directory on the host. The directory is **append-only during execution**, except for `status.json`, which is updated in-place using atomic replacement.
 
 ```
 ~/.local/share/rch/artifacts/<job_id>/
@@ -486,7 +565,7 @@ Artifacts are written under an immutable job directory on the host:
 ├── metrics.json           # Resource + transfer metrics + queue stats
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
-├── build.log              # stdout/stderr capture
+├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
 └── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
 ```
 
@@ -566,11 +645,19 @@ When `store` is `"worker"` or `"object_store"`, the `rch xcode fetch <job_id>` c
 
 The event stream is a newline-delimited JSON file where each line is a self-contained event object. Events are appended in real time during job execution.
 
+**Append safety (Normative):**
+- Writers MUST append complete, newline-terminated JSON objects only.
+- Writers MUST NOT emit partial JSON lines.
+- Readers MUST tolerate the file growing during reads, and SHOULD ignore a non-terminal final line only if it is not newline-terminated (defensive tail behavior).
+
 **Required fields per event:**
 
 - `type` — Event type string (e.g., `"build_started"`, `"test_case_passed"`, `"phase_completed"`, `"error"`, `"complete"`).
 - `timestamp` — ISO 8601 timestamp.
 - `sequence` — Monotonically increasing integer (1-based).
+- `job_id` — Job identifier (MUST match artifacts).
+- `run_id` — Content-derived identifier.
+- `attempt` — Attempt number for this run_id.
 
 **Standard event types:**
 
@@ -593,6 +680,10 @@ Consumers MUST tolerate unknown event types (forward compatibility).
 ### `status.json` Requirements
 
 `status.json` is a mutable file updated in-place throughout job execution. It provides a polling-friendly snapshot of current job state.
+
+**Atomic update (Normative):**
+- Writers MUST update `status.json` by writing a complete JSON document to a temporary path (e.g., `status.json.tmp`) and then atomically renaming it over `status.json`.
+- Readers MUST tolerate missing/empty `status.json` during very early job creation.
 
 **Required fields:**
 
@@ -708,6 +799,30 @@ The `validate` command verifies artifact integrity and consistency for a complet
 
 Cache usage MUST be controlled via `[profiles.<name>.cache]` and MUST be reflected in `effective_config.json`. The lane MUST record cache decisions and hit/miss stats in `metrics.json` (at minimum: derived data + SPM).
 
+#### Cache Write Policy (Normative)
+
+To prevent cache poisoning from untrusted PRs/forks, profiles MUST declare cache write intent:
+
+```toml
+[profiles.ci.cache]
+derived_data = true
+spm = true
+mode = "read_only"          # "off" | "read_only" | "read_write"
+```
+
+- `off`: Do not read or write caches.
+- `read_only` (recommended for CI with untrusted code): May read existing caches but MUST NOT write/update them. Prevents poisoning.
+- `read_write` (default for trusted repos): May read and write caches.
+
+The worker MUST enforce the cache mode:
+- When `mode = "off"`, the worker MUST NOT use cached DerivedData or SPM packages.
+- When `mode = "read_only"`, the worker MUST use cached data if available but MUST NOT write new cache entries.
+- When `mode = "read_write"`, the worker MAY write cache entries.
+
+`metrics.json` MUST record:
+- `cache_mode` — The effective cache mode for the job.
+- `cache_writable` — Boolean: whether the cache was writable for this job (false for `off` and `read_only`).
+
 #### Cache Isolation (Normative)
 
 To reduce cross-run contamination and cache poisoning, profiles MAY define cache trust boundaries:
@@ -771,14 +886,17 @@ When `erase_on_start = true`:
 To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-based concurrency model:
 
 - **Lease acquisition**: Before a job begins execution on a worker, the host MUST acquire a lease. A lease grants exclusive (or counted) access to worker job slots.
-- **Lease TTL**: Every lease MUST have a time-to-live (TTL), defaulting to `timeout_seconds + 300` (5-minute grace). If the lease expires without renewal, the worker MUST consider the job abandoned.
-- **Lease renewal**: The host MUST renew the lease periodically (at least every `TTL / 2` seconds) while the job is active. Renewal is a heartbeat proving the host is alive.
-- **Crash recovery**: If a lease expires without graceful release:
+- **Lease TTL**: Every lease MUST have a time-to-live (TTL), defaulting to `timeout_seconds + 300` (5-minute grace). TTL is a hard upper bound to prevent runaway jobs.
+- **Liveness**: Lease liveness MUST be tied to the active `rch-xcode-worker run` session (SSH connection + harness process). If the session is lost unexpectedly, the worker MUST treat the job as abandoned.
+- **Crash recovery**: If liveness is lost (session drop) or TTL is exceeded:
   - Worker MUST terminate the associated job process (SIGTERM, then SIGKILL after 10s).
   - Worker MUST mark the job workspace for cleanup.
-  - Host MUST detect the expired lease on reconnection and transition the job to `failed` with reason `"lease_expired"`.
+  - Host MUST transition the job to `failed` with reason `"lease_expired"` (retryable) when it cannot observe a clean terminal completion.
 - **Concurrency limit**: Each worker advertises a maximum concurrent job count (default: 1). The host MUST NOT acquire a lease if the worker is at capacity; instead, the job enters a queue.
 - **`status.json` integration**: `queued_at`, `started_at`, and `queue_wait_seconds` fields (see status.json Requirements) MUST reflect actual lease acquisition timing.
+
+**Hello event (lease fields, Normative):**
+- The harness `hello` event MUST include `lease_id` and `lease_ttl_seconds` so the host can correlate execution with concurrency state and debug lease failures.
 
 ### Retry Policy (Normative)
 
@@ -854,6 +972,10 @@ retry_on = ["lease_expired", "worker_unreachable", "source_staging_failed", "art
 | Flag passthrough | Disallowed | N/A (must model as config fields) |
 | SSH host key pinning | Optional (recorded) | `ssh_host_key_fingerprint` in workers.toml |
 | CI requires pinning | Disabled | `[profiles.<name>.trust] require_pinned_host_key = true` |
+| Cache write policy | `read_write` | `[profiles.<name>.cache] mode = "read_only"` |
+| Environment passthrough | Disallowed | `[profiles.<name>.env] allow = [...]` |
+| Log redaction | Disabled | `[profiles.<name>.redaction] enabled = true` |
+| Backend preference | `xcodebuildmcp` | `[profiles.<name>.backend] preferred = "xcodebuild"` |
 
 ---
 

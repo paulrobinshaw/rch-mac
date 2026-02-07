@@ -7,7 +7,8 @@
 
 **RCH Xcode Lane** is a *remote build/test gate* for Apple-platform projects.
 It extends **Remote Compilation Helper (RCH)** to route safe, allowlisted Xcode build/test commands
-to a remote **macOS worker** (e.g., a Mac mini) via **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` runner.
+to a remote **macOS worker** (e.g., a Mac mini) via a **stable worker harness**: `rch-xcode-worker`.
+The harness may use **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` backend, but the host always speaks one protocol and always receives structured NDJSON events.
 
 ## Why
 
@@ -28,7 +29,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (Xcode, runtimes, XcodeBuildMCP).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
-3. **Run** build/test remotely (via XcodeBuildMCP backend; `xcodebuild` fallback allowed).
+3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
 5. **Attest** toolchain + environment; emit machine-readable outputs for CI/agents.
 
@@ -45,6 +46,9 @@ Xcode builds can execute project-defined scripts and plugins. Treat the worker a
 Recommended:
 - Dedicated macOS user account for RCH runs
 - Dedicated machine (or at least dedicated environment) for lane execution
+- Harden SSH on the worker:
+  - Prefer a forced-command key for `rch-xcode-worker` (no-pty, no-agent-forwarding, no-port-forwarding)
+  - Use a separate, restricted rsync key confined to the workspace/staging root (e.g., `rrsync`)
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
 - CI profiles SHOULD require pinning (lane can refuse if worker has no configured fingerprint)
@@ -133,7 +137,7 @@ Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommen
 ├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only)
-├── build.log              # Streamed + finalized stdout/stderr
+├── build.log              # Captured harness stderr (human logs + backend output)
 ├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
 └── provenance/            # Optional: signatures + verification report
 ```
