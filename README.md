@@ -28,7 +28,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 └──────────────┘                                   └───────────────────┘
 ```
 
-1. **Select worker** (tagged `macos,xcode`) and probe capabilities (Xcode, runtimes, XcodeBuildMCP).
+1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, Xcode, runtimes, backends).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
 3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
    - Production setups SHOULD use the harness in **forced-command mode** so SSH cannot run arbitrary commands.
@@ -57,6 +57,7 @@ Recommended:
     - **Fetch key**: read-only, confined to the `jobs_root/` (pull artifacts back)
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
 - Prefer a **read-only staged source root** on the worker so project scripts/plugins cannot silently rewrite inputs
+- Be explicit about symlink handling: in untrusted posture the lane SHOULD forbid symlinks (see `PLAN.md` `source.symlinks`)
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
 - CI profiles SHOULD require pinning (lane can refuse if worker has no configured fingerprint)
 
@@ -75,6 +76,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 - Node.js + XcodeBuildMCP (recommended backend)
 - `rch-xcode-worker` harness (**required**): stable remote probe/run/collect interface
   - Strongly recommended: forced-command SSH key (`authorized_keys command=...`) running `rch-xcode-worker --forced`
+  - MUST advertise compatible `protocol_versions` **and** `contract_versions` (`rch xcode verify` enforces)
 
 ### Host
 
@@ -172,6 +174,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 ├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only; optional hash chain for tamper-evident verification)
+├── backend_invocation.json# Structured backend invocation record (safe, no secret values)
 ├── build.log              # Captured harness stderr (human logs + backend output)
 ├── redaction_report.json  # Optional: what redaction/truncation was applied (no secret values)
 ├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
@@ -183,6 +186,8 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 - Recommended: dedicate a worker user account with minimal privileges
 - Prefer `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled in config
 - Use worker concurrency limits + leases to avoid simulator contention
+  - The harness is the source of truth for queueing (`queued`) and lease acquisition (`lease_acquired`)
+  - `workers --refresh` can surface `probe.load` so selection strategies like `least_busy` are grounded
 - Prefer per-job simulator hygiene for flaky UI tests (erase/create policies)
 - CI profiles SHOULD pin destination runtime/device; floating resolution is opt-in
 - Deterministic IDs: `run_id` is content-derived from `effective_config.inputs` (including `contract_version`) + `source_tree_hash`; `job_id` is per-attempt. Timestamps live in `summary.json`, not config.

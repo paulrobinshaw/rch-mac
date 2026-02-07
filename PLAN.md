@@ -60,6 +60,7 @@ The harness MUST support two verbs:
 
 The probe JSON MUST include at minimum:
 - `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
+- `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
 - `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
 - `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
@@ -68,9 +69,15 @@ The probe JSON MUST include at minimum:
 - `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
 - `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/xcresult-derived diagnostics). Enables the host/agents to understand expected event richness.
 - `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
+- `load` (object) — Best-effort current load snapshot:
+  - `active_jobs` (integer) — Number of jobs currently executing.
+  - `queued_jobs` (integer) — Number of jobs waiting for a lease slot.
+  - `updated_at` (ISO 8601 timestamp) — When this snapshot was taken.
 - `roots` (object) — Canonical harness roots used to derive per-job paths (especially in `--forced` mode): `stage_root`, `jobs_root`, `cache_root`.
 
 The host MUST select a `protocol_version` supported by both sides. If no overlap exists, the lane MUST refuse with stable error code `protocol_version_unsupported`.
+
+The host MUST also ensure the job's `effective_config.inputs.contract_version` is present in the harness `contract_versions`. If unsupported, the lane MUST refuse with stable error code `contract_version_unsupported`.
 
 2) `rch-xcode-worker run`
    - Reads exactly one JSON object (the job request) from stdin.
@@ -90,7 +97,8 @@ The harness SHOULD support an optional third verb:
 - `job_id`, `run_id`, `attempt`
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, destination UDID)
-- `paths` (object: source/workdir/cache roots). In `--forced` mode, the harness MUST ignore any host-supplied absolute paths and MUST derive paths from configured roots + `job_id` (see Path Confinement below).
+- `paths` (object). In `--forced` mode, the harness MUST ignore any host-supplied absolute paths and MUST derive paths from configured roots + `job_id` (see Path Confinement below).
+  - `src`, `work`, `dd`, `result`, `spm`, `cache` MUST be representable (even if some are aliases of others depending on cache policy).
 
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
@@ -114,8 +122,8 @@ The harness SHOULD support an optional third verb:
 - The harness SHOULD route backend build output (e.g., `xcodebuild` stdout/stderr) into harness stderr so it is captured in `build.log`.
 
 **Event stream (stdout) requirements:**
-- The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
-- The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `cache`) so audits/debugging can prove where execution happened.
+- The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
+- The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `result`, `spm`, `cache`) so audits/debugging can prove where execution happened.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
 - Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
 - Every event SHOULD include: `monotonic_ms` — Milliseconds since harness process start (monotonic clock) to provide stable ordering under clock skew.
@@ -257,9 +265,9 @@ xcresult_format = "directory"          # "directory" | "tar.zst"
 compression = "none"                   # "none" | "zstd" (applies to large artifacts during transfer)
 
 [profiles.ci.limits]
-max_workspace_bytes = 50_000_000_000   # workspace + DerivedData cap (best effort)
-max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap
-max_log_bytes       = 200_000_000      # build.log cap; truncate with marker
+max_workspace_bytes = 50_000_000_000   # workspace + DerivedData cap; enforced after staging + before collection
+max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap; enforced during collection
+max_log_bytes       = 200_000_000      # build.log cap; truncate with marker (see Quota Enforcement)
 max_events_bytes    = 50_000_000       # events.ndjson cap; on exceed: fail with complete + error_code
 max_event_line_bytes = 1_000_000       # per-event JSON line cap; on exceed: fail with complete + error_code
 
@@ -274,6 +282,24 @@ timeout_seconds = 3600                 # longer timeout for release builds
 allow_mutating = true                  # override base: allow archive
 code_signing_allowed = true            # override base: enable signing
 ```
+
+### Quota Enforcement (Normative)
+
+When `limits.*` are configured, the harness/host MUST enforce them deterministically:
+
+**`max_workspace_bytes`:**
+- MUST be checked at least after staging completes and again before artifact collection begins.
+- If exceeded, the job MUST terminate with `error_code="workspace_quota_exceeded"`.
+- The terminal error `detail` MUST include `{ "limit_bytes": <int>, "observed_bytes": <int> }`.
+
+**`max_artifact_bytes`:**
+- MUST be enforced during collection; if collecting the next artifact would exceed the cap, collection MUST stop.
+- The job MUST terminate with `error_code="artifact_quota_exceeded"` and preserve already-collected artifacts + manifest entries.
+- The terminal error `detail` MUST include `{ "limit_bytes": <int>, "observed_bytes": <int>, "artifact": "<path>" }`.
+
+**`max_log_bytes`:**
+- When exceeded, `build.log` MUST be truncated with an explicit marker and `redaction_report.json` MUST record `log_truncated=true`.
+- The job MAY still succeed; `summary.json.errors[]` SHOULD include a non-fatal error object with code `log_truncated`.
 
 ### Host Config: `~/.config/rch/workers.toml`
 
@@ -461,6 +487,8 @@ The worker MUST execute jobs inside a dedicated per-job workspace root, e.g.:
 - `src/` — staged source tree
 - `work/` — scratch/workdir for transient files
 - `dd/` — DerivedData (or equivalent) root
+- `result/` — result bundle root (xcresult output lives under here)
+- `spm/` — cloned SourcePackages dir (when supported) or per-job package working dir
 
 **Read-only source (Normative):**
 
@@ -601,6 +629,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `xcode_version_mismatch` | Xcode version does not match constraint | No |
 | `backend_unavailable` | Preferred backend unavailable and fallback disallowed | No |
 | `protocol_version_unsupported` | No common protocol version between host and harness | No |
+| `contract_version_unsupported` | Harness does not support requested contract_version | No |
 | `runtime_not_found` | Requested simulator runtime not installed | No |
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
@@ -621,6 +650,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
 | `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
+| `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
+| `unsafe_symlink_target` | A symlink target is unsafe under allow_safe policy | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -649,6 +680,7 @@ When posture is `untrusted`, the lane MUST enforce (regardless of profile defaul
 - `code_signing_allowed = false`
 - `allow_mutating = false`
 - `cache.mode = "read_only"` (or `"off"` if profile sets caches off)
+- `source.symlinks = "forbid"` unless the operator explicitly opts out for a known-safe repository
 - If `action = "test"`, the lane MUST set (or require) `simulator.strategy = "per_job"` unless explicitly overridden for local use.
 - If artifacts may leave the host (`store = "worker"` or `"object_store"`), the lane MUST enable log redaction (`redaction.enabled = true`) or refuse with a stable error code `untrusted_remote_storage_requires_redaction`.
 
@@ -745,6 +777,7 @@ Each entry in `entries` MUST be an object with:
 - `mode` (string) — Stable file mode string (e.g., `"100644"` for regular file, `"100755"` for executable).
 - `sha256` (string) — Lowercase hex SHA-256 of file contents. For symlinks, hash the link target path bytes (not the target file contents).
 - `bytes` (integer) — File size in bytes (symlink: length of target path).
+- `link_target` (string|null) — REQUIRED when `type="symlink"`; MUST be the symlink target path as stored in the filesystem. Null for regular files.
 
 **Hash computation:**
 
@@ -759,7 +792,7 @@ Where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and the result is low
 - Paths MUST use `/` as separator (convert from platform-native).
 - Paths MUST NOT have leading `./` or trailing `/`.
 - Paths MUST be sorted lexicographically by UTF-8 byte values.
-- Symlinks MUST be represented as `type: "symlink"` with hash of target path; the lane MUST NOT follow symlinks.
+- Symlinks MUST be represented as `type: "symlink"` with `link_target` recorded and `sha256` computed over `link_target` bytes; the lane MUST NOT follow symlinks.
 - Binary files are hashed as-is (no newline normalization).
 - Default excludes: `.git/`, `.rch/`, `*.xcresult/`, `DerivedData/`. Additional excludes via `[profiles.<name>.source].excludes`.
 
@@ -776,6 +809,10 @@ Source snapshot behavior is configured under `[profiles.<name>.source]`:
 - **`mode`** — `"vcs"` (default): hash and sync only VCS-tracked files. `"working_tree"`: hash and sync all files (respecting excludes).
 - **`require_clean`** — If true, lane MUST refuse to run when the working tree is dirty. Default: false for `local` profiles, true for `ci` profiles.
 - **`include_untracked`** — If true, untracked files are included in hash and sync. Default: false.
+- **`symlinks`** — `"forbid"` | `"allow_safe"` | `"allow_all"`. Default: `"forbid"` for untrusted posture, `"allow_safe"` otherwise.
+  - `forbid`: Source tree MUST NOT contain symlinks; if any are found, refuse with `symlinks_disallowed`.
+  - `allow_safe`: Allow symlinks only if target is relative, does not start with `/`, and does not contain `..` path segments. Unsafe symlinks cause `unsafe_symlink_target`.
+  - `allow_all`: Allow all symlinks (use with caution).
 
 ### Provenance (Optional, Strongly Recommended)
 
@@ -818,6 +855,7 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
 ├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
+├── backend_invocation.json# Structured backend invocation record (safe; no secret values)
 ├── redaction_report.json  # Optional: redaction/truncation report (no secret values; emitted when redaction enabled)
 └── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
 ```
@@ -883,6 +921,33 @@ When `store` is `"worker"` or `"object_store"`, the `rch xcode fetch <job_id>` c
 3. Verify SHA-256 hash matches the manifest entry.
 4. Decompress if `compression` indicates compressed format.
 5. Update `manifest.json` to reflect local storage after successful fetch.
+
+### `backend_invocation.json` Requirements (Normative)
+
+A small, structured record of what the harness actually invoked. MUST be safe to store remotely.
+
+**Required fields:**
+- `kind`: `"backend_invocation"`
+- `schema_version`, `lane_version`
+- `job_id`, `run_id`, `attempt`
+- `backend` (object): `{ "preferred": "...", "actual": "..." }`
+
+**Backend-specific fields:**
+
+For `backend.actual = "xcodebuild"`:
+- `argv` (array of strings) — The full argument vector passed to xcodebuild.
+- `cwd` (string) — The working directory.
+
+For `backend.actual = "xcodebuildmcp"`:
+- `mcp_request` (object) — A structured, redacted/safe representation of the MCP request sent.
+
+**Additional required fields:**
+- `paths` (object) — The effective confined paths used (`dd`, `result`, `spm`) for auditability and reproducibility.
+- `env_names` (array of strings) — Allowlisted environment variable names passed (values MUST NOT be included).
+
+**Prohibited:**
+- MUST NOT include secret values (env values, tokens, credentials).
+- Environment MUST be represented as names/allowlist only.
 
 ### `environment.json` Requirements
 
@@ -1132,6 +1197,8 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
 - `probe.json` parses successfully and includes required capability fields (`protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`).
 - JSON artifacts validate against their schemas (when schemas are available).
+- Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
+- Recompute `run_id` as `SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
 - If hash chain fields are present, verify the chain (`prev_event_sha256`/`event_sha256`) and that `event_chain_head_sha256` matches the final non-`complete` event.
@@ -1268,6 +1335,18 @@ When `erase_on_start = true`:
 
 `effective_config.json` MUST record the actual `simulator_strategy` and `simulator_udid` used.
 
+### Backend Path Discipline (Normative)
+
+The harness MUST ensure backend outputs are confined to the per-job workspace by construction:
+
+- When invoking `xcodebuild`, the harness MUST pass:
+  - `-derivedDataPath` = `worker_paths.dd`
+  - `-resultBundlePath` = `worker_paths.result/result.xcresult` (or equivalent under `result/`)
+  - When supported and when `cache.spm` is enabled: `-clonedSourcePackagesDirPath` = `worker_paths.spm`
+- When invoking XcodeBuildMCP, the harness MUST set equivalent fields in the MCP request so the same confinement holds.
+
+The harness MUST record the effective paths in `effective_config.resolved.paths` and echo them in the `hello.worker_paths`.
+
 ### Concurrency Control
 
 - Avoid thrashing by limiting concurrent jobs per worker.
@@ -1278,14 +1357,14 @@ When `erase_on_start = true`:
 
 To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-based concurrency model:
 
-- **Lease acquisition**: Before a job begins execution on a worker, the host MUST acquire a lease. A lease grants exclusive (or counted) access to worker job slots.
+- **Lease acquisition**: Before backend execution begins, the **harness MUST acquire a lease slot locally**. The harness is the source of truth for concurrency/queueing because it has perfect local visibility. The host does not maintain separate lease state; it observes harness `queued`/`lease_acquired` events and reflects them into `status.json`.
 - **Lease TTL**: Every lease MUST have a time-to-live (TTL), defaulting to `timeout_seconds + 300` (5-minute grace). TTL is a hard upper bound to prevent runaway jobs.
 - **Liveness**: Lease liveness MUST be tied to the active `rch-xcode-worker run` session (SSH connection + harness process). If the session is lost unexpectedly, the worker MUST treat the job as abandoned.
 - **Crash recovery**: If liveness is lost (session drop) or TTL is exceeded:
   - Worker MUST terminate the associated job process (SIGTERM, then SIGKILL after 10s).
   - Worker MUST mark the job workspace for cleanup.
   - Host MUST transition the job to `failed` with reason `"lease_expired"` (retryable) when it cannot observe a clean terminal completion.
-- **Concurrency limit**: Each worker advertises a maximum concurrent job count (default: 1). The host MUST NOT acquire a lease if the worker is at capacity; instead, the job enters a queue.
+- **Concurrency limit**: Each worker advertises a maximum concurrent job count (default: 1). If the worker is at capacity, the harness MUST queue the job and emit periodic `queued` events (at least every 10s) until a lease slot is acquired.
 - **`status.json` integration**: `queued_at`, `started_at`, and `queue_wait_seconds` fields (see status.json Requirements) MUST reflect actual lease acquisition timing.
 
 **Hello event (lease fields, Normative):**
@@ -1399,6 +1478,7 @@ To prevent contract drift between host and harness:
 | Trust posture | `auto` | `[profiles.<name>.trust] posture = "untrusted"` |
 | Event hash chain | Disabled | `[profiles.<name>.integrity] event_hash_chain = true` |
 | Cache promote on failure | Disabled | `[profiles.<name>.cache] promote_on_failure = true` |
+| Symlinks in source | `forbid` (untrusted) / `allow_safe` (trusted) | `[profiles.<name>.source] symlinks = "allow_all"` |
 
 ---
 
