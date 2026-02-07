@@ -66,10 +66,20 @@ The harness MUST support two verbs:
 - `effective_config` (object)
 - `paths` (object: source/workdir/cache roots)
 
+**Stdout/Stderr Separation (Normative):**
+- Stdout MUST contain ONLY NDJSON event objects. No banners, no debug lines, no progress text, no non-JSON output.
+- Stderr MAY contain human-readable logs and MUST be treated as the source for `build.log` capture/streaming.
+- The host MUST capture stderr separately and MUST NOT attempt to parse it as JSON.
+
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`.
+- Every event SHOULD include: `monotonic_ms` — Milliseconds since harness process start (monotonic clock) to provide stable ordering under clock skew.
 - The FINAL event MUST be `{"type":"complete","exit_code":N,...}` and MUST be the last line. After emitting `complete`, the harness MUST exit promptly.
+
+**Robustness (Normative):**
+- If the harness cannot emit valid JSON for an event, it MUST fail the job with a terminal `complete` event whose payload includes error code `event_stream_corrupt`.
+- The harness MUST NOT emit partial JSON lines or unterminated objects to stdout.
 
 **Benefits:**
 
@@ -119,6 +129,11 @@ mode = "vcs"                           # "vcs" (default) | "working_tree"
 require_clean = true                   # reject dirty working trees
 include_untracked = false              # include untracked files in source tree hash
 
+[profiles.ci.artifacts]
+store = "host"                         # "host" (default) | "worker" | "object_store"
+xcresult_format = "directory"          # "directory" | "tar.zst"
+compression = "none"                   # "none" | "zstd" (applies to large artifacts during transfer)
+
 [profiles.release]
 action = "build"
 workspace = "MyApp.xcworkspace"
@@ -145,9 +160,22 @@ ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
 
 ### Transport Trust (Normative)
 
-When `ssh_host_key_fingerprint` is configured for a worker, the host MUST verify the remote SSH host key matches before executing any probe/run command. If verification fails, the lane MUST refuse to run and emit a clear error.
+When `ssh_host_key_fingerprint` is configured for a worker, the host MUST verify the remote SSH host key matches before executing any probe/run command. If verification fails, the lane MUST refuse to run and emit a clear error with code `ssh_host_key_mismatch`.
 
 `attestation.json` MUST record the observed SSH host key fingerprint used for the session (even if not pinned), so audits can detect worker identity drift.
+
+#### Profile-Level Host Key Enforcement
+
+Profiles MAY define `[profiles.<name>.trust]` to require host key pinning:
+
+```toml
+[profiles.ci.trust]
+require_pinned_host_key = true
+```
+
+When `require_pinned_host_key = true`, the lane MUST refuse to run unless the selected worker has `ssh_host_key_fingerprint` configured in `workers.toml`. Refusal MUST use error code `unpinned_worker_disallowed` and include a hint describing how to pin the worker.
+
+This enables CI profiles to enforce a stronger trust posture than local development profiles.
 
 ### Resolution Rules
 
@@ -270,9 +298,65 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
 - `command_parsed` — Optional structured parse result (recognized flags/fields), for debugging and audit.
 - `profile_used` — The profile name selected.
 - `intercepted` — Boolean: whether the command was intercepted and routed to a worker.
-- `refusal_reason` — If not intercepted, the reason (e.g., `"uncertain_classification"`, `"mutating_disallowed"`). Null if intercepted.
+- `refusal_reason` — If not intercepted, a stable error code (e.g., `"uncertain_classification"`, `"mutating_disallowed"`). Null if intercepted. MUST use stable error codes from the Error Model.
 - `worker_selected` — Worker name, or null if refused.
 - `timestamp` — ISO 8601 timestamp of the decision.
+
+---
+
+## Error Model (Normative)
+
+To support agent/CI automation, the lane MUST provide a stable machine-consumable error model.
+
+### Error Object
+
+When present, an error MUST be represented as:
+```json
+{ "code": "string", "message": "string", "retryable": "boolean", "hint": "string|null", "detail": "object|null" }
+```
+
+- `code` — Stable error code (snake_case). MUST NOT change across releases.
+- `message` — Human-readable description. MAY change across releases.
+- `retryable` — Boolean indicating if the operation may succeed on retry.
+- `hint` — Optional human-readable guidance for resolution.
+- `detail` — Optional structured data for debugging (e.g., available runtimes, expected vs actual values).
+
+### Stable Error Codes
+
+Error codes MUST be stable across releases (backward compatible). Codes MUST be snake_case.
+
+**Standard error codes:**
+
+| Code | Meaning | Retryable |
+|------|---------|-----------|
+| `destination_not_found` | Requested simulator destination not available | No |
+| `destination_ambiguous` | Multiple matching destinations found | No |
+| `ssh_host_key_mismatch` | Worker SSH host key does not match pinned fingerprint | No |
+| `unpinned_worker_disallowed` | Profile requires pinned host key but worker has none | No |
+| `lease_expired` | Worker lease TTL exceeded without renewal | Yes |
+| `lease_unavailable` | No worker lease slots available | Yes |
+| `worker_unreachable` | Cannot establish SSH connection to worker | Yes |
+| `xcode_not_found` | Xcode not found at expected path on worker | No |
+| `xcode_version_mismatch` | Xcode version does not match constraint | No |
+| `runtime_not_found` | Requested simulator runtime not installed | No |
+| `uncertain_classification` | Command could not be confidently classified | No |
+| `mutating_disallowed` | Mutating command refused by policy | No |
+| `floating_destination_disallowed` | Floating destination (os="latest") refused by policy | No |
+| `dirty_working_tree` | Working tree has uncommitted changes and require_clean=true | No |
+| `timeout` | Job exceeded configured timeout_seconds | No |
+| `canceled` | Job was canceled by user | No |
+| `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
+| `source_staging_failed` | Failed to stage source to worker | Yes |
+| `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
+
+Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
+
+### Required Placement
+
+- `summary.json` MUST include:
+  - `error_code` (string|null) — Primary error code for the run (null on success).
+  - `errors` (array) — Array of error objects; may be empty on success.
+- `decision.json` MUST use stable codes for `refusal_reason` when refusing interception.
 
 ### Threat Model
 
@@ -312,10 +396,48 @@ The `attestation.json` MUST include a `source` object capturing the state of the
 
 - **`vcs_commit`** — The full commit SHA of HEAD (or null if not a VCS repo).
 - **`dirty`** — Boolean: true if the working tree has uncommitted changes.
-- **`source_tree_hash`** — A deterministic hash of the source files sent to the worker (SHA-256 of sorted file paths + contents, excluding `.rch/`, `.git/`, and configured excludes).
+- **`source_tree_hash`** — A deterministic hash of the source files sent to the worker (see Canonical Source Manifest below).
 - **`untracked_included`** — Boolean: whether untracked files were included in the hash and sync.
 
 The source tree hash is a critical input to `run_id` computation (see Job Identity).
+
+#### Canonical Source Manifest (Normative)
+
+The lane MUST produce a canonical manifest of the staged source and MUST use it to compute `source_tree_hash`. This enables reproducibility verification and debugging.
+
+**Artifact:** `source_manifest.json` (required)
+
+**Required top-level fields:** `kind`, `schema_version`, `lane_version`, `entries`
+
+Each entry in `entries` MUST be an object with:
+- `path` (string) — Normalized path: POSIX `/` separators, no leading `./`, UTF-8, sorted lexicographically (byte order).
+- `type` (string) — `"file"` or `"symlink"`.
+- `mode` (string) — Stable file mode string (e.g., `"100644"` for regular file, `"100755"` for executable).
+- `sha256` (string) — Lowercase hex SHA-256 of file contents. For symlinks, hash the link target path bytes (not the target file contents).
+- `bytes` (integer) — File size in bytes (symlink: length of target path).
+
+**Hash computation:**
+
+```
+source_tree_hash = SHA-256( JCS(source_manifest.entries) )
+```
+
+Where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and the result is lowercase hex.
+
+**Normalization rules:**
+
+- Paths MUST use `/` as separator (convert from platform-native).
+- Paths MUST NOT have leading `./` or trailing `/`.
+- Paths MUST be sorted lexicographically by UTF-8 byte values.
+- Symlinks MUST be represented as `type: "symlink"` with hash of target path; the lane MUST NOT follow symlinks.
+- Binary files are hashed as-is (no newline normalization).
+- Default excludes: `.git/`, `.rch/`, `*.xcresult/`, `DerivedData/`. Additional excludes via `[profiles.<name>.source].excludes`.
+
+#### Excludes + Submodules
+
+Under `[profiles.<name>.source]`, the following fields MAY be used:
+- `excludes` (array of strings) — Additional path globs to exclude from hashing/staging (applied after defaults).
+- `submodules` (string) — `"forbid"` (default) | `"include"`. If `"include"`, submodules MUST be staged at their recorded commit and represented in the manifest as normal files.
 
 ### Source Policy
 
@@ -356,6 +478,7 @@ Artifacts are written under an immutable job directory on the host:
 ├── summary.json           # Machine-readable outcome + timings
 ├── effective_config.json  # Fully-resolved config used for the job
 ├── attestation.json       # Toolchain + environment fingerprint
+├── source_manifest.json   # Canonical file list + per-entry hashes used to compute source_tree_hash
 ├── manifest.json          # Artifact index + SHA-256 hashes + byte sizes
 ├── decision.json          # Classification + routing decision record
 ├── environment.json       # Captured worker environment snapshot
@@ -364,7 +487,7 @@ Artifacts are written under an immutable job directory on the host:
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
 ├── build.log              # stdout/stderr capture
-└── result.xcresult/       # When tests run and xcresult is produced
+└── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
 ```
 
 ### `manifest.json` Requirements
@@ -373,6 +496,44 @@ Artifacts are written under an immutable job directory on the host:
 - MUST include byte sizes.
 - SHOULD include a logical artifact type for each entry (log/json/xcresult/etc.).
 - SHOULD include `kind`/`schema_version` for JSON artifacts (or inferable mapping) to aid verifiers.
+
+Each manifest entry MUST include:
+- `path` (string) — Relative path within the artifact directory.
+- `sha256` (string) — Lowercase hex SHA-256 hash.
+- `bytes` (integer) — Size in bytes.
+
+Each manifest entry MAY include:
+- `storage` (string) — `"host"` | `"worker"` | `"object_store"` (where the artifact is stored).
+- `uri` (string|null) — For remote storage, a stable URI for retrieval.
+- `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
+
+### Artifact Storage & Compression (Normative)
+
+Artifact storage and compression are controlled via `[profiles.<name>.artifacts]`.
+
+#### Storage Modes
+
+- `store = "host"` (default): Host collects all configured artifacts into `~/.local/share/rch/artifacts/<job_id>/`. All artifacts are stored locally.
+- `store = "worker"`: Worker retains large artifacts (xcresult, logs); host stores JSON metadata artifacts + manifest with pointers. `rch xcode fetch <job_id>` retrieves on demand.
+- `store = "object_store"`: Host uploads artifacts after collection; manifest MUST include stable URIs for retrieval. Requires additional `[profiles.<name>.artifacts.object_store]` configuration (endpoint, bucket, credentials).
+
+#### Compression Options
+
+- `xcresult_format = "directory"` (default): xcresult stored as directory tree.
+- `xcresult_format = "tar.zst"`: xcresult compressed as `result.xcresult.tar.zst` for transfer and storage.
+- `compression = "none"` (default): No compression for other artifacts.
+- `compression = "zstd"`: Apply zstd compression to large text artifacts (logs) during transfer.
+
+When compression is enabled, the `manifest.json` entry MUST indicate the compression type so consumers can decompress correctly.
+
+#### Fetch Semantics
+
+When `store` is `"worker"` or `"object_store"`, the `rch xcode fetch <job_id>` command MUST:
+1. Read `manifest.json` from the local artifact directory.
+2. For each entry with `storage` != `"host"`, retrieve the artifact from the indicated location.
+3. Verify SHA-256 hash matches the manifest entry.
+4. Decompress if `compression` indicates compressed format.
+5. Update `manifest.json` to reflect local storage after successful fetch.
 
 ### `environment.json` Requirements
 
@@ -484,6 +645,7 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
+| `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity (+ provenance if enabled) |
 | `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
@@ -502,6 +664,29 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 - Requested destination available (simulator runtime + device)
 - XcodeBuildMCP available (if configured as backend)
 - Node.js version compatible
+
+### `validate` Checks (Artifacts)
+
+The `validate` command verifies artifact integrity and consistency for a completed job.
+
+**Required validations:**
+
+- All files listed in `manifest.json` exist and have matching SHA-256 hashes.
+- All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
+- JSON artifacts validate against their schemas (when schemas are available).
+- `events.ndjson` parses as valid NDJSON and ends with a terminal `complete` event.
+- `job_id`, `run_id`, `attempt` are consistent across artifacts.
+
+**Optional validations (when applicable):**
+
+- Provenance signatures verify against `verify.json` public key.
+- `source_manifest.json` entries hash to the recorded `source_tree_hash`.
+
+**Exit codes:**
+
+- `0` — All validations passed.
+- `1` — One or more validations failed (details in stdout as JSON).
+- `2` — Artifact directory not found or unreadable.
 
 ---
 
@@ -523,11 +708,57 @@ Machine-readable test summary for agent consumption. Emitted when the job action
 
 Cache usage MUST be controlled via `[profiles.<name>.cache]` and MUST be reflected in `effective_config.json`. The lane MUST record cache decisions and hit/miss stats in `metrics.json` (at minimum: derived data + SPM).
 
+#### Cache Isolation (Normative)
+
+To reduce cross-run contamination and cache poisoning, profiles MAY define cache trust boundaries:
+
+```toml
+[profiles.ci.cache]
+derived_data = true
+spm = true
+trust_domain = "per_profile"           # "shared" | "per_repo" | "per_profile"
+```
+
+- `trust_domain = "shared"`: All jobs share the same cache namespace. Use only for fully trusted repos.
+- `trust_domain = "per_repo"` (default for CI): Caches are segregated by repository identity (e.g., repo URL hash).
+- `trust_domain = "per_profile"`: Caches are segregated by profile name within a repo.
+
+The worker MUST segregate caches by the effective `trust_domain` boundary. At minimum, DerivedData and SPM caches MUST be isolated.
+
+`metrics.json` SHOULD record:
+- `cache_namespace` — The computed cache namespace key.
+- `cache_writable` — Boolean indicating if the cache was writable for this job.
+
 ### Simulator Prewarm
 
 - Boot simulator once, reuse across runs.
 - Collect runtime info in `environment.json`.
 - Avoid cold-start tax on every job.
+
+### Simulator Hygiene (Normative)
+
+To prevent test pollution and flaky behavior from shared simulator state, profiles MAY define simulator lifecycle policies:
+
+```toml
+[profiles.ci.simulator]
+strategy = "shared_prebooted"          # "shared_prebooted" | "per_job"
+erase_on_start = false                 # Erase simulator data before test run
+shutdown_on_end = true                 # Shutdown simulator after job completion
+```
+
+- `strategy = "shared_prebooted"` (default): Reuse prebooted simulators across jobs. Faster but may accumulate state.
+- `strategy = "per_job"`: Create a dedicated simulator device for the job, delete on completion (best-effort). Maximum isolation.
+
+When `strategy = "per_job"`:
+- The worker MUST create a new simulator device matching the destination spec.
+- The worker MUST record the created UDID in `effective_config.json`.
+- The worker MUST delete the simulator device on job completion (best-effort cleanup).
+
+When `erase_on_start = true`:
+- The worker MUST erase the simulator device data before the test run begins.
+- This is slower but ensures a clean state for each job.
+
+`effective_config.json` MUST record the actual `simulator_strategy` and `simulator_udid` used.
 
 ### Concurrency Control
 
@@ -549,6 +780,35 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 - **Concurrency limit**: Each worker advertises a maximum concurrent job count (default: 1). The host MUST NOT acquire a lease if the worker is at capacity; instead, the job enters a queue.
 - **`status.json` integration**: `queued_at`, `started_at`, and `queue_wait_seconds` fields (see status.json Requirements) MUST reflect actual lease acquisition timing.
 
+### Retry Policy (Normative)
+
+To handle transient infrastructure failures gracefully, profiles MAY define automatic retry behavior:
+
+```toml
+[profiles.ci.retry]
+max_attempts = 3                       # Maximum total attempts (including first try)
+retry_on = ["lease_expired", "worker_unreachable", "source_staging_failed", "artifact_collection_failed"]
+```
+
+- `max_attempts` (integer, default: 1) — Maximum number of attempts. Value of 1 means no retries.
+- `retry_on` (array of strings) — Error codes that trigger automatic retry. Empty means no automatic retries.
+
+**Retry semantics:**
+
+- Automatic retries MUST keep the same `run_id` (content-derived, unchanged).
+- Each retry MUST increment `attempt` (1, 2, 3, ...).
+- Each retry MUST allocate a new `job_id` (unique per attempt).
+- Retries MUST respect `max_attempts`; after exhausting retries, the job fails with the last error.
+
+**Event recording:**
+
+- Each attempt MUST emit `attempt_started` and `attempt_complete` events in `events.ndjson`.
+- `summary.json` MUST include `attempt` field and `attempts` array with per-attempt summaries when retries occur.
+
+**Manual retry:**
+
+`rch xcode retry <job_id>` MAY be provided to manually retry a failed job with `attempt` incremented. The new attempt inherits the original `run_id` if source and config are unchanged.
+
 ---
 
 ## Milestones
@@ -560,14 +820,21 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 - **M4**: XcodeBuildMCP backend with structured events (build phases, test events)
 - **M5**: Determinism outputs: summary.json, effective_config.json, attestation.json, manifest.json, environment.json, timing.json
 - **M5.1**: Decision artifact (`decision.json`) + event stream (`events.ndjson`) + live status (`status.json`)
-- **M5.2**: Source snapshot in attestation + source policy enforcement
+- **M5.2**: Source snapshot in attestation + source policy enforcement + `source_manifest.json`
 - **M5.3**: Artifact schema versioning (`kind`, `schema_version`, `lane_version`) + metrics.json
+- **M5.4**: Error model (stable error codes in summary.json, decision.json)
 - **M6**: Caching + performance: DerivedData/SPM caches, incremental sync, simulator prewarm, concurrency control
 - **M6.1**: Worker leases + crash recovery + queue-wait metrics
+- **M6.2**: Cache isolation (trust_domain boundaries)
+- **M6.3**: Simulator hygiene (per-job strategy, erase/shutdown policies)
 - **M7**: Ops hardening: timeouts, cancellation, worker harness (`rch-xcode-worker`), partial artifact preservation
 - **M7.1**: Optional provenance (signed attestation + manifest)
 - **M7.2**: Optional CI reports (`junit.xml`, `test_summary.json`)
 - **M7.3**: Garbage collection (`rch xcode gc`) + worker workspace retention
+- **M7.4**: Retry policy (automatic retries on transient errors)
+- **M7.5**: Artifact storage + compression (worker/object_store modes, xcresult compression)
+- **M7.6**: `validate` command (artifact integrity verification)
+- **M7.7**: Transport trust enforcement (`require_pinned_host_key`)
 - **M8**: Compatibility matrix + fixtures: golden configs, sample repos, reproducible failure cases
 
 ---
@@ -586,6 +853,7 @@ To prevent resource exhaustion and ensure crash recovery, the lane uses a lease-
 | Provenance signing | Disabled | `[profiles.<name>.provenance] enabled = true` |
 | Flag passthrough | Disallowed | N/A (must model as config fields) |
 | SSH host key pinning | Optional (recorded) | `ssh_host_key_fingerprint` in workers.toml |
+| CI requires pinning | Disabled | `[profiles.<name>.trust] require_pinned_host_key = true` |
 
 ---
 

@@ -913,12 +913,16 @@ def run_integrate(
     if shutil.which("claude"):
         try:
             claude_result = subprocess.run(
-                ["claude", "--print", "-"],
+                ["claude", "-p", "--allowedTools", "Read Edit Write Bash", "--permission-mode", "bypassPermissions", "--append-system-prompt", "You MUST use the Edit or Write tool to apply changes directly to the files. Do not just describe the changes in your output.", "-"],
                 input=prompt,
                 capture_output=True, text=True,
                 timeout=3600,
             )
             if claude_result.returncode == 0:
+                # Log Claude output for debugging
+                out_file = config.log_dir / f"integrate_claude_round_{round_num}.log"
+                out_file.write_text(claude_result.stdout[:5000] if claude_result.stdout else "(no output)")
+                logger.debug(f"  Claude output saved to {out_file}")
                 logger.info("  ✅ Claude Code integration complete")
                 return True
             logger.warning(

@@ -47,6 +47,7 @@ Recommended:
 - Dedicated machine (or at least dedicated environment) for lane execution
 - Keep `allow_mutating = false` unless you explicitly need `clean`/`archive`-like behavior
 - Pin worker SSH host keys (or at minimum record host key fingerprints in attestation)
+- CI profiles SHOULD require pinning (lane can refuse if worker has no configured fingerprint)
 
 See `PLAN.md` § Safety Rules for the full threat model.
 
@@ -74,6 +75,7 @@ See `PLAN.md` § Safety Rules for the full threat model.
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
+| `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity |
 | `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
@@ -105,6 +107,9 @@ os = "18.2"  # CI SHOULD pin; floating "latest" is opt-in (see PLAN.md)
 [profiles.ci.safety]
 allow_mutating = false
 code_signing_allowed = false
+
+[profiles.ci.trust]
+require_pinned_host_key = true
 ```
 
 ## Outputs
@@ -112,14 +117,16 @@ code_signing_allowed = false
 Artifacts are written to: `~/.local/share/rch/artifacts/<job_id>/`
 
 All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
+`summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.
 Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommended for CI/agents).
 
 ```
 <job_id>/
-├── summary.json           # High-level status + timings (includes job_id, run_id, attempt)
+├── summary.json           # High-level status + timings (includes job_id, run_id, attempt, error_code)
 ├── effective_config.json  # Resolved/pinned run configuration
-├── decision.json          # Interception/classification decision + refusal reasons
+├── decision.json          # Interception/classification decision + refusal reasons (stable error codes)
 ├── attestation.json       # Worker identity, tool versions, repo state
+├── source_manifest.json   # Canonical file list + per-entry hashes used to compute source_tree_hash
 ├── manifest.json          # Artifact listing + SHA-256 hashes
 ├── environment.json       # Worker environment snapshot
 ├── timing.json            # Phase durations (staging/running/collecting)
@@ -127,7 +134,7 @@ Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommen
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only)
 ├── build.log              # Streamed + finalized stdout/stderr
-├── result.xcresult/       # When tests are executed
+├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
 └── provenance/            # Optional: signatures + verification report
 ```
 
@@ -136,9 +143,11 @@ Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommen
 - Recommended: dedicate a worker user account with minimal privileges
 - Prefer `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled in config
 - Use worker concurrency limits + leases to avoid simulator contention
+- Prefer per-job simulator hygiene for flaky UI tests (erase/create policies)
 - CI profiles SHOULD pin destination runtime/device; floating resolution is opt-in
 - Deterministic IDs: `run_id` is content-derived; `job_id` is per-attempt. Timestamps live in `summary.json`, not config.
 - Failure modes are first-class: timeouts/cancellation preserve partial artifacts
+- Transient errors (lease_expired, worker_unreachable) can be auto-retried via retry policy
 
 ## Next
 
