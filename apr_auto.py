@@ -513,8 +513,10 @@ def check_output_truncation(
                 )
                 return True
 
-    # Relative size: <30% of rolling average is suspicious
-    if output_sizes and chars > 0:
+    # Relative size: <30% of rolling average is suspicious.
+    # Require at least 3 samples before comparing — early rounds after
+    # plan integration can legitimately differ in size.
+    if len(output_sizes) >= 3 and chars > 0:
         avg = sum(output_sizes) / len(output_sizes)
         if chars < avg * 0.3:
             logger.warning(
