@@ -24,6 +24,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Lane**: The Xcode-specific subsystem within RCH.
 - **Run ID**: Content-derived identifier (SHA-256 of canonical **config inputs** + source tree hash); identical inputs produce the same run ID.
 - **Job ID**: Unique identifier per execution attempt; never reused.
+- **Contract Version**: A stable semantic version of the *lane contract* that is included in `effective_config.inputs` (and therefore influences `run_id`). It MUST be bumped whenever the meaning of any hashed input changes (defaults, canonicalization, policy semantics, backend argument reconstruction), even if `lane_version` changes for other reasons.
 
 ---
 
@@ -67,6 +68,7 @@ The probe JSON MUST include at minimum:
 - `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
 - `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/xcresult-derived diagnostics). Enables the host/agents to understand expected event richness.
 - `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
+- `roots` (object) — Canonical harness roots used to derive per-job paths (especially in `--forced` mode): `stage_root`, `jobs_root`, `cache_root`.
 
 The host MUST select a `protocol_version` supported by both sides. If no overlap exists, the lane MUST refuse with stable error code `protocol_version_unsupported`.
 
@@ -88,11 +90,16 @@ The harness SHOULD support an optional third verb:
 - `job_id`, `run_id`, `attempt`
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, destination UDID)
-- `paths` (object: source/workdir/cache roots)
+- `paths` (object: source/workdir/cache roots). In `--forced` mode, the harness MUST ignore any host-supplied absolute paths and MUST derive paths from configured roots + `job_id` (see Path Confinement below).
 
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
   - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
+
+**Path Confinement (Normative):**
+- In `--forced` mode, the harness MUST compute `src/`, `work/`, `dd/` and related paths solely from (`jobs_root`, `stage_root`, `cache_root`) + `job_id` (and optional stable subpaths).
+- The harness MUST reject any request whose effective paths would escape the configured roots (after resolving `..` and symlinks) with stable error code `path_out_of_bounds`.
+- The harness MUST treat `paths` from the host as *hints only* (or ignore entirely) when `--forced` is active.
 
 **Backend Selection (Normative):**
 - `effective_config.backend.preferred` MAY be `"xcodebuildmcp"` or `"xcodebuild"`.
@@ -108,6 +115,7 @@ The harness SHOULD support an optional third verb:
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, and the echoed `job_id`/`run_id`/`attempt`.
+- The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `cache`) so audits/debugging can prove where execution happened.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
 - Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
 - Every event SHOULD include: `monotonic_ms` — Milliseconds since harness process start (monotonic clock) to provide stable ordering under clock skew.
@@ -152,6 +160,20 @@ Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so 
 ### Repo Config: `.rch/xcode.toml`
 
 Configuration uses **named profiles** (`[profiles.<name>]`). Select a profile with `--profile <name>`.
+
+### Structured Xcode Test Controls (Normative)
+
+Profiles MAY define an `xcode_test` table to control *test selection* without permitting arbitrary flag passthrough:
+
+```toml
+[profiles.ci.xcode_test]
+test_plan = "CI"                          # optional
+only_testing = ["MyAppTests/FooTests"]    # optional array (replaces, no concat)
+skip_testing = ["MyAppTests/FlakyTests"]  # optional array (replaces, no concat)
+```
+
+- These fields MUST be included in `effective_config.inputs` when present.
+- The harness MUST translate these into backend-specific invocations (XcodeBuildMCP or xcodebuild) and MUST record the final applied selection in `effective_config.resolved`.
 
 **Profile inheritance (Normative):**
 
@@ -233,6 +255,8 @@ compression = "none"                   # "none" | "zstd" (applies to large artif
 max_workspace_bytes = 50_000_000_000   # workspace + DerivedData cap (best effort)
 max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap
 max_log_bytes       = 200_000_000      # build.log cap; truncate with marker
+max_events_bytes    = 50_000_000       # events.ndjson cap; on exceed: fail with complete + error_code
+max_event_line_bytes = 1_000_000       # per-event JSON line cap; on exceed: fail with complete + error_code
 
 # Release profile extends base but overrides safety for signing
 [profiles.release]
@@ -357,6 +381,7 @@ All three fields MUST appear in `summary.json`, `effective_config.json`, and `at
 ```
 
 **`inputs` (hashed):** MUST include all logical build/test inputs that affect results and caching, such as:
+- `contract_version` — semantic contract version for the hashed inputs (see Terms)
 - action, workspace/project, scheme, configuration, timeout
 - destination *spec* (platform + device/runtime identifiers or pinned versions)
 - toolchain identity once pinned (Xcode build number, selected runtime identifier)
@@ -372,7 +397,7 @@ All three fields MUST appear in `summary.json`, `effective_config.json`, and `at
 
 To make `run_id` stable across hosts/implementations, the lane MUST define canonicalization.
 
-**Canonical JSON:** The lane MUST canonicalize **`effective_config.inputs`** using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing.
+**Canonical JSON:** The lane MUST canonicalize **`effective_config.inputs`** using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing. `effective_config.inputs` MUST include `contract_version`.
 
 **`run_id` bytes:** The lane MUST compute:
 `run_id = SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )`
@@ -442,7 +467,7 @@ When the lane intercepts an incoming command string, it MUST:
 1. Parse/classify the request (for decision/audit), then
 2. Construct the remote invocation exclusively from `effective_config.json`.
 
-The lane MUST NOT pass through arbitrary user-provided `xcodebuild` flags or paths. Any CLI overrides MUST be explicitly modeled as structured config fields and included in `effective_config.json`.
+The lane MUST NOT pass through arbitrary user-provided `xcodebuild` flags or paths. Any overrides MUST be explicitly modeled as structured config fields (e.g., `xcode_test.only_testing`) and included in `effective_config.json`.
 
 Rationale: prevents flag-based policy bypass and keeps runs deterministic/auditable.
 
@@ -563,11 +588,14 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `timeout` | Job exceeded configured timeout_seconds | No |
 | `canceled` | Job was canceled by user | No |
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
+| `events_quota_exceeded` | Event stream exceeded configured byte cap | No |
+| `event_line_too_long` | A single event exceeded configured per-line cap | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
 | `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
 | `source_tree_modified` | Source tree was modified during execution | No |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
 | `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
+| `path_out_of_bounds` | Requested/derived path escaped configured roots | No |
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
@@ -652,6 +680,7 @@ The `attestation.json` MUST include a `source` object capturing the state of the
 - **`dirty`** — Boolean: true if the working tree has uncommitted changes.
 - **`source_tree_hash`** — A deterministic hash of the source files sent to the worker (see Canonical Source Manifest below).
 - **`untracked_included`** — Boolean: whether untracked files were included in the hash and sync.
+- **`lockfiles`** — Optional array of `{ path, sha256 }` for recognized dependency lockfiles (e.g., `Package.resolved`, `Podfile.lock`, `Cartfile.resolved`) when present in the staged source.
 
 The source tree hash is a critical input to `run_id` computation (see Job Identity).
 
@@ -745,6 +774,7 @@ Artifacts are written under a per-job directory on the host. The directory is **
 
 ```
 ~/.local/share/rch/artifacts/jobs/<job_id>/
+├── probe.json             # Captured worker harness probe output used for selection/verification
 ├── summary.json           # Machine-readable outcome + timings
 ├── effective_config.json  # Fully-resolved config used for the job
 ├── attestation.json       # Toolchain + environment fingerprint
@@ -858,6 +888,8 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 **Append safety (Normative):**
 - Writers MUST append complete, newline-terminated JSON objects only.
 - Writers MUST NOT emit partial JSON lines.
+- Writers MUST ensure each event line is <= `max_event_line_bytes` when configured; if the next event would exceed the cap, the harness MUST terminate the job with a final `complete` event using error code `event_line_too_long`.
+- When `max_events_bytes` is configured, if emitting the next event would exceed the cap, the harness MUST terminate the job with a final `complete` event using error code `events_quota_exceeded`.
 - Readers MUST tolerate the file growing during reads, and SHOULD ignore a non-terminal final line only if it is not newline-terminated (defensive tail behavior).
 
 **Required fields per event:**
@@ -1026,6 +1058,7 @@ The `validate` command verifies artifact integrity and consistency for a complet
 
 - All files listed in `manifest.json` exist and have matching SHA-256 hashes.
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
+- `probe.json` parses successfully and includes required capability fields (`protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
@@ -1058,7 +1091,7 @@ The `validate` command verifies artifact integrity and consistency for a complet
 | Cache | Key Components |
 |-------|----------------|
 | DerivedData | cache_namespace + config_hash |
-| SwiftPM | Xcode build + resolved dependencies hash (+ optional toolchain constraints) |
+| SwiftPM | Xcode build + resolved dependencies hash (derived from lockfiles such as `Package.resolved`) (+ optional toolchain constraints) |
 
 ### Cache Policy (Normative)
 

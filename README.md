@@ -115,14 +115,14 @@ workspace = "MyApp.xcworkspace"
 scheme = "MyApp"
 configuration = "Debug"
 timeout_seconds = 1800
-#
+
 # Larger repos MAY define a base profile and have others extend it (see PLAN.md).
 
 [profiles.ci.destination]
 platform = "iOS Simulator"
 name = "iPhone 16"
 os = "18.2"  # CI SHOULD pin; floating "latest" is opt-in (see PLAN.md)
-#
+
 # Strongly recommended for CI (more stable than human-friendly names):
 # device_type_id = "com.apple.CoreSimulator.SimDeviceType.iPhone-16"
 # runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-18-2"
@@ -151,6 +151,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 
 ```
 <job_id>/
+├── probe.json             # Captured worker harness probe output used for selection/verification
 ├── summary.json           # High-level status + timings (includes job_id, run_id, attempt, error_code)
 ├── effective_config.json  # Resolved/pinned run configuration
 ├── decision.json          # Interception/classification decision + refusal reasons (stable error codes)
@@ -175,7 +176,7 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 - Use worker concurrency limits + leases to avoid simulator contention
 - Prefer per-job simulator hygiene for flaky UI tests (erase/create policies)
 - CI profiles SHOULD pin destination runtime/device; floating resolution is opt-in
-- Deterministic IDs: `run_id` is content-derived; `job_id` is per-attempt. Timestamps live in `summary.json`, not config.
+- Deterministic IDs: `run_id` is content-derived from `effective_config.inputs` (including `contract_version`) + `source_tree_hash`; `job_id` is per-attempt. Timestamps live in `summary.json`, not config.
 - Failure modes are first-class: timeouts/cancellation preserve partial artifacts
 - Transient errors (lease_expired, worker_unreachable) can be auto-retried via retry policy
 
