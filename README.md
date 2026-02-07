@@ -8,7 +8,8 @@
 **RCH Xcode Lane** is a *remote build/test gate* for Apple-platform projects.
 It extends **Remote Compilation Helper (RCH)** to route safe, allowlisted Xcode build/test commands
 to a remote **macOS worker** (e.g., a Mac mini) via a **stable worker harness**: `rch-xcode-worker`.
-The harness may use **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` backend, but the host always speaks one protocol and always receives structured NDJSON events.
+
+The host **never shells out to `xcodebuild` directly**. It speaks one protocol (`probe` / `run`) and always receives structured NDJSON events. The harness may use **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` backend *internally*.
 
 ## Why
 
@@ -30,6 +31,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (Xcode, runtimes, XcodeBuildMCP).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
 3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
+   - Production setups SHOULD use the harness in **forced-command mode** so SSH cannot run arbitrary commands.
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
 5. **Attest** toolchain + environment; emit machine-readable outputs for CI/agents.
 
@@ -65,7 +67,8 @@ See `PLAN.md` § Safety Rules for the full threat model.
 - SSH access (key-based)
 - `rsync` + `zstd` (fast sync + compression)
 - Node.js + XcodeBuildMCP (recommended backend)
-- `rch-xcode-worker` harness (recommended): stable remote probe/run/collect interface
+- `rch-xcode-worker` harness (**required**): stable remote probe/run/collect interface
+  - Strongly recommended: forced-command SSH key (`authorized_keys command=...`) running `rch-xcode-worker --forced`
 
 ### Host
 
@@ -91,11 +94,14 @@ See `PLAN.md` § Safety Rules for the full threat model.
 ## Setup
 
 1. Register the Mac mini in `~/.config/rch/workers.toml` with tags `macos,xcode`
-2. Add repo config at `.rch/xcode.toml` (see example below)
-3. Start the daemon: `rch daemon start`
-4. Check setup: `rch xcode doctor`
-5. Validate config: `rch xcode verify --profile ci`
-6. Run a gate: `rch xcode test --profile ci`
+2. Pin the worker SSH host key fingerprint (CI profiles SHOULD require this)
+3. Install `rch-xcode-worker` on the worker and configure the **run key** as forced-command
+4. Configure a separate restricted **rsync key** (e.g., `rrsync`) confined to the staging root
+5. Add repo config at `.rch/xcode.toml` (see example below)
+6. Start the daemon: `rch daemon start`
+7. Check setup: `rch xcode doctor`
+8. Validate config: `rch xcode verify --profile ci`
+9. Run a gate: `rch xcode test --profile ci`
 
 ## Minimal `.rch/xcode.toml`
 

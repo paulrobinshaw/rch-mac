@@ -36,6 +36,7 @@ If README.md conflicts with PLAN.md, PLAN.md wins.
 - Every JSON artifact must include `schema_version`
 - New config fields need defaults and must be backwards-compatible
 - New artifacts must be added to the Required Artifacts listing AND manifest.json
+- `effective_config.json` separates `inputs` (hashed for run_id) from `resolved` (execution-time details like UDIDs, paths)
 
 ### When modifying README.md
 - Keep it non-normative — quickstart and mental model only
@@ -46,7 +47,7 @@ If README.md conflicts with PLAN.md, PLAN.md wins.
 - Start from PLAN.md, not README.md
 - The job lifecycle is: created → queued → staging → running → terminal
 - All JSON artifacts use RFC 8785 (JCS) for canonicalization
-- `run_id = SHA-256(JCS(effective_config) || \n || source_tree_hash_hex)`
+- `run_id = SHA-256(JCS(effective_config.inputs) || \n || source_tree_hash_hex)` — note: only `inputs` is hashed, not `resolved`
 - Worker communication should go through the harness protocol when available
 
 ## Current State

@@ -22,7 +22,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Job**: One remote build/test execution with stable, addressable artifacts.
 - **Profile**: Named configuration block (e.g., `ci`, `local`, `release`).
 - **Lane**: The Xcode-specific subsystem within RCH.
-- **Run ID**: Content-derived identifier (SHA-256 of effective config + source tree hash); identical inputs produce the same run ID.
+- **Run ID**: Content-derived identifier (SHA-256 of canonical **config inputs** + source tree hash); identical inputs produce the same run ID.
 - **Job ID**: Unique identifier per execution attempt; never reused.
 
 ---
@@ -55,15 +55,38 @@ The harness MUST support two verbs:
    - Emits a single JSON object to stdout (capabilities) and exits 0 on success.
    - Used by `rch xcode verify` and worker selection.
 
+**Probe output schema (Normative):**
+
+The probe JSON MUST include at minimum:
+- `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
+- `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
+- `lane_version` (SemVer string) — Lane specification version the harness implements.
+- `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
+- `xcode` (object) — `path`, `version`, `build` (Xcode build number).
+- `simulators` (object) — Available runtimes + device types (or a summarized digest).
+- `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
+- `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
+
+The host MUST select a `protocol_version` supported by both sides. If no overlap exists, the lane MUST refuse with stable error code `protocol_version_unsupported`.
+
 2) `rch-xcode-worker run`
    - Reads exactly one JSON object (the job request) from stdin.
    - Emits NDJSON events to stdout (one JSON object per line).
    - Exits after emitting a terminal `complete` event.
 
+The harness SHOULD support an optional third verb:
+
+3) `rch-xcode-worker cancel`
+   - Reads a single JSON object from stdin containing at minimum `job_id` (and SHOULD include `lease_id` if known).
+   - Terminates the active backend process group for that job (SIGTERM, then SIGKILL after 10s).
+   - Emits a single JSON object to stdout describing whether a process was found and terminated.
+   - Enables clean cancellation under forced-command mode without dropping the SSH session.
+
 **Job request (stdin) MUST include:**
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
-- `effective_config` (object)
+- `config_inputs` (object) — exact copy of `effective_config.inputs`
+- `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, destination UDID)
 - `paths` (object: source/workdir/cache roots)
 
 **Backend Selection (Normative):**
@@ -100,7 +123,7 @@ The harness MUST support two verbs:
 Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so the remote account cannot execute arbitrary commands. The harness MUST support `rch-xcode-worker --forced`, which:
 
 - Reads the requested verb from `SSH_ORIGINAL_COMMAND`
-- Allows ONLY `probe` and `run` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
+- Allows ONLY `probe`, `run`, and optionally `cancel` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
 
 ---
@@ -122,8 +145,10 @@ timeout_seconds = 1800
 
 [profiles.ci.destination]
 platform = "iOS Simulator"
-name = "iPhone 16"
-os = "18.2"                            # pinned version; required for CI unless allow_floating_destination = true
+name = "iPhone 16"                     # friendly alias (used if device_type_id not specified)
+os = "18.2"                            # friendly alias (used if runtime_id not specified)
+device_type_id = "com.apple.CoreSimulator.SimDeviceType.iPhone-16"  # preferred when available
+runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-18-2"          # preferred when available
 
 [profiles.ci.xcode]
 path = "/Applications/Xcode.app"       # optional; uses worker default if omitted
@@ -229,14 +254,15 @@ This enables CI profiles to enforce a stronger trust posture than local developm
 ### Destination Resolution Algorithm
 
 1. Read `destination.platform`, `destination.name`, `destination.os` from effective config.
+   - If `destination.device_type_id` and/or `destination.runtime_id` are present, prefer them for matching (stable CoreSimulator identifiers).
 2. If `os` is `"latest"` and `allow_floating_destination` is false, reject with error.
-3. Query worker for available simulators matching platform + name + os.
-4. If exactly one match, use its UDID.
+3. Query worker for available simulators matching the destination spec.
+4. If exactly one match, use its UDID for execution, but record it only under `effective_config.resolved.destination_udid`.
 5. If zero matches, reject with error listing available runtimes.
 6. If multiple matches:
    - Default: reject with an error describing the duplicates and how to fix/disambiguate.
    - If `destination.on_multiple = "select"` is set, select using `destination.selector` (default selector: `"highest_udid"`), and emit a warning.
-7. Record resolved UDID, runtime version, and device type in `effective_config.json`.
+7. Record device/runtime identifiers in `effective_config.inputs` and record resolved UDID in `effective_config.resolved`.
 
 ### Destination Disambiguation (Config)
 
@@ -264,27 +290,53 @@ Under `[profiles.<name>.destination]`, the following fields MAY be used:
 Every job attempt MUST carry three identity fields:
 
 - **`job_id`** — A unique identifier for this specific execution attempt (UUID v7 recommended). Never reused across attempts.
-- **`run_id`** — A content-derived identifier: `SHA-256(canonical(effective_config) || source_tree_hash)`. Two jobs with identical config and source MUST produce the same `run_id`. This enables cache lookups and deduplication.
+- **`run_id`** — A content-derived identifier: `SHA-256( JCS(config_inputs) || "\n" || source_tree_hash_hex )`. Two jobs with identical config inputs and source MUST produce the same `run_id`. This enables cache lookups and deduplication.
 - **`attempt`** — A monotonically increasing integer (starting at 1) within a given `run_id`. If a job is retried with the same effective config and source, `run_id` stays the same but `attempt` increments.
 
 All three fields MUST appear in `summary.json`, `effective_config.json`, and `attestation.json`.
+
+### Effective Config Envelope (Normative)
+
+`effective_config.json` is an *envelope* that separates **hashable inputs** from **execution-time resolution**.
+
+```jsonc
+{
+  "kind": "effective_config",
+  "schema_version": "1.0.0",
+  "lane_version": "0.1.0",
+  "inputs": { /* hashable, content-derived */ },
+  "resolved": { /* execution-time details, NOT hashed */ }
+}
+```
+
+**`inputs` (hashed):** MUST include all logical build/test inputs that affect results and caching, such as:
+- action, workspace/project, scheme, configuration, timeout
+- destination *spec* (platform + device/runtime identifiers or pinned versions)
+- toolchain identity once pinned (Xcode build number, selected runtime identifier)
+- backend policy (preferred/fallback), safety policy, cache policy, env allowlist, redaction policy
+
+**`resolved` (not hashed):** MUST include execution-time details that are expected to vary between attempts/workers, such as:
+- selected worker name/identity (also captured in attestation)
+- filesystem paths (`paths.*`), temp dirs
+- simulator **UDID** (especially under `strategy = "per_job"`)
+- timestamps, queue position, lease bookkeeping
 
 ### Canonicalization + `run_id` (Normative)
 
 To make `run_id` stable across hosts/implementations, the lane MUST define canonicalization.
 
-**Canonical JSON:** The lane MUST canonicalize `effective_config.json` using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing.
+**Canonical JSON:** The lane MUST canonicalize **`effective_config.inputs`** using the JSON Canonicalization Scheme (RFC 8785 / "JCS") before hashing.
 
 **`run_id` bytes:** The lane MUST compute:
-`run_id = SHA-256( JCS(effective_config) || "\n" || source_tree_hash_hex )`
-where `JCS(effective_config)` is UTF-8 bytes and `source_tree_hash_hex` is the lowercase hex string (UTF-8).
+`run_id = SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )`
+where `JCS(effective_config.inputs)` is UTF-8 bytes and `source_tree_hash_hex` is the lowercase hex string (UTF-8).
 
-Rationale: simple, deterministic, and implementation-portable.
+Rationale: simple, deterministic, and implementation-portable. Separating inputs from resolved details ensures lane versioning and worker-local details (UDIDs, paths) do not affect run identity.
 
 ### `config_hash` (Recommended)
 
 For cache addressing and reporting, the lane SHOULD compute:
-`config_hash = SHA-256( JCS(effective_config) )` as lowercase hex.
+`config_hash = SHA-256( JCS(effective_config.inputs) )` as lowercase hex.
 
 This is distinct from `run_id` (which includes the source tree hash). The `config_hash` enables efficient cache sharing: jobs with identical configuration (toolchain, destination, scheme, build settings) but different source trees can share DerivedData caches.
 
@@ -433,6 +485,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `xcode_not_found` | Xcode not found at expected path on worker | No |
 | `xcode_version_mismatch` | Xcode version does not match constraint | No |
 | `backend_unavailable` | Preferred backend unavailable and fallback disallowed | No |
+| `protocol_version_unsupported` | No common protocol version between host and harness | No |
 | `runtime_not_found` | Requested simulator runtime not installed | No |
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
@@ -442,6 +495,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `canceled` | Job was canceled by user | No |
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
+| `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
 | `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
@@ -530,6 +584,22 @@ The `attestation.json` MUST include a `source` object capturing the state of the
 - **`untracked_included`** — Boolean: whether untracked files were included in the hash and sync.
 
 The source tree hash is a critical input to `run_id` computation (see Job Identity).
+
+#### Post-stage Source Integrity Check (Recommended; Normative when enabled)
+
+Profiles MAY enable a post-stage integrity check:
+
+```toml
+[profiles.ci.source]
+verify_after_stage = true
+```
+
+When `verify_after_stage = true`:
+- The worker harness MUST compute `observed_source_tree_hash` from the staged tree using the same Canonical Source Manifest rules.
+- If `observed_source_tree_hash` does not equal the host-provided `source_tree_hash`, the harness MUST fail the job with stable error code `source_hash_mismatch` (retryable: true).
+- `attestation.json` MUST record: `source.expected_tree_hash`, `source.observed_tree_hash`, and `source.verified` (true if check passed, false if skipped).
+
+This check catches rsync drift, disk corruption, and staging misconfiguration before the build begins.
 
 #### Canonical Source Manifest (Normative)
 
@@ -643,10 +713,16 @@ Each manifest entry MUST include:
 - `sha256` (string) — Lowercase hex SHA-256 hash.
 - `bytes` (integer) — Size in bytes.
 
+Each manifest entry SHOULD include:
+- `artifact_type` (string) — e.g. `"json"` | `"log"` | `"xcresult"` | `"provenance"` | `"other"`.
+- `content_type` (string) — e.g. `"application/json"`, `"text/plain"`, `"application/vnd.apple.xcresult"`.
+- `encoding` (string|null) — e.g. `"utf-8"` for text files.
+
 Each manifest entry MAY include:
 - `storage` (string) — `"host"` | `"worker"` | `"object_store"` (where the artifact is stored).
 - `uri` (string|null) — For remote storage, a stable URI for retrieval.
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
+- `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
 
 ### Artifact Storage & Compression (Normative)
 
@@ -781,6 +857,26 @@ Consumers MUST tolerate unknown event types (forward compatibility).
 ## Optional Artifacts
 
 The following artifacts are not required but SHOULD be emitted when the information is available.
+
+### `repro/` (Recommended)
+
+A small, standardized reproduction bundle intended to make failed runs easy to re-run.
+
+When emitted, the lane SHOULD include:
+- `repro/inputs.json` — Exact copy of `effective_config.inputs` (enables re-running with identical hashable inputs).
+- `repro/attestation_excerpt.json` — Minimal toolchain + destination identifiers needed to reason about reproducibility.
+- `repro/README.txt` — Short instructions (no secrets) describing how to re-run with `rch xcode plan`/`test`.
+- OPTIONAL: `repro/source.tar.zst` — Exact staged source snapshot (opt-in; may be disallowed in CI/object_store).
+
+Profiles MAY control this via:
+
+```toml
+[profiles.ci.repro]
+enabled = true
+include_source_bundle = false
+```
+
+The repro bundle is especially valuable for failed runs, enabling developers to immediately reproduce the failure with identical inputs.
 
 ### `junit.xml`
 
