@@ -30,8 +30,8 @@ Auto-detection:
 Environment variables:
     ORACLE_REMOTE_HOST          Tailscale IP:port (e.g. 100.122.100.99:9333)
     ORACLE_REMOTE_TOKEN         Oracle auth token
-    APR_ORACLE_MIN_STABLE_MS    Oracle stability timing (default: 45000)
-    APR_ORACLE_SETTLE_WINDOW_MS Oracle settle timing (default: 45000)
+    APR_ORACLE_MIN_STABLE_MS    Oracle stability timing (forwarded if set)
+    APR_ORACLE_SETTLE_WINDOW_MS Oracle settle timing (forwarded if set)
     APR_MAX_RETRIES             APR's own retry count (forwarded)
     APR_INITIAL_BACKOFF         APR's own backoff (forwarded)
     APR_AUTO_LOG_DIR            Log directory (default: .apr/auto-logs)
@@ -70,8 +70,6 @@ DEFAULT_CONVERGENCE_TARGET = 75  # percent
 DEFAULT_WORKFLOW = "default"
 DEFAULT_ORACLE_HOST = "100.122.100.99"
 DEFAULT_ORACLE_PORT = 9333
-DEFAULT_MIN_STABLE_MS = "45000"
-DEFAULT_SETTLE_WINDOW_MS = "45000"
 DEFAULT_COOLDOWN_SECONDS = 10
 ROUND_TIMEOUT_SECONDS = 3600  # 1 hour per round
 MAX_CONSECUTIVE_FAILURES = 3
@@ -668,8 +666,6 @@ def build_env(config: Config) -> Dict[str, str]:
         )
     if config.oracle_token:
         env["ORACLE_REMOTE_TOKEN"] = config.oracle_token
-    env.setdefault("APR_ORACLE_MIN_STABLE_MS", DEFAULT_MIN_STABLE_MS)
-    env.setdefault("APR_ORACLE_SETTLE_WINDOW_MS", DEFAULT_SETTLE_WINDOW_MS)
     env.setdefault("APR_CHECK_UPDATES", "0")
     env.setdefault("NO_COLOR", "1")
     return env
@@ -692,14 +688,18 @@ def run_apr_round(
     if config.workflow != DEFAULT_WORKFLOW:
         cmd.extend(["-w", config.workflow])
 
+    env = build_env(config)
     logger.debug(f"Running: {' '.join(cmd)}")
+    logger.debug(f"  env: ORACLE_REMOTE_HOST={env.get('ORACLE_REMOTE_HOST', '<unset>')}")
+    logger.debug(f"  env: APR_ORACLE_MIN_STABLE_MS={env.get('APR_ORACLE_MIN_STABLE_MS', '<unset>')}")
+    logger.debug(f"  env: APR_ORACLE_SETTLE_WINDOW_MS={env.get('APR_ORACLE_SETTLE_WINDOW_MS', '<unset>')}")
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            env=build_env(config),
+            env=env,
             timeout=ROUND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -1041,7 +1041,6 @@ class Orchestrator:
         self._shutting_down = False
         self._output_sizes: List[int] = []
         self._truncation_attempts: Dict[int, int] = {}
-        self._workflow_name: Optional[str] = None
         self._rounds_dir: Optional[Path] = None
 
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -1139,6 +1138,8 @@ class Orchestrator:
         config = self.config
         logger = self.logger
 
+        config.workflow = resolve_workflow_name(config.workflow)
+
         logger.info("")
         logger.info("=" * 55)
         logger.info("  APR Auto-Orchestrator")
@@ -1171,9 +1172,7 @@ class Orchestrator:
             notify("APR auto: pre-flight failed", config, logger)
             sys.exit(1)
 
-        workflow_name = resolve_workflow_name(config.workflow)
-        rounds_dir_path = resolve_rounds_dir(workflow_name)
-        self._workflow_name = workflow_name
+        rounds_dir_path = resolve_rounds_dir(config.workflow)
         self._rounds_dir = rounds_dir_path
         logger.info(f"  📁 Rounds dir: {rounds_dir_path}")
 
@@ -1258,7 +1257,7 @@ class Orchestrator:
 
             # --- Verify output ---
             rf = locate_round_file(
-                rounds_dir_path, round_num, workflow_name, logger
+                rounds_dir_path, round_num, config.workflow, logger
             )
             chars, line_count = 0, 0
             truncated = False
@@ -1269,7 +1268,7 @@ class Orchestrator:
                 line_count = content.count("\n")
             truncated = check_output_truncation(
                 rounds_dir_path, round_num,
-                workflow_name, self._output_sizes, logger,
+                config.workflow, self._output_sizes, logger,
             )
             if chars > 0 and not truncated:
                 self._output_sizes.append(chars)
@@ -1312,7 +1311,7 @@ class Orchestrator:
                     line_count = recovered.count("\n")
                     still_truncated = check_output_truncation(
                         rounds_dir_path, round_num,
-                        workflow_name, self._output_sizes, logger,
+                        config.workflow, self._output_sizes, logger,
                     )
                     if not still_truncated:
                         logger.info(
@@ -1377,7 +1376,7 @@ class Orchestrator:
             conv_info = ""
             conv_pct = None
             if backfill_ok:
-                conv_pct = read_stability_score(workflow_name, config, logger)
+                conv_pct = read_stability_score(config.workflow, config, logger)
                 if conv_pct is not None:
                     conv_info = f"{conv_pct:.1f}%"
                     logger.info(f"  📊 Stability score: {conv_info}")
