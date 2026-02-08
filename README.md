@@ -10,7 +10,7 @@
 It extends **Remote Compilation Helper (RCH)** to route safe, allowlisted Xcode build/test commands
 to a remote **macOS worker** (e.g., a Mac mini) via a **stable worker harness**: `rch-xcode-worker`.
 
-The host **never shells out to `xcodebuild` directly**. It speaks one protocol (`probe` / `run`) and always receives structured NDJSON events. The harness may use **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` backend *internally*.
+The host **never shells out to `xcodebuild` directly**. It speaks one protocol (`probe` / `run` / `status` / `cancel` / …) and always receives structured NDJSON events. The harness may use **XcodeBuildMCP** (preferred) or a fallback `xcodebuild` backend *internally*.
 
 ## Why
 
@@ -37,6 +37,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
      directory so the backend never sees a partially-staged tree.
 3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
    - Production setups SHOULD use the harness in **forced-command mode** so SSH cannot run arbitrary commands.
+   - In `--forced` deployments, `status` and `cancel` are treated as part of the core contract (needed for resume + cancellation without arbitrary SSH).
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
 5. **Attest** toolchain + environment; emit machine-readable outputs for CI/agents.
 
@@ -78,7 +79,7 @@ Recommended:
 
 See `PLAN.md` § Safety Rules for the full threat model.
 
-Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untrusted posture" (`trust.posture = "untrusted"`) so the lane automatically disables signing, isolates caches from trusted contexts, tightens simulator hygiene, and requires log redaction for remote artifact storage.
+Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untrusted posture" (`trust.posture = "untrusted"`) so the lane automatically disables signing, isolates caches from trusted contexts, tightens simulator hygiene, and requires log redaction for remote artifact storage (redaction is applied inline on the worker so secrets don't traverse the control-plane stream).
 
 **Determinism note:** If you forward environment variables, their *values* can change build outputs. CI profiles SHOULD enable `env.strict = true` and (optionally) `env.include_value_fingerprints = true` so `run_id` reflects the forwarded env inputs without recording raw values.
 
@@ -113,7 +114,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode fetch <job_id>` | Pull remote artifacts (worker/object store), verify hashes, materialize locally |
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity |
 | `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
-| `rch xcode status <job_id>` | Query best-effort remote status (queued/running/terminal) + latest sequence (supports resume) |
+| `rch xcode status <job_id>` | Query best-effort remote status (queued/running/terminal) + latest sequence (+ terminal error_code when available; supports resume) |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain worker selection + pinning + refusal reasons (human + `--json`) |
 | `rch xcode retry <job_id>` | Retry a failed job (increments attempt; keeps run_id if inputs/source unchanged) |

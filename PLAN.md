@@ -79,6 +79,19 @@ The lane MUST use the `rch-xcode-worker` harness for remote execution. This is a
 
 **Protocol (Verbs + Versioning):**
 
+The harness exposes a small set of verbs. Implementations MUST be explicit about what is supported via `probe.verbs`.
+
+**Verb requirement matrix (Normative):**
+
+| Verb | Always required | Required when `rch-xcode-worker --forced` is used |
+|------|------------------|---------------------------------------------------|
+| `probe` | ✅ | ✅ |
+| `run` | ✅ | ✅ |
+| `cancel` | Optional | ✅ |
+| `status` | Optional | ✅ |
+| `cache_query` | Optional | Optional |
+| `prewarm` | Optional | Optional |
+
 The harness MUST support two verbs:
 
 1) `rch-xcode-worker probe`
@@ -100,11 +113,12 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
   - `signing_sha256` (string|null) — Optional digest of the signing blob/requirement.
   - `requirement_sha256` (string|null) — SHA-256 of the designated requirement string (or equivalent stable form). Provides a stronger identity pin than `team_id` alone.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
-- `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel"]` (and optionally `"cache_query"`).
+- `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel","status"]` (and optionally `"cache_query"`, `"prewarm"`).
 - `features` (object) — Feature flags/capabilities beyond versions, e.g.:
   - `event_hash_chain` (boolean) — Whether hash-chained events are supported when enabled in config.
   - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
   - `cache_namespace` (boolean) — Whether the harness supports explicit cache namespaces supplied by the host.
+  - `inline_redaction` (boolean) — Whether the harness can apply configured redaction inline to stdout/stderr and durable artifacts (`events.ndjson`, `build.log`) before integrity hashing.
 - `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load` and `health`). Enables capability drift detection.
 
 **`capabilities_sha256` computation (Normative):**
@@ -160,8 +174,15 @@ The harness SHOULD support a third verb:
 3) `rch-xcode-worker cancel`
    - Reads a single JSON object from stdin containing at minimum `job_id` (and SHOULD include `lease_id` if known).
    - Terminates the active backend process group for that job (SIGTERM, then SIGKILL after 10s).
-   - Emits a single JSON object to stdout describing whether a process was found and terminated.
+   - Emits a single self-describing JSON object to stdout describing whether a process was found and terminated.
+   - **Idempotency (Normative):** If the job is already terminal (or no backend process is found), `cancel` MUST still exit 0 and report
+     `{ "ok": true, "already_terminal": true }` (or `{ "ok": true, "found": false }`) rather than failing.
    - **REQUIRED for deployments using `rch-xcode-worker --forced`** so the host can cancel without arbitrary remote commands.
+
+**Cancel/status bookkeeping (Normative):**
+- During `run`, the harness MUST write a small, non-secret control record under the per-job workspace (e.g., `jobs_root/<job_id>/control.json`)
+  containing at minimum `{ job_id, lease_id, backend_pid, backend_pgid, started_at }`. This enables `cancel` and `status` to operate
+  without scanning process tables or relying on transport state.
 
 The harness MAY support an optional fourth verb:
 
@@ -196,7 +217,7 @@ The harness MAY support an optional fifth verb:
 
 The harness SHOULD support a sixth verb:
 
-6) `rch-xcode-worker status` (Optional; **REQUIRED for deployments using `rch-xcode-worker --forced`**)
+6) `rch-xcode-worker status` (Normative when `--forced` is used; optional otherwise)
    - Reads a single JSON object from stdin containing at minimum `job_id`.
    - Emits a single JSON object describing best-effort job state (`queued`, `running`, `terminal`, `unknown`),
      and the latest observed `events.sequence` written to disk (when available).
@@ -217,12 +238,18 @@ The status verb MUST emit a single self-describing JSON object:
 - `build_log_bytes` (integer|null) — best-effort current byte size of `build.log` (for resume tooling)
 - `lease_id` (string|null)
 - `hints` (array of strings) — human-safe hints (MUST NOT contain secrets)
+- `terminal` (object|null) — Present only when `state="terminal"`:
+  - `state` (string) — `succeeded` | `failed` | `canceled` | `timed_out`
+  - `exit_code` (integer|null)
+  - `error_code` (string|null)
+  - `errors` (array) — array of Error Objects (MAY be truncated; MUST remain JSON-valid)
 
 **Job request (stdin) MUST be a self-describing, versioned object and MUST include:**
 - `kind` (string) — MUST be `"job_request"`.
 - `schema_version` (SemVer string) — Schema version for the job request payload (e.g., `"1.0.0"`).
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
+- `source_tree_hash` (string) — Lowercase hex hash of the staged source snapshot (`source_manifest.entries` hash). Used for staging verification and (optionally) for recomputing/validating `run_id`.
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, resolved destination IDs).
   The destination UDID MAY be omitted; when omitted, the harness MUST resolve/select/create an appropriate simulator device
@@ -290,9 +317,13 @@ For a given `job_id`, the host MUST stage into:
 - `stage_root/<job_id>/src.tmp/` (upload target)
 - then atomically rename to `stage_root/<job_id>/src/`
 
-After the rename, the host MUST write:
+After the rename, the host MUST write (atomically):
 - `stage_root/<job_id>/stage_receipt.json` (self-describing JSON; schema below)
 - `stage_root/<job_id>/STAGE_READY` (empty sentinel file)
+
+**Atomic write rule (Normative):**
+- The host MUST write `stage_receipt.json` via `stage_receipt.json.tmp` + atomic rename.
+- The host MUST create `STAGE_READY` via `STAGE_READY.tmp` + atomic rename (empty file).
 
 The harness MUST treat staging as complete **only** when `STAGE_READY` exists.
 
@@ -310,6 +341,8 @@ The stage receipt MUST be a self-describing JSON object:
   "method": "rsync|git_snapshot",
   "source_tree_hash": "…",
   "excludes": ["…"],
+  "files_total": 789,
+  "bytes_total": 987654321,
   "bytes_sent": 123,
   "files_changed": 456,
   "created_at": "2026-02-08T00:00:00Z"
@@ -320,7 +353,8 @@ The stage receipt MUST be a self-describing JSON object:
 
 Before backend execution, the harness MUST:
 1. Refuse with stable error code `source_staging_incomplete` if `STAGE_READY` or `stage_receipt.json` is missing.
-2. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
+2. Refuse with stable error code `stage_receipt_mismatch` if `stage_receipt.json.job_id/run_id/attempt` or `stage_receipt.json.source_tree_hash` do not match the job request (`job_id/run_id/attempt/source_tree_hash`).
+3. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
 3. Populate the job `src/` by atomically swapping a fully materialized tree:
    - Recommended: stage to `jobs_root/<job_id>/src.tmp/` then rename to `src/`
 4. Apply the existing **read-only source** rule to the final `src/`.
@@ -339,7 +373,7 @@ The harness MUST:
 1. Compare `job_request.required_features[]` against `probe.features`
 2. Refuse before execution with stable error code `required_feature_unsupported` on any missing feature
 
-This prevents "silent downgrade" when new safety knobs are introduced. Without this, an older harness might silently ignore a new enforcement field (e.g., `sandbox.network = deny_all`), causing the job to run unsafely.
+This prevents "silent downgrade" when new safety knobs are introduced. Without this, an older harness might silently ignore a new enforcement field (e.g., `sandbox.network = deny_all` or `redaction.enabled = true` requiring `features.inline_redaction`), causing the job to run unsafely or leak secrets.
 
 ---
 
@@ -581,6 +615,12 @@ When `limits.*` are configured, the harness/host MUST enforce them deterministic
 - When exceeded, `build.log` MUST be truncated with an explicit marker and `redaction_report.json` MUST record `log_truncated=true`.
 - The job MAY still succeed; `summary.json.errors[]` SHOULD include a non-fatal error object with code `log_truncated`.
 
+**`source.max_bytes` / `source.max_file_bytes`:**
+- The host MUST compute source snapshot size from `source_manifest.entries` (sum of `bytes`, and max per-entry `bytes`) before staging begins.
+- If exceeded, the lane MUST refuse with `error_code="source_quota_exceeded"` and include `detail` at least:
+  `{ "limit_bytes": <int>, "observed_bytes": <int>, "largest_file_bytes": <int>, "largest_file_path": "<path>" }`.
+- The harness MUST re-check the staged tree before backend execution (best-effort) and fail with the same error code if exceeded.
+
 ### Host Config: `~/.config/rch/workers.toml`
 
 ```toml
@@ -813,6 +853,7 @@ Before applying JCS, the lane MUST normalize "set-like" arrays in `effective_con
 - `env.allow`
 - `retry.retry_on`
 - `source.excludes`
+- `redaction.patterns`
 
 If the meaning of this normalization changes (fields added/removed, sort order changed), `contract_version` MUST be bumped.
 
@@ -954,7 +995,12 @@ When `redaction.enabled = true`, the lane SHOULD redact known secret patterns fr
 - `events.ndjson`
 - any derived text reports emitted by the lane (e.g., `junit.xml`, `sarif.json`, `annotations.json`) when those reports may embed raw messages
 
-Redaction MUST be applied before any hashing or upload operations.
+**Ordering (Normative):**
+- Redaction MUST be applied **before** any integrity digests are computed (event hash chain, `events_sha256`) and before any manifest hashes are computed for storage/upload.
+- To preserve end-to-end integrity validation, the harness MUST apply redaction **inline** (before emitting bytes to stdout/stderr and before writing durable `events.ndjson` / `build.log`).
+- When `redaction.enabled = true`, the host MUST include `"inline_redaction"` in `job_request.required_features`.
+- The host MUST treat `events.ndjson` and `build.log` as immutable bytes once collected. If additional post-processing is required for export,
+  implementations MUST write new artifacts (e.g., `events.redacted.ndjson`) and record them separately in `manifest.json`.
 
 **Redaction reporting (Recommended):**
 
@@ -973,8 +1019,8 @@ This enables auditing that redaction policy was applied without exposing what wa
 Artifacts MAY contain sensitive information (logs, crash dumps, test output, event messages).
 When `store = "object_store"` (or any non-host persistence), the lane MUST:
 
-- Apply configured redaction to `build.log` prior to upload
-- Apply configured redaction to `events.ndjson` prior to upload
+- Ensure configured redaction is applied **inline on the worker** (requires `probe.features.inline_redaction = true` and MUST be listed in `job_request.required_features`)
+  so secrets are not transmitted over the control-plane stream.
 - Apply configured redaction to derived text reports (e.g., `junit.xml`, `sarif.json`, `annotations.json`) prior to upload
 - Avoid uploading `environment.json` values (only identifiers/redacted fields)
 - Never upload credentials; object store auth MUST remain on the host only
@@ -1099,6 +1145,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `event_line_too_long` | A single event exceeded configured per-line cap | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
 | `source_staging_incomplete` | Stage receipt/sentinel missing; staging not complete | Yes |
+| `stage_receipt_mismatch` | Stage receipt identity/hash does not match the job request | Yes |
 | `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
 | `source_tree_modified` | Source tree was modified during execution | No |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
@@ -1109,6 +1156,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
+| `source_quota_exceeded` | Source snapshot exceeded configured `source.max_*` limits | No |
 | `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
 | `object_store_encryption_required` | Remote storage requires explicit encryption policy (untrusted posture disallows none) | No |
 | `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
@@ -1149,6 +1197,7 @@ When posture is `untrusted`, the lane MUST enforce (regardless of profile defaul
 - If `action = "test"`, the lane MUST set (or require) `simulator.strategy = "per_job"` unless explicitly overridden for local use.
 - If `action = "test"`, the lane MUST set (or require) `simulator.device_set = "per_job"` to isolate CoreSimulator device database state.
 - If artifacts may leave the host (`store = "worker"` or `"object_store"`), the lane MUST enable log redaction (`redaction.enabled = true`) or refuse with a stable error code `untrusted_remote_storage_requires_redaction`.
+  When enabled, the host MUST require `features.inline_redaction` from the harness to avoid leaking secrets over the run stream.
 
 #### Untrusted Cache Read Opt-in (Normative)
 
@@ -1322,6 +1371,8 @@ Source snapshot behavior is configured under `[profiles.<name>.source]`:
 - **`metadata`** — `"strip"` | `"preserve"`. Default: `"strip"`.
   - `strip`: Staging MUST NOT preserve xattrs or ACLs. This improves reproducibility by eliminating macOS-specific metadata that can affect execution (quarantine flags, permissions) and cause drift between workers.
   - `preserve`: Preserve xattrs and ACLs during staging (use with caution; may reduce reproducibility).
+- **`max_bytes`** — integer|null. When set, the lane MUST refuse (before staging) if the computed source snapshot size exceeds this limit.
+- **`max_file_bytes`** — integer|null. When set, the lane MUST refuse if any single file in the source snapshot exceeds this limit.
 
 ### Provenance (Optional, Strongly Recommended)
 
@@ -1412,6 +1463,7 @@ Each manifest entry MAY include:
 - `etag` (string|null) — Best-effort remote integrity hint (when provided by storage backend).
 - `encryption` (string|null) — `"server_side"` | `"client_side"` | `"none"` (best-effort, when applicable).
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
+- `compression_level` (integer|null) — Optional: numeric level used when `compression != "none"` (recording improves reproducibility + CAS effectiveness).
 - `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
 - `sensitivity` (string|null) — `"public"` | `"internal"` | `"sensitive"`. Recommended for policy-aware retention/upload decisions. Enables CI to decide what to upload/retain based on sensitivity classification.
 
@@ -1433,7 +1485,20 @@ Implementations SHOULD also emit an optional tree manifest:
 
 **Remote storage + xcresult (Normative):**
 
-If `store != "host"`, profiles SHOULD set `xcresult_format = "tar.zst"`. If `xcresult_format = "directory"` and `store != "host"`, the lane MUST either (a) pack the directory deterministically prior to upload/fetch, or (b) refuse with a stable error code `directory_artifact_remote_disallowed`.
+If `store != "host"`, profiles SHOULD set `xcresult_format = "tar.zst"`.
+If `xcresult_format = "directory"` and `store != "host"`, the lane MUST refuse with a stable error code `directory_artifact_remote_disallowed`
+unless it implements **deterministic packing** (see below).
+
+**Deterministic packing (Normative when used):**
+- The lane MUST pack directory artifacts (including `result.xcresult/`) into a byte-stable archive such that identical directory content produces identical archive bytes.
+- The packing algorithm MUST:
+  - Sort entries lexicographically by UTF-8 byte order of their relative paths
+  - Normalize paths to POSIX `/` separators
+  - Set uid/gid to 0 and omit uname/gname
+  - Set all mtimes to a constant (e.g., Unix epoch `0`)
+  - Strip xattrs/ACLs and omit OS-specific metadata
+- When compression is applied (e.g., `.tar.zst`), the compressor settings MUST be deterministic and MUST be recorded in `manifest.json`
+  (`compression` plus an optional `compression_level` field).
 
 ### Artifact Storage & Compression (Normative)
 
@@ -1613,6 +1678,11 @@ This enables streaming consumers to verify event integrity incrementally without
 
 - The harness SHOULD emit `{"type":"heartbeat",...}` at least every 10 seconds while running.
 
+**Error model reuse (Normative):**
+- Events with `type = "error"` MUST include an `error` object that conforms to the lane Error Object schema (`code`, `message`, `retryable`, `hint`, `detail`).
+- Events with `type = "warning"` SHOULD include a `warning` object with the same shape (retryable is typically `false`).
+- This enables streaming consumers to react to stable codes without waiting for the terminal `complete` event.
+
 **Standard event types:**
 
 | Type | Emitted when |
@@ -1627,10 +1697,10 @@ This enables streaming consumers to verify event integrity incrementally without
 | `test_case_passed` | A single test case passes |
 | `test_case_failed` | A single test case fails (includes failure message) |
 | `test_suite_completed` | A test suite finishes (includes pass/fail counts) |
-| `warning` | Non-fatal issue detected |
+| `warning` | Non-fatal issue detected (SHOULD include Error Object) |
 | `diagnostic` | Structured diagnostic (file/line/message) suitable for agent consumption |
 | `artifact_ready` | A named artifact became available (e.g., build.log, result bundle) |
-| `error` | Fatal error during execution |
+| `error` | Fatal error during execution (MUST include Error Object) |
 | `heartbeat` | Periodic liveness signal (at least every 10s) |
 | `complete` | Final event; includes terminal state + error model + `exit_code` |
 
@@ -1860,11 +1930,13 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - All files listed in `manifest.json` exist and have matching SHA-256 hashes.
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
 - `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
+- `stage_receipt.json` parses successfully and its `job_id/run_id/attempt/source_tree_hash` match `job_request.json`.
 - `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
 - If `job_request_sha256` is present in `hello`/`complete` events, recompute and verify it matches `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`.
 - `probe.json` parses successfully and includes required fields (`kind`, `schema_version`, `protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
+- Verify `job_request.json.source_tree_hash` equals the recomputed `source_tree_hash` (and equals `stage_receipt.json.source_tree_hash`).
 - Recompute `run_id` as `SHA-256( "rch-xcode-lane/run_id/v1\n" || JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
