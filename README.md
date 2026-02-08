@@ -73,7 +73,9 @@ Recommended:
 
 See `PLAN.md` § Safety Rules for the full threat model.
 
-Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untrusted posture" (`trust.posture = "untrusted"`) so the lane automatically disables signing, forces read-only caches, tightens simulator hygiene, and requires log redaction for remote artifact storage.
+Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untrusted posture" (`trust.posture = "untrusted"`) so the lane automatically disables signing, isolates caches from trusted contexts, tightens simulator hygiene, and requires log redaction for remote artifact storage.
+
+**Determinism note:** If you forward environment variables, their *values* can change build outputs. CI profiles SHOULD enable `env.strict = true` and (optionally) `env.include_value_fingerprints = true` so `run_id` reflects the forwarded env inputs without recording raw values.
 
 ## Requirements
 

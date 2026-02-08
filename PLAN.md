@@ -206,6 +206,8 @@ The status verb MUST emit a single self-describing JSON object:
 - `state` (string) — `queued` | `running` | `terminal` | `unknown`
 - `updated_at` (ISO 8601 string|null)
 - `latest_sequence` (integer|null) — last sequence written to durable `events.ndjson` (best-effort)
+- `events_bytes` (integer|null) — best-effort current byte size of `events.ndjson` (for resume tooling)
+- `build_log_bytes` (integer|null) — best-effort current byte size of `build.log` (for resume tooling)
 - `lease_id` (string|null)
 - `hints` (array of strings) — human-safe hints (MUST NOT contain secrets)
 
@@ -235,6 +237,11 @@ The status verb MUST emit a single self-describing JSON object:
   On validation failure: fail with stable error code `invalid_job_identity`.
 - The harness MUST reject any request whose effective paths would escape the configured roots (after resolving `..` and symlinks) with stable error code `path_out_of_bounds`.
 - The harness MUST treat `paths` from the host as *hints only* (or ignore entirely) when `--forced` is active.
+
+**Job ID single-use (Normative):**
+- The harness MUST treat `job_id` as single-use.
+- If the derived job workspace root already exists and appears to contain a prior run (e.g., has a terminal `complete` event in `events.ndjson` or a non-empty artifact directory), the harness MUST refuse with stable error code `job_id_reused`.
+- The harness MUST NOT overwrite or "recycle" an existing job workspace.
 
 **Backend Selection (Normative):**
 - `effective_config.backend.preferred` MAY be `"xcodebuildmcp"` or `"xcodebuild"`.
@@ -404,7 +411,9 @@ preferred = "xcodebuildmcp"            # "xcodebuildmcp" | "xcodebuild"
 allow_fallback = true                  # allow fallback to xcodebuild if preferred unavailable
 
 [profiles.ci.env]
-allow = ["CI", "RCH_*"]                # env vars forwarded to worker (default: none)
+allow = ["CI", "RCH_BUILD_MODE"]       # explicit names recommended for CI
+strict = true                          # forbid globs/prefix patterns (CI SHOULD enable)
+include_value_fingerprints = true      # include hashed fingerprints of forwarded env values in inputs
 
 [profiles.ci.safety]
 allow_mutating = false                 # disallow implicit clean/archive
@@ -475,6 +484,7 @@ ssh_fetch_key = "~/.ssh/rch_fetch_ed25519"   # used only for fetching artifacts 
 ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
 expected_harness_binary_sha256 = "0123...abcd"       # optional pin for supply-chain integrity
 expected_codesign_team_id = "ABCDE12345"             # optional pin when codesign is used
+probe_cache_ttl_seconds = 30                         # optional; host may reuse probe results for this TTL
 
 # Worker roots (used to compute per-job workspaces deterministically)
 stage_root = "~/Library/Caches/rch-xcode-lane/stage"
@@ -500,11 +510,19 @@ Profiles MAY define `[profiles.<name>.trust]` to require host key pinning:
 [profiles.ci.trust]
 require_pinned_host_key = true
 posture = "auto"   # "auto" | "trusted" | "untrusted"
+require_stable_capabilities_sha256 = true   # CI may require no capability drift between selection and run
 ```
 
 When `require_pinned_host_key = true`, the lane MUST refuse to run unless the selected worker has `ssh_host_key_fingerprint` configured in `workers.toml`. Refusal MUST use error code `unpinned_worker_disallowed` and include a hint describing how to pin the worker.
 
 This enables CI profiles to enforce a stronger trust posture than local development profiles.
+
+#### Capability Freeze (Normative when enabled)
+
+When `trust.require_stable_capabilities_sha256 = true`:
+- The host MUST record the selected worker's `capabilities_sha256` at selection time in `decision.json`.
+- Immediately before invoking `run`, the host MUST re-probe the selected worker (ignoring probe cache) and compare `capabilities_sha256`.
+- If it differs, the lane MUST refuse with stable error code `capabilities_drift` and include details `{ "expected": "...", "observed": "..." }`.
 
 ### Optional Integrity Controls (Recommended for CI / remote storage)
 
@@ -759,6 +777,28 @@ The lane MUST NOT pass through arbitrary user-provided `xcodebuild` flags or pat
 
 Rationale: prevents flag-based policy bypass and keeps runs deterministic/auditable.
 
+### Environment Forwarding (Normative)
+
+Profiles MAY forward specific environment variables to the worker. Because env values can affect build outputs, the lane provides deterministic controls that avoid recording raw values.
+
+```toml
+[profiles.ci.env]
+allow = ["CI", "RCH_BUILD_MODE"]          # explicit names recommended for CI
+strict = true                             # forbid globs/prefix patterns (CI SHOULD enable)
+include_value_fingerprints = true         # include hashed fingerprints of forwarded env values in inputs
+```
+
+**Rules (Normative):**
+- If `env.strict = true`, `env.allow` entries MUST be exact variable names (no `*` globs, no prefix patterns). If violated, refuse with `env_globs_disallowed`.
+- The host MUST NOT forward any env vars by default.
+- If `env.allow` is present, the host MUST forward **only** vars matching `env.allow` (and MUST NOT forward "ambient" vars).
+- If `env.include_value_fingerprints = true`, the host MUST include in `effective_config.inputs` an `env.forwarded` map containing, for each forwarded env var name:
+  - `present` (boolean)
+  - `value_sha256` (string|null) — lowercase hex SHA-256 of:
+    `SHA-256( "rch-xcode-lane/env_value_sha256/v1\n" || <NAME> || "\n" || <VALUE_BYTES> )`
+    where `<VALUE_BYTES>` are the exact UTF-8 bytes of the env value (empty string allowed).
+- `environment.json` MUST continue to omit env values (names only); fingerprints live only in `effective_config.inputs`.
+
 ### Secrets & Environment (Normative)
 
 To prevent accidental secret leakage in build logs and environment artifacts:
@@ -769,6 +809,8 @@ To prevent accidental secret leakage in build logs and environment artifacts:
 ```toml
 [profiles.ci.env]
 allow = ["CI", "RCH_*"]     # Values forwarded if present (literal names or prefix globs)
+strict = false              # When true: forbid globs/prefix (recommended for CI determinism)
+include_value_fingerprints = false  # When true: hash forwarded env values into effective_config.inputs
 ```
 
 - `environment.json` MUST be sanitized:
@@ -830,6 +872,7 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
   - `name` (string) — Classifier identifier
   - `version` (string) — Classifier version
   - `policy_sha256` (string) — Digest of the active allowlist/policy bundle
+  - `policy_artifact` (string) — Relative path to the captured policy bundle artifact (see `policy.json`)
   - `confidence` (number) — Classification confidence (0..1)
 - `profile_used` — The profile name selected.
 - `intercepted` — Boolean: whether the command was intercepted and routed to a worker.
@@ -845,6 +888,32 @@ Every job MUST emit a `decision.json` file in the artifact directory, recording 
 - `name` — Worker name.
 - `eligible` — Boolean: whether the worker was eligible.
 - `reasons` — Array of stable codes explaining rejection (e.g., `xcode_version_mismatch`, `runtime_not_found`, `lease_unavailable`).
+
+### Policy Bundle Artifact (Normative)
+
+Every job MUST also emit a captured policy bundle artifact so audits do not depend on a hash alone.
+
+**Artifact:** `policy.json` (required)
+
+**Required fields:**
+```jsonc
+{
+  "kind": "policy",
+  "schema_version": "1.0.0",
+  "lane_version": "0.1.0",
+  "policy": {
+    "name": "string",
+    "version": "string",
+    "sha256": "lowercase hex",
+    "rules": { /* canonical, serialized allowlist/policy representation */ }
+  }
+}
+```
+
+**Rules (Normative):**
+- `policy.policy.sha256` MUST equal `decision.json.classifier.policy_sha256`.
+- `decision.json.classifier.policy_artifact` MUST equal `"policy.json"`.
+- The policy artifact MUST NOT contain secrets.
 
 ---
 
@@ -878,6 +947,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `core_ids_required` | Profile requires CoreSimulator IDs but they are missing | No |
 | `ssh_host_key_mismatch` | Worker SSH host key does not match pinned fingerprint | No |
 | `harness_identity_mismatch` | Harness binary hash or codesign identity does not match expected pins | No |
+| `capabilities_drift` | Worker capabilities_sha256 changed between selection and run | No |
 | `insufficient_disk_space` | Worker did not meet `min_disk_free_bytes` threshold | Yes |
 | `worker_degraded` | Worker reported degraded execution state | Yes |
 | `unpinned_worker_disallowed` | Profile requires pinned host key but worker has none | No |
@@ -893,6 +963,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
 | `floating_destination_disallowed` | Floating destination (os="latest") refused by policy | No |
+| `env_globs_disallowed` | env.strict=true forbids glob/prefix patterns in env.allow | No |
 | `dirty_working_tree` | Working tree has uncommitted changes and require_clean=true | No |
 | `timeout` | Job exceeded configured timeout_seconds | No |
 | `canceled` | Job was canceled by user | No |
@@ -908,6 +979,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `forbidden_ssh_command` | SSH command rejected by harness in forced mode | No |
 | `path_out_of_bounds` | Requested/derived path escaped configured roots | No |
 | `invalid_job_identity` | job_id/run_id/attempt failed validation | No |
+| `job_id_reused` | job_id workspace already exists; job_id is single-use | No |
 | `workspace_quota_exceeded` | Worker workspace exceeded configured cap | No |
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
@@ -945,6 +1017,8 @@ When posture is `untrusted`, the lane MUST enforce (regardless of profile defaul
 - `code_signing_allowed = false`
 - `allow_mutating = false`
 - `cache.mode = "read_only"` (or `"off"` if profile sets caches off)
+- `cache.trust_domain = "per_repo_and_posture"` unless the profile explicitly sets `allow_cross_posture_reads = true`
+- If `allow_cross_posture_reads = false`, the worker MUST NOT read cache entries produced under a different posture partition.
 - `source.symlinks = "forbid"` unless the operator explicitly opts out for a known-safe repository
 - If `action = "test"`, the lane MUST set (or require) `simulator.strategy = "per_job"` unless explicitly overridden for local use.
 - If artifacts may leave the host (`store = "worker"` or `"object_store"`), the lane MUST enable log redaction (`redaction.enabled = true`) or refuse with a stable error code `untrusted_remote_storage_requires_redaction`.
@@ -1077,6 +1151,14 @@ Where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and the result is low
 - Binary files are hashed as-is (no newline normalization).
 - Default excludes: `.git/`, `.rch/`, `*.xcresult/`, `DerivedData/`. Additional excludes via `[profiles.<name>.source].excludes`.
 
+**VCS mode mode-bit source (Normative):**
+
+When `source.mode = "vcs"` and the repository is a Git working copy, the lane MUST derive `entries[].mode` from VCS metadata (Git index) rather than filesystem permissions:
+- Use Git's tracked file mode (e.g., `100644` vs `100755`) as the canonical `mode`.
+- If VCS metadata is unavailable (non-git repo), fallback to filesystem mode is permitted.
+
+Rationale: prevents umask/checkout drift from perturbing `source_tree_hash` and `run_id`.
+
 #### Excludes + Submodules
 
 Under `[profiles.<name>.source]`, the following fields MAY be used:
@@ -1139,6 +1221,7 @@ Artifacts are written under a per-job directory on the host, scoped by `repo_key
 ├── source_manifest.json   # Canonical file list + per-entry hashes used to compute source_tree_hash
 ├── manifest.json          # Artifact index + SHA-256 hashes + byte sizes
 ├── decision.json          # Classification + routing decision record
+├── policy.json            # Captured allowlist/policy bundle (required)
 ├── environment.json       # Captured worker environment snapshot
 ├── timing.json            # Durations for stage/run/collect phases
 ├── staging.json           # Staging report (method, excludes, bytes/files, duration, tool versions)
@@ -1525,7 +1608,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity (+ provenance if enabled) |
-| `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
+| `rch xcode watch <job_id>` | Stream events + follow logs for a running job (supports resume) |
 | `rch xcode status <job_id>` | Query best-effort remote status (queued/running/terminal) + latest sequence (supports resume) |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain selection/verification/refusal decisions (human + `--json`) |
@@ -1547,6 +1630,16 @@ JSON outputs MUST use a standard envelope with:
 - `errors` (array) — Array of error objects from the Error Model
 
 This enables agent/CI integration without log scraping and provides consistent error handling across all commands.
+
+### `watch` Resume Semantics (Normative)
+
+`rch xcode watch` MUST be resilient to transport drops:
+- While attached to a live `run` session, it SHOULD stream events directly from stdout and logs from stderr.
+- If the session is interrupted, it MUST:
+  1) Poll `rch-xcode-worker status` to determine whether the job is still running/queued/terminal, and
+  2) Resume display by reading durable artifacts (`events.ndjson`, `build.log`) via the configured fetch mechanism.
+- Event display MUST be deduplicated by `(job_id, sequence)` and MUST NOT re-emit an event with a sequence number <= the last displayed sequence.
+- If `latest_sequence` regresses or gaps are detected, `watch` MUST emit a warning indicating possible corruption or partial file state.
 
 ### `explain` Output (Normative when `--json`)
 
@@ -1694,18 +1787,21 @@ To reduce cross-run contamination and cache poisoning, profiles MAY define cache
 [profiles.ci.cache]
 derived_data = true
 spm = true
-trust_domain = "per_profile"           # "shared" | "per_repo" | "per_profile"
+trust_domain = "per_profile"           # "shared" | "per_repo" | "per_profile" | "per_repo_and_posture"
+allow_cross_posture_reads = true       # default true for trusted posture; see untrusted posture rules
 ```
 
 - `trust_domain = "shared"`: All jobs share the same cache namespace. Use only for fully trusted repos.
 - `trust_domain = "per_repo"` (default for CI): Caches are segregated by repository identity (e.g., repo URL hash).
 - `trust_domain = "per_profile"`: Caches are segregated by profile name within a repo.
+- `trust_domain = "per_repo_and_posture"`: Caches are segregated by repo identity AND effective trust posture (`trusted` vs `untrusted`), preventing cross-posture cache reuse by default.
 
 The worker MUST segregate caches by the effective `trust_domain` boundary. At minimum, DerivedData and SPM caches MUST be isolated.
 
 `metrics.json` SHOULD record:
 - `cache_namespace` — The computed cache namespace key.
 - `cache_writable` — Boolean indicating if the cache was writable for this job.
+- `cache_posture_partitioned` — Boolean indicating if cache namespace included trust posture separation.
 
 ### Simulator Prewarm
 
