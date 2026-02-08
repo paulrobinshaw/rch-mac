@@ -150,6 +150,11 @@ MUST bump `probe.schema_version`.
   - `queued_jobs` (integer) — Number of jobs waiting for a lease slot.
   - `updated_at` (ISO 8601 timestamp) — When this snapshot was taken.
 - `roots` (object) — Canonical harness roots used to derive per-job paths (especially in `--forced` mode): `stage_root`, `jobs_root`, `cache_root`.
+
+**Root path requirements (Normative):**
+- `roots.*` MUST be **absolute** paths (no `~`, no relative paths).
+- `roots.*` MUST be **expanded and normalized** (no `..` segments). Implementations SHOULD report `realpath(3)` when feasible.
+- If any required root is missing, non-absolute, or fails normalization, the harness MUST refuse `probe` (non-zero) and the host MUST treat the worker as ineligible (see Error Model: `invalid_worker_roots`).
 - `health` (object) — Best-effort worker health snapshot (**volatile; excluded from `capabilities_sha256`**):
   - `disk_free_bytes` (integer|null)
   - `disk_total_bytes` (integer|null)
@@ -189,7 +194,7 @@ The harness MAY support an optional fourth verb:
 4) `rch-xcode-worker cache_query` (Optional; Recommended)
    - Reads a single JSON object from stdin containing at minimum:
      - `protocol_version`
-     - `config_hash` (lowercase hex SHA-256 of `JCS(effective_config.inputs)`)
+     - `config_hash` (lowercase hex SHA-256 of `"rch-xcode-lane/config_hash/v1\n" || JCS(effective_config.inputs)`)
      - `kinds` (array of strings) — e.g. `["derived_data","spm"]`
      - `cache_namespace` (string) — REQUIRED when `features.cache_namespace=true`
    - Emits a single JSON object to stdout and exits 0 on success:
@@ -249,6 +254,11 @@ The status verb MUST emit a single self-describing JSON object:
 - `schema_version` (SemVer string) — Schema version for the job request payload (e.g., `"1.0.0"`).
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
+- `job_request_sha256` (string) — Lowercase hex SHA-256 computed by the host as:
+  `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`
+  where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed.
+  **Harness verification (Normative):** The harness MUST recompute this digest and MUST refuse before execution with
+  stable error code `job_request_sha256_mismatch` if it differs. If missing/empty, refuse with `job_request_sha256_missing`.
 - `source_tree_hash` (string) — Lowercase hex hash of the staged source snapshot (`source_manifest.entries` hash). Used for staging verification and (optionally) for recomputing/validating `run_id`.
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, resolved destination IDs).
@@ -261,9 +271,11 @@ The status verb MUST emit a single self-describing JSON object:
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
   - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
+- `selected_capabilities_sha256` (string|null) — Selection-time `capabilities_sha256` recorded by the host.
+  If non-null, the harness MUST compare it against its current `capabilities_sha256` (stable fields) and MUST refuse
+  before execution with stable error code `capabilities_drift` on mismatch.
 - `required_features` (array of strings) — policy-critical features the host expects the harness to enforce.
   The harness MUST refuse if any required feature is unsupported (see Required Feature Negotiation below).
-- `job_request_sha256` (string) — Lowercase hex SHA-256 of `"rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest)` computed by the host, where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed. The harness MUST echo this value in `hello` and `complete` so the host can detect any request corruption.
 
 **Path Confinement (Normative):**
 - In `--forced` mode, the harness MUST compute `src/`, `work/`, `dd/` and related paths solely from (`jobs_root`, `stage_root`, `cache_root`) + `job_id` (and optional stable subpaths).
@@ -291,6 +303,12 @@ The status verb MUST emit a single self-describing JSON object:
 - Stderr MAY contain human-readable logs and MUST be treated as the source for `build.log` capture/streaming.
 - The host MUST capture stderr separately and MUST NOT attempt to parse it as JSON.
 - The harness SHOULD route backend build output (e.g., `xcodebuild` stdout/stderr) into harness stderr so it is captured in `build.log`.
+
+**Wire encoding + line discipline (Normative):**
+- Stdout NDJSON and stderr logs MUST be UTF-8 encoded bytes.
+- NDJSON lines MUST be terminated with a single `\n` (LF). Implementations MUST NOT emit `\r\n`.
+- The harness MUST flush stdout after each emitted NDJSON line and MUST flush stderr periodically (at least per line or per 64KiB).
+- The harness MUST NOT buffer events until process exit; events are a live stream and MUST be observable promptly by `watch`.
 
 **Durable stream tee (Normative):**
 
@@ -355,9 +373,9 @@ Before backend execution, the harness MUST:
 1. Refuse with stable error code `source_staging_incomplete` if `STAGE_READY` or `stage_receipt.json` is missing.
 2. Refuse with stable error code `stage_receipt_mismatch` if `stage_receipt.json.job_id/run_id/attempt` or `stage_receipt.json.source_tree_hash` do not match the job request (`job_id/run_id/attempt/source_tree_hash`).
 3. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
-3. Populate the job `src/` by atomically swapping a fully materialized tree:
+4. Populate the job `src/` by atomically swapping a fully materialized tree:
    - Recommended: stage to `jobs_root/<job_id>/src.tmp/` then rename to `src/`
-4. Apply the existing **read-only source** rule to the final `src/`.
+5. Apply the existing **read-only source** rule to the final `src/`.
 
 If `[profiles.<name>.source].verify_after_stage = true`, the harness MUST emit `stage_verification.json`
 recording expected vs observed hashes and fail with `source_hash_mismatch` when they differ.
@@ -412,7 +430,7 @@ The host MUST record the computed `cache_namespace` in `metrics.json` and `attes
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
 - The `hello` event MUST include `event_schema_version` (SemVer string) declaring the schema for all subsequent NDJSON events in the stream.
-- The `hello` event MUST include `job_request_sha256` when provided in the job request.
+- The `hello` event MUST include `job_request_sha256` (echoed from the job request).
 - The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `result`, `spm`, `cache`) so audits/debugging can prove where execution happened.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
 - Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
@@ -430,7 +448,7 @@ The terminal `complete` event MUST include:
 - `events_sha256` (string|null) — digest over emitted event bytes (excluding the `complete` line itself)
 - `event_chain_head_sha256` (string|null) — when hash chain enabled, the `event_sha256` of the last non-`complete` event
 - `artifact_summary` (object) — small summary, e.g. `{ "xcresult": true, "xcresult_format": "directory|tar.zst" }`
-- `job_request_sha256` (string|null) — Echoed from `hello` when present; null if not provided in the job request.
+- `job_request_sha256` (string) — Echoed from `hello` / job request.
 
 This enables streaming consumers to know the terminal outcome without waiting for artifact assembly.
 
@@ -584,6 +602,8 @@ max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap; enforced
 max_log_bytes       = 200_000_000      # build.log cap; truncate with marker (see Quota Enforcement)
 max_events_bytes    = 50_000_000       # events.ndjson cap; on exceed: fail with complete + error_code
 max_event_line_bytes = 1_000_000       # per-event JSON line cap; on exceed: fail with complete + error_code
+max_cpu_seconds     = 7200             # optional: cumulative CPU seconds cap for backend process group
+max_memory_bytes    = 8_000_000_000    # optional: peak RSS cap for backend process group (best-effort)
 
 # Release profile extends base but overrides safety for signing
 [profiles.release]
@@ -621,6 +641,16 @@ When `limits.*` are configured, the harness/host MUST enforce them deterministic
   `{ "limit_bytes": <int>, "observed_bytes": <int>, "largest_file_bytes": <int>, "largest_file_path": "<path>" }`.
 - The harness MUST re-check the staged tree before backend execution (best-effort) and fail with the same error code if exceeded.
 
+**`max_cpu_seconds`:**
+- When configured, the harness MUST track CPU time consumed by the backend process group (best-effort).
+- If exceeded, the job MUST terminate with `error_code="cpu_quota_exceeded"`.
+- The terminal error `detail` MUST include `{ "limit_cpu_seconds": <number>, "observed_cpu_seconds": <number> }`.
+
+**`max_memory_bytes`:**
+- When configured, the harness MUST track peak resident memory (RSS) of the backend process group (best-effort).
+- If exceeded, the job MUST terminate with `error_code="memory_quota_exceeded"`.
+- The terminal error `detail` MUST include `{ "limit_bytes": <int>, "observed_peak_bytes": <int> }`.
+
 ### Host Config: `~/.config/rch/workers.toml`
 
 ```toml
@@ -640,10 +670,10 @@ expected_codesign_team_id = "ABCDE12345"             # optional pin when codesig
 expected_codesign_requirement_sha256 = "deadbeef..."  # optional stronger pin (SHA-256 of designated requirement)
 probe_cache_ttl_seconds = 30                         # optional; host may reuse probe results for this TTL
 
-# Worker roots (used to compute per-job workspaces deterministically)
-stage_root = "~/Library/Caches/rch-xcode-lane/stage"
-jobs_root  = "~/Library/Caches/rch-xcode-lane/jobs"
-cache_root = "~/Library/Caches/rch-xcode-lane/cache"
+# Worker roots (MUST be absolute paths; used to compute per-job workspaces deterministically)
+stage_root = "/Users/rch/Library/Caches/rch-xcode-lane/stage"
+jobs_root  = "/Users/rch/Library/Caches/rch-xcode-lane/jobs"
+cache_root = "/Users/rch/Library/Caches/rch-xcode-lane/cache"
 ```
 
 ### Transport Trust (Normative)
@@ -680,12 +710,30 @@ When `require_pinned_host_key = true`, the lane MUST refuse to run unless the se
 
 This enables CI profiles to enforce a stronger trust posture than local development profiles.
 
+#### Profile-Level Harness Pin Enforcement (Normative when enabled)
+
+Profiles MAY require harness identity pins to be present and verified for the selected worker:
+
+```toml
+[profiles.ci.trust]
+require_pinned_host_key = true
+require_harness_pins = true
+```
+
+When `require_harness_pins = true`, the lane MUST refuse unless the selected worker has at least one configured expected harness identity pin (e.g., `expected_harness_binary_sha256` and/or `expected_codesign_requirement_sha256`). Refusal MUST use stable error code `harness_pin_missing`.
+
+If pins are present, the host MUST verify probe-reported values match before invoking `run`. Mismatch MUST refuse with stable error code `harness_identity_mismatch`.
+
 #### Capability Freeze (Normative when enabled)
 
 When `trust.require_stable_capabilities_sha256 = true`:
 - The host MUST record the selected worker's `capabilities_sha256` at selection time in `decision.json`.
 - Immediately before invoking `run`, the host MUST re-probe the selected worker (ignoring probe cache) and compare `capabilities_sha256`.
 - If it differs, the lane MUST refuse with stable error code `capabilities_drift` and include details `{ "expected": "...", "observed": "..." }`.
+
+**Additional binding (Recommended):**
+
+When capability freeze is enabled, the host SHOULD also include `job_request.selected_capabilities_sha256` so the harness can refuse if its current stable capabilities do not match the selection-time value (see Job Request schema).
 
 ### Optional Integrity Controls (Recommended for CI / remote storage)
 
@@ -753,7 +801,7 @@ Worker selection is controlled via `[profiles.<name>.worker].selection`:
 **Worker Selection: `warm_cache` (Normative)**
 
 When `worker.selection = "warm_cache"`:
-- The host MUST compute `config_hash = SHA-256( JCS(effective_config.inputs) )` as lowercase hex.
+- The host MUST compute `config_hash = SHA-256( "rch-xcode-lane/config_hash/v1\n" || JCS(effective_config.inputs) )` as lowercase hex.
 - For each eligible worker that advertises `"cache_query"` in `probe.verbs` (or `features.cache_query=true`), the host SHOULD invoke `cache_query` and score the worker:
   - Scoring SHOULD prioritize DerivedData presence over SPM presence.
   - Implementations MAY use weighted scoring (e.g., +100 for DerivedData present, +50 for SPM present) but MUST document their algorithm.
@@ -804,7 +852,9 @@ The host MUST record in `decision.json.worker_candidates[]`:
 Every job attempt MUST carry three identity fields:
 
 - **`job_id`** — A unique identifier for this specific execution attempt (UUID v7 recommended). Never reused across attempts.
-- **`run_id`** — A content-derived identifier: `SHA-256( JCS(config_inputs) || "\n" || source_tree_hash_hex )`. Two jobs with identical config inputs and source MUST produce the same `run_id`. This enables cache lookups and deduplication.
+- **`run_id`** — A content-derived identifier:
+  `SHA-256( "rch-xcode-lane/run_id/v1\n" || JCS(config_inputs) || "\n" || source_tree_hash_hex )`.
+  Two jobs with identical config inputs and source MUST produce the same `run_id`. This enables cache lookups and deduplication.
 - **`attempt`** — A monotonically increasing integer (starting at 1) within a given `run_id`. If a job is retried with the same effective config and source, `run_id` stays the same but `attempt` increments.
 
 All three fields MUST appear in `summary.json`, `effective_config.json`, and `attestation.json`.
@@ -1116,6 +1166,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `core_ids_required` | Profile requires CoreSimulator IDs but they are missing | No |
 | `ssh_host_key_untrusted` | Worker SSH host key/cert not trusted by configured pins | No |
 | `harness_identity_mismatch` | Harness binary hash or codesign identity does not match expected pins | No |
+| `harness_pin_missing` | Profile requires harness identity pins but worker has none configured | No |
+| `invalid_worker_roots` | Worker reported invalid/non-absolute roots; cannot safely confine paths | No |
 | `capabilities_drift` | Worker capabilities_sha256 changed between selection and run | No |
 | `insufficient_disk_space` | Worker did not meet `min_disk_free_bytes` threshold | Yes |
 | `worker_degraded` | Worker reported degraded execution state | Yes |
@@ -1141,6 +1193,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `cancel_failed` | Cancel command executed but worker could not terminate the job | Yes |
 | `cancel_not_supported` | Worker/harness does not support cancel (disallowed in `--forced` deployments) | No |
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
+| `job_request_sha256_missing` | job_request_sha256 missing/empty in job request | No |
+| `job_request_sha256_mismatch` | job_request_sha256 did not match recomputed digest | Yes |
 | `events_quota_exceeded` | Event stream exceeded configured byte cap | No |
 | `event_line_too_long` | A single event exceeded configured per-line cap | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
@@ -1157,6 +1211,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `artifact_quota_exceeded` | Artifacts exceeded configured cap | No |
 | `log_truncated` | build.log exceeded cap and was truncated | No |
 | `source_quota_exceeded` | Source snapshot exceeded configured `source.max_*` limits | No |
+| `cpu_quota_exceeded` | Backend exceeded configured CPU time cap | No |
+| `memory_quota_exceeded` | Backend exceeded configured peak memory cap | No |
 | `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
 | `object_store_encryption_required` | Remote storage requires explicit encryption policy (untrusted posture disallows none) | No |
 | `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
@@ -1232,10 +1288,10 @@ The lane assumes repos may execute arbitrary code during build/test. Operators S
 command="/usr/local/bin/rch-xcode-worker --forced",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-run
 
 # Stage key (write-only, confined to staging root):
-command="/usr/local/bin/rrsync -wo ~/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-stage
+command="/usr/local/bin/rrsync -wo /Users/rch/Library/Caches/rch-xcode-lane/stage",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-stage
 
 # Fetch key (read-only, confined to jobs root):
-command="/usr/local/bin/rrsync -ro ~/Library/Caches/rch-xcode-lane/jobs",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-fetch
+command="/usr/local/bin/rrsync -ro /Users/rch/Library/Caches/rch-xcode-lane/jobs",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,restrict ssh-ed25519 AAAA... rch-fetch
 ```
 
 ---
@@ -1245,8 +1301,22 @@ command="/usr/local/bin/rrsync -ro ~/Library/Caches/rch-xcode-lane/jobs",no-pty,
 Every run MUST emit:
 
 - `effective_config.json` — Fully-resolved configuration used for the job (Xcode path, destination, build settings, cache policy).
-- `attestation.json` — Environment fingerprint: macOS version, Xcode version/build, toolchain versions, worker identity, repo state.
+- `attestation.json` — Environment fingerprint: host identity, worker identity, macOS version, Xcode version/build, toolchain versions, repo state.
 - `manifest.json` — Artifact inventory + hashes.
+
+**`attestation.json` (Normative field groups):**
+
+- `host` (object) — MUST include:
+  - `rch_version` (string)
+  - `daemon_version` (string|null)
+  - `os` (string) / `arch` (string)
+  - `classifier` (object) excerpt: `{ name, version, policy_sha256 }` (no secrets)
+- `worker` (object) — MUST include:
+  - `hostname` (string), optional `machine_id`
+  - `user` (string|null), `uid` (integer|null), `gid` (integer|null) (best-effort)
+- `transport` (object) — MUST include:
+  - `ssh_host_key_fingerprint_observed` (string|null)
+  - `ssh_host_key_verification` (`"fingerprint"` | `"ca"` | `"none"`)
 
 ### Artifact Schema + Versioning (Normative)
 
@@ -1932,7 +2002,8 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
 - `stage_receipt.json` parses successfully and its `job_id/run_id/attempt/source_tree_hash` match `job_request.json`.
 - `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
-- If `job_request_sha256` is present in `hello`/`complete` events, recompute and verify it matches `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`.
+- Recompute and verify `job_request_sha256` matches `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`.
+- Verify `events.ndjson` `hello.job_request_sha256` and terminal `complete.job_request_sha256` equal `job_request.json.job_request_sha256`.
 - `probe.json` parses successfully and includes required fields (`kind`, `schema_version`, `protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.

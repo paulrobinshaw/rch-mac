@@ -126,6 +126,32 @@ Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 
 **Performance tip:** If you enable `worker.selection = "warm_cache"`, the host can optionally query workers for cache presence keyed by `config_hash` and route the job to the warmest eligible worker (see `PLAN.md` Worker Selection and Cache Query verb).
 
+## TL;DR Quickstart
+
+1. **On the worker (Mac):** install `rch-xcode-worker`, Xcode, sims; enable a **forced-command** run key.
+2. **On the host:** register the worker in `~/.config/rch/workers.toml` (tags: `macos,xcode`) and **pin** its SSH host key.
+3. **In the repo:** add `.rch/xcode.toml` with a `ci` profile (pin destination + safety defaults).
+4. Start daemon: `rch daemon start`
+5. Validate: `rch xcode doctor` then `rch xcode verify --profile ci`
+6. Run: `rch xcode test --profile ci` (or `build`)
+7. Inspect: `rch xcode watch <job_id>` → `rch xcode validate <job_id>`
+
+## CI Hardening Checklist (Recommended)
+
+- **Forced-command run key** on the worker (`authorized_keys command="rch-xcode-worker --forced",no-pty,...`).
+- **Separate data-plane keys** (stage write-only to `stage_root/`, fetch read-only from `jobs_root/`).
+- **Pinned SSH host key** (CI profiles SHOULD require this).
+- **Harness identity pinning** (binary hash and/or codesign requirement) for supply-chain integrity.
+- **Untrusted posture** for fork PRs: signing off, stricter simulator hygiene, no cache writes, redaction for remote storage.
+- **Absolute worker roots** (avoid `~` and shell expansion; see PLAN.md `roots` requirements).
+- `rch xcode validate` in CI to enforce schema + manifest + event-stream integrity.
+
+## Upgrade Strategy (Fleet)
+
+- Roll upgrades by **adding** support first (new `protocol_version` / `contract_version`) before **requiring** it.
+- Prefer harnesses that support multiple `contract_versions` concurrently; then bump CI profiles once the fleet is updated.
+- When tightening safety knobs that depend on harness support, use `required_features` so old harnesses refuse explicitly (no silent downgrade).
+
 ## Setup
 
 1. Register the Mac mini in `~/.config/rch/workers.toml` with tags `macos,xcode`
