@@ -19,12 +19,15 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 
 - **Host**: Machine running `rch` client + daemon.
 - **Worker**: macOS machine running jobs over SSH.
+- **Stage Root**: A worker-confined root (`probe.roots.stage_root`) where the host can upload a source snapshot using a restricted stage key.
 - **Job**: One remote build/test execution with stable, addressable artifacts.
 - **Profile**: Named configuration block (e.g., `ci`, `local`, `release`).
 - **Lane**: The Xcode-specific subsystem within RCH.
 - **Run ID**: Content-derived identifier (SHA-256 of canonical **config inputs** + source tree hash); identical inputs produce the same run ID.
 - **Job ID**: Unique identifier per execution attempt; never reused.
 - **Repo Key**: A stable *host-side* namespace used to segregate artifacts and (optionally) caches per repository/workspace. It MUST NOT be included in `effective_config.inputs` (so it does not affect `run_id`), but MUST be recorded in `attestation.json`. Derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash.
+- **Repo Identity**: A cross-host stable identity for cache partitioning and audit (e.g., normalized VCS origin + optional repo fingerprint). See Cache Namespace section.
+- **Cache Namespace**: A worker-visible, explicit namespace string used to segregate caches per trust boundary. Computed by the host and supplied in the job request.
 - **Contract Version**: A stable semantic version of the *lane contract* that is included in `effective_config.inputs` (and therefore influences `run_id`). It MUST be bumped whenever the meaning of any hashed input changes (defaults, canonicalization, policy semantics, backend argument reconstruction), even if `lane_version` changes for other reasons.
 
 ---
@@ -95,11 +98,13 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
   - `identifier` (string|null)
   - `team_id` (string|null)
   - `signing_sha256` (string|null) — Optional digest of the signing blob/requirement.
+  - `requirement_sha256` (string|null) — SHA-256 of the designated requirement string (or equivalent stable form). Provides a stronger identity pin than `team_id` alone.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
 - `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel"]` (and optionally `"cache_query"`).
 - `features` (object) — Feature flags/capabilities beyond versions, e.g.:
   - `event_hash_chain` (boolean) — Whether hash-chained events are supported when enabled in config.
   - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
+  - `cache_namespace` (boolean) — Whether the harness supports explicit cache namespaces supplied by the host.
 - `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load` and `health`). Enables capability drift detection.
 
 **`capabilities_sha256` computation (Normative):**
@@ -165,9 +170,11 @@ The harness MAY support an optional fourth verb:
      - `protocol_version`
      - `config_hash` (lowercase hex SHA-256 of `JCS(effective_config.inputs)`)
      - `kinds` (array of strings) — e.g. `["derived_data","spm"]`
+     - `cache_namespace` (string) — REQUIRED when `features.cache_namespace=true`
    - Emits a single JSON object to stdout and exits 0 on success:
      - `config_hash`
-     - `namespace` (string) — effective cache namespace/trust boundary
+     - `cache_namespace` (string) — effective cache namespace/trust boundary
+     - `namespace` (string) — DEPRECATED alias for `cache_namespace` (for backward compatibility)
      - `derived_data` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
      - `spm` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
    - MUST NOT reveal any paths outside configured cache roots.
@@ -220,12 +227,15 @@ The status verb MUST emit a single self-describing JSON object:
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, resolved destination IDs).
   The destination UDID MAY be omitted; when omitted, the harness MUST resolve/select/create an appropriate simulator device
   according to `effective_config.inputs.simulator.*` and record the chosen UDID under `effective_config.resolved`.
+  - MUST include `repo_identity` and `cache_namespace` when caching is enabled (see Cache Namespace section).
 - `paths` (object). In `--forced` mode, the harness MUST ignore any host-supplied absolute paths and MUST derive paths from configured roots + `job_id` (see Path Confinement below).
   - `src`, `work`, `dd`, `result`, `spm`, `cache` MUST be representable (even if some are aliases of others depending on cache policy).
 
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
   - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
+- `required_features` (array of strings) — policy-critical features the host expects the harness to enforce.
+  The harness MUST refuse if any required feature is unsupported (see Required Feature Negotiation below).
 - `job_request_sha256` (string) — Lowercase hex SHA-256 of `"rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest)` computed by the host, where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed. The harness MUST echo this value in `hello` and `complete` so the host can detect any request corruption.
 
 **Path Confinement (Normative):**
@@ -262,6 +272,108 @@ The harness MUST tee (write) the same bytes it emits to durable files under the 
 - `build.log` — Same content as harness stderr (human logs + backend output).
 
 This ensures runs remain inspectable and artifacts are fetchable even if the SSH session is interrupted mid-execution. The `status` verb (when supported) can report the latest durable `events.sequence` to enable resume.
+
+---
+
+## Staging Contract (Normative)
+
+Deployments commonly use split SSH keys:
+- **Stage key** (write-only) confined to `stage_root/` to upload source
+- **Run key** (forced-command) confined to `rch-xcode-worker --forced`
+- **Fetch key** (read-only) confined to `jobs_root/` to pull artifacts
+
+To make this safe and deterministic, staging MUST be an explicit contract between host and harness.
+
+### Worker Stage Layout
+
+For a given `job_id`, the host MUST stage into:
+- `stage_root/<job_id>/src.tmp/` (upload target)
+- then atomically rename to `stage_root/<job_id>/src/`
+
+After the rename, the host MUST write:
+- `stage_root/<job_id>/stage_receipt.json` (self-describing JSON; schema below)
+- `stage_root/<job_id>/STAGE_READY` (empty sentinel file)
+
+The harness MUST treat staging as complete **only** when `STAGE_READY` exists.
+
+### `stage_receipt.json` (Normative)
+
+The stage receipt MUST be a self-describing JSON object:
+```jsonc
+{
+  "kind": "stage_receipt",
+  "schema_version": "1.0.0",
+  "lane_version": "0.1.0",
+  "job_id": "…",
+  "run_id": "…",
+  "attempt": 1,
+  "method": "rsync|git_snapshot",
+  "source_tree_hash": "…",
+  "excludes": ["…"],
+  "bytes_sent": 123,
+  "files_changed": 456,
+  "created_at": "2026-02-08T00:00:00Z"
+}
+```
+
+### Harness Staging Behavior (Normative)
+
+Before backend execution, the harness MUST:
+1. Refuse with stable error code `source_staging_incomplete` if `STAGE_READY` or `stage_receipt.json` is missing.
+2. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
+3. Populate the job `src/` by atomically swapping a fully materialized tree:
+   - Recommended: stage to `jobs_root/<job_id>/src.tmp/` then rename to `src/`
+4. Apply the existing **read-only source** rule to the final `src/`.
+
+If `[profiles.<name>.source].verify_after_stage = true`, the harness MUST emit `stage_verification.json`
+recording expected vs observed hashes and fail with `source_hash_mismatch` when they differ.
+
+---
+
+## Required Feature Negotiation (Normative)
+
+The probe `features` object is the authoritative declaration of optional harness capabilities.
+If the host relies on a policy-affecting optional capability, it MUST list it in `job_request.required_features`.
+
+The harness MUST:
+1. Compare `job_request.required_features[]` against `probe.features`
+2. Refuse before execution with stable error code `required_feature_unsupported` on any missing feature
+
+This prevents "silent downgrade" when new safety knobs are introduced. Without this, an older harness might silently ignore a new enforcement field (e.g., `sandbox.network = deny_all`), causing the job to run unsafely.
+
+---
+
+## Cache Namespace (Normative)
+
+When `cache.derived_data` and/or `cache.spm` is enabled, the host MUST compute and supply a `cache_namespace`
+string under `job_request.config_resolved.cache_namespace`. The harness MUST use it to segregate all cache reads/writes.
+
+The harness MUST refuse with stable error code `cache_namespace_missing` if caching is enabled but
+`cache_namespace` is absent or empty.
+
+### `repo_identity` (Normative)
+
+The host MUST supply `job_request.config_resolved.repo_identity` as:
+```jsonc
+{ "kind": "git", "origin": "<normalized-url>", "repo_fingerprint_sha256": "<optional>" }
+```
+
+`origin` normalization MUST:
+- Strip credentials/userinfo
+- Lowercase hostname
+- Remove trailing `.git`
+- Normalize ssh/scp-like forms to `ssh://host/path`
+
+### Cache Namespace Derivation (Recommended; MUST be recorded when used)
+
+```text
+cache_namespace = "rch-xcode-lane/cache_ns/v1/" +
+  SHA256( normalized_origin + "\n" + trust_posture + "\n" + trust_domain + "\n" + profile_name )
+```
+
+The host MUST record the computed `cache_namespace` in `metrics.json` and `attestation.json`.
+
+---
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
@@ -482,8 +594,10 @@ ssh_run_key = "~/.ssh/rch_run_ed25519"       # used only for harness probe/run
 ssh_stage_key = "~/.ssh/rch_stage_ed25519"   # used only for staging (rrsync write-only, confined to stage_root)
 ssh_fetch_key = "~/.ssh/rch_fetch_ed25519"   # used only for fetching artifacts (rrsync read-only, confined to jobs_root)
 ssh_host_key_fingerprint = "SHA256:BASE64ENCODEDFINGERPRINT"
+ssh_host_key_ca_public_key = "~/.config/rch/ssh_host_ca.pub"  # optional: trust worker host certs signed by this CA
 expected_harness_binary_sha256 = "0123...abcd"       # optional pin for supply-chain integrity
 expected_codesign_team_id = "ABCDE12345"             # optional pin when codesign is used
+expected_codesign_requirement_sha256 = "deadbeef..."  # optional stronger pin (SHA-256 of designated requirement)
 probe_cache_ttl_seconds = 30                         # optional; host may reuse probe results for this TTL
 
 # Worker roots (used to compute per-job workspaces deterministically)
@@ -494,9 +608,18 @@ cache_root = "~/Library/Caches/rch-xcode-lane/cache"
 
 ### Transport Trust (Normative)
 
-When `ssh_host_key_fingerprint` is configured for a worker, the host MUST verify the remote SSH host key matches before executing any probe/run command. If verification fails, the lane MUST refuse to run and emit a clear error with code `ssh_host_key_mismatch`.
+The host MUST support two worker host-key verification modes:
+1. **Pinned fingerprint** via `ssh_host_key_fingerprint` — exact match required
+2. **SSH host CA** via `ssh_host_key_ca_public_key` — trust host certificates signed by the specified CA
 
-`attestation.json` MUST record the observed SSH host key fingerprint used for the session (even if not pinned), so audits can detect worker identity drift.
+If either verification mode is configured, the host MUST verify worker identity before any probe/run command.
+If verification fails, the lane MUST refuse to run and emit a clear error with code `ssh_host_key_untrusted`.
+
+`attestation.json` MUST record:
+- The observed SSH host key fingerprint used for the session (even if not pinned)
+- `ssh_host_key_verification` = `"fingerprint"` | `"ca"` | `"none"` indicating which mode was used
+
+This enables audits to detect worker identity drift.
 
 #### Harness Identity Enforcement (Recommended)
 
@@ -945,7 +1068,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `destination_not_found` | Requested simulator destination not available | No |
 | `destination_ambiguous` | Multiple matching destinations found | No |
 | `core_ids_required` | Profile requires CoreSimulator IDs but they are missing | No |
-| `ssh_host_key_mismatch` | Worker SSH host key does not match pinned fingerprint | No |
+| `ssh_host_key_untrusted` | Worker SSH host key/cert not trusted by configured pins | No |
 | `harness_identity_mismatch` | Harness binary hash or codesign identity does not match expected pins | No |
 | `capabilities_drift` | Worker capabilities_sha256 changed between selection and run | No |
 | `insufficient_disk_space` | Worker did not meet `min_disk_free_bytes` threshold | Yes |
@@ -957,8 +1080,10 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `xcode_not_found` | Xcode not found at expected path on worker | No |
 | `xcode_version_mismatch` | Xcode version does not match constraint | No |
 | `backend_unavailable` | Preferred backend unavailable and fallback disallowed | No |
+| `cache_namespace_missing` | Caching enabled but cache_namespace missing/invalid | No |
 | `protocol_version_unsupported` | No common protocol version between host and harness | No |
 | `contract_version_unsupported` | Harness does not support requested contract_version | No |
+| `required_feature_unsupported` | Host required a harness feature that is unavailable | No |
 | `runtime_not_found` | Requested simulator runtime not installed | No |
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
@@ -973,6 +1098,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `events_quota_exceeded` | Event stream exceeded configured byte cap | No |
 | `event_line_too_long` | A single event exceeded configured per-line cap | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
+| `source_staging_incomplete` | Stage receipt/sentinel missing; staging not complete | Yes |
 | `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
 | `source_tree_modified` | Source tree was modified during execution | No |
 | `artifact_collection_failed` | Failed to collect artifacts from worker | Yes |
@@ -1016,12 +1142,26 @@ Profiles MAY control trust posture explicitly via `[profiles.<name>.trust]`:
 When posture is `untrusted`, the lane MUST enforce (regardless of profile defaults):
 - `code_signing_allowed = false`
 - `allow_mutating = false`
-- `cache.mode = "read_only"` (or `"off"` if profile sets caches off)
+- `cache.mode = "off"` unless the profile explicitly opts in via `cache.allow_untrusted_reads = true`
 - `cache.trust_domain = "per_repo_and_posture"` unless the profile explicitly sets `allow_cross_posture_reads = true`
 - If `allow_cross_posture_reads = false`, the worker MUST NOT read cache entries produced under a different posture partition.
 - `source.symlinks = "forbid"` unless the operator explicitly opts out for a known-safe repository
 - If `action = "test"`, the lane MUST set (or require) `simulator.strategy = "per_job"` unless explicitly overridden for local use.
+- If `action = "test"`, the lane MUST set (or require) `simulator.device_set = "per_job"` to isolate CoreSimulator device database state.
 - If artifacts may leave the host (`store = "worker"` or `"object_store"`), the lane MUST enable log redaction (`redaction.enabled = true`) or refuse with a stable error code `untrusted_remote_storage_requires_redaction`.
+
+#### Untrusted Cache Read Opt-in (Normative)
+
+Profiles MAY explicitly opt in to cache reads under untrusted posture:
+
+```toml
+[profiles.ci.cache]
+allow_untrusted_reads = false  # default: false
+```
+
+If `trust.posture` resolves to `"untrusted"` and `allow_untrusted_reads = false` (the default), the lane MUST force `cache.mode = "off"`.
+
+Rationale: Reading caches in untrusted posture can leak information from prior trusted builds (private symbols, paths, embedded data from proprietary dependencies).
 
 The applied posture MUST be recorded in `decision.json` (as `trust_posture`) and `effective_config.json` (as final resolved values). This ensures the lane is safer-by-default even when configs drift.
 
@@ -1225,6 +1365,8 @@ Artifacts are written under a per-job directory on the host, scoped by `repo_key
 ├── environment.json       # Captured worker environment snapshot
 ├── timing.json            # Durations for stage/run/collect phases
 ├── staging.json           # Staging report (method, excludes, bytes/files, duration, tool versions)
+├── stage_receipt.json     # Stage receipt consumed by the harness (copied into job dir for audit)
+├── stage_verification.json# Optional: post-stage/post-run integrity verification (when enabled)
 ├── metrics.json           # Resource + transfer metrics + queue stats
 ├── events.ndjson          # Streaming event log (newline-delimited JSON)
 ├── status.json            # Current job status (updated in-place during execution)
@@ -1337,6 +1479,20 @@ When `store` is `"worker"` or `"object_store"`, the `rch xcode fetch <job_id>` c
 3. Verify SHA-256 hash matches the manifest entry.
 4. Decompress if `compression` indicates compressed format.
 5. Update `manifest.json` to reflect local storage after successful fetch.
+
+### Host CAS Store (Optional; Recommended)
+
+To reduce duplicated storage across retries and identical artifacts, the host MAY enable a content-addressed store (CAS):
+
+- CAS root: `~/.local/share/rch/artifacts/cas/sha256/<aa>/<hash>` (where `<aa>` is the first two hex characters)
+- Job directories reference CAS objects via hardlinks or symlinks (implementation choice)
+
+Requirements when CAS is enabled:
+- `manifest.json` remains authoritative for `sha256` + `bytes` (CAS does not change validation semantics)
+- `rch xcode validate` MUST validate referenced CAS objects equivalently (follow links, hash bytes)
+- `rch xcode gc` MUST account for CAS reachability from live job dirs + run index before deleting CAS objects
+
+Rationale: `xcresult` can be very large, and agent loops produce many repeated attempts. CAS makes the lane cheaper to operate (disk + time) and improves the "reuse run" experience because artifacts are already present by hash.
 
 ### `backend_invocation.json` Requirements (Normative)
 
@@ -1603,7 +1759,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | Enumerate/probe workers; show capability summaries |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
-| `rch xcode plan --profile <name>` | Deterministically resolve effective config, worker selection, destination resolution (no staging/run) |
+| `rch xcode plan --profile <name>` | Deterministically resolve effective config, worker selection, destination resolution; optionally compute hashes and show reuse candidates (no staging/run) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
@@ -1630,6 +1786,22 @@ JSON outputs MUST use a standard envelope with:
 - `errors` (array) — Array of error objects from the Error Model
 
 This enables agent/CI integration without log scraping and provides consistent error handling across all commands.
+
+### `plan` Output (Normative when `--json`)
+
+`rch xcode plan --json` MUST emit a single envelope object:
+- Standard envelope fields: `kind`, `schema_version`, `lane_version`, `ok`, `error_code`, `errors`
+- `kind`: `"plan_result"`
+- `profile` (string) — The profile name used
+- `worker_selected` (object|null) — Selected worker info, or null if no eligible worker
+- `effective_config` (object) — The resolved config envelope
+- `hashes` (object|null):
+  - `source_tree_hash` (string) — SHA-256 of the source manifest
+  - `config_hash` (string) — SHA-256 of `JCS(effective_config.inputs)`
+  - `run_id` (string) — Content-derived run identifier
+- `reuse_candidate` (object|null): `{ job_id, attempt, path }` — An existing succeeded attempt for this run_id, if found
+
+The command MUST support `--no-hash` to omit `hashes` and `reuse_candidate`, avoiding hashing large trees when speed matters.
 
 ### `watch` Resume Semantics (Normative)
 
@@ -1836,14 +2008,14 @@ When `erase_on_start = true`:
 
 `effective_config.json` MUST record the actual `simulator_strategy` and `simulator_udid` used.
 
-**Device set isolation (Recommended; Normative when enabled):**
+**Device set isolation (Recommended; Normative when enabled or in untrusted posture):**
 
-When `simulator.device_set = "per_job"`:
+When `simulator.device_set = "per_job"` (or when forced by untrusted posture):
 - The harness MUST set `SIMULATOR_DEVICE_SET_PATH` to a per-job path under the confined workspace (e.g., `worker_paths.work/device-set/`).
 - All `simctl` operations and simulator launches for the job MUST use that device set.
 - The harness MUST record `effective_config.resolved.simulator_device_set_path`.
 
-This reduces cross-job CoreSimulator interference and improves parallelism reliability by isolating the device database per job.
+This reduces cross-job CoreSimulator interference and improves parallelism reliability by isolating the device database per job. It also prevents state leakage between trusted and untrusted builds.
 
 ### Backend Path Discipline (Normative)
 

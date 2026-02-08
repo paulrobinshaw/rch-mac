@@ -2,6 +2,7 @@
 
 > **Normative spec:** `PLAN.md` is the source of truth for the lane's contract, artifacts, and safety rules.
 > This README is intentionally **non-normative**: mental model + quickstart.
+> **Note:** Staging is a first-class contract (stage receipt + atomic ready signal) — see `PLAN.md` § Staging Contract.
 
 ## What it is
 
@@ -30,6 +31,10 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, supported `verbs`, stable `capabilities_sha256`, Xcode, runtimes, backends).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
+   - Staging writes into `stage_root/<job_id>/` using the restricted **stage key** and finishes by writing
+     a self-describing `stage_receipt.json` plus a `STAGE_READY` sentinel (atomic "stage complete" signal).
+   - The harness refuses to run if staging is incomplete, and performs an atomic swap into the per-job `src/`
+     directory so the backend never sees a partially-staged tree.
 3. **Run** build/test remotely by invoking `rch-xcode-worker run` (harness selects allowed backend; emits NDJSON events).
    - Production setups SHOULD use the harness in **forced-command mode** so SSH cannot run arbitrary commands.
 4. **Collect artifacts** (logs, `xcresult`, structured JSON).
@@ -102,7 +107,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | List/probe eligible macOS workers and summarize capabilities |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
-| `rch xcode plan --profile <name>` | Resolve effective config + select worker + resolve destination (no staging/run) |
+| `rch xcode plan --profile <name>` | Resolve effective config + select worker + resolve destination; optionally compute `source_tree_hash`, `config_hash`, `run_id`, and show reuse candidates (`--no-hash` to skip) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
 | `rch xcode test [--profile <name>]` | Remote test gate |
 | `rch xcode fetch <job_id>` | Pull remote artifacts (worker/object store), verify hashes, materialize locally |
@@ -169,6 +174,10 @@ Artifacts are written to:
 - Canonical per-attempt dir (repo-scoped): `~/.local/share/rch/artifacts/repos/<repo_key>/jobs/<job_id>/`
 - Stable run index (repo-scoped): `~/.local/share/rch/artifacts/repos/<repo_key>/runs/<run_id>/attempt-<n>/` (links/pointers to job dirs)
 
+Optional: the host MAY enable a content-addressed store (CAS) so large artifacts (e.g., `result.xcresult.tar.zst`, logs)
+are stored once by SHA-256 and referenced by hardlink/symlink from job dirs. This reduces disk usage across retries and
+identical runs (see `PLAN.md` § Host CAS Store).
+
 `repo_key` is a stable host-side namespace derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash. It is recorded in `attestation.json` and prevents cross-repo run index collisions.
 
 All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
@@ -191,7 +200,9 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 ├── manifest.json          # Artifact listing + SHA-256 hashes
 ├── environment.json       # Worker environment snapshot
 ├── timing.json            # Phase durations (staging/running/collecting)
-├── staging.json           # Staging method + excludes + transfer stats (bytes/files/duration)
+├── staging.json           # Host-side staging report (method + excludes + transfer stats)
+├── stage_receipt.json     # The stage receipt consumed by the harness (copied into job dir for audit)
+├── stage_verification.json# Optional: worker-side post-stage/post-run integrity results (when enabled)
 ├── metrics.json           # Resource + transfer metrics (cpu/mem/disk/bytes, queue stats)
 ├── status.json            # Latest job state snapshot (atomic updates while running)
 ├── events.ndjson          # Structured event stream (append-only; optional hash chain for tamper-evident verification)
