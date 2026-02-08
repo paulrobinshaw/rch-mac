@@ -35,7 +35,8 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 - **Storage plane (optional):** Object-store persistence addressed by `manifest.json` URIs (upload/download after hashing + redaction).
 
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, supported `verbs`, stable `capabilities_sha256`, Xcode, runtimes, backends).
-2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
+2. **Snapshot + stage source** to the worker (rsync working tree, git snapshot, **or deterministic bundle** depending on profile policy).
+   - Bundle staging uploads a single `source.tar.zst` (deterministic archive) then writes `stage_receipt.json` + `STAGE_READY`.
    - Staging writes into `stage_root/<job_id>/` using the restricted **stage key** and finishes by writing
      a self-describing `stage_receipt.json` plus a `STAGE_READY` sentinel (atomic "stage complete" signal).
    - The harness refuses to run if staging is incomplete, and performs an atomic swap into the per-job `src/`
@@ -94,6 +95,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 
 - Xcode installed (pinned version; lane records Xcode build number)
 - SSH access (key-based)
+- `tar` (for bundle staging / deterministic packing when enabled)
 - `rsync` + `zstd` (fast sync + compression)
 - Optional but recommended: `rrsync` (or equivalent) to confine stage/fetch keys to lane roots
 - Node.js + XcodeBuildMCP (recommended backend)
@@ -147,6 +149,7 @@ Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 
 - **Forced-command run key** on the worker (`authorized_keys command="rch-xcode-worker --forced",no-pty,...`).
 - **Separate data-plane keys** (stage write-only to `stage_root/`, fetch read-only from `jobs_root/`).
+- **Roots consistency**: refuse if `workers.toml` roots don't match `probe.roots` (`worker_roots_mismatch`).
 - **Pinned SSH host key** (CI profiles SHOULD require this).
 - **Harness identity pinning** (binary hash and/or codesign requirement) for supply-chain integrity.
 - **Optional: signed job requests** (mutual auth): Require the harness to verify a host signature over `job_request_sha256`
@@ -200,6 +203,12 @@ os = "18.2"  # CI SHOULD pin; floating "latest" is opt-in (see PLAN.md)
 allow_mutating = false
 code_signing_allowed = false
 
+[profiles.ci.reports]
+junit = true
+test_summary = true
+sarif = false
+annotations = true
+
 [profiles.ci.trust]
 require_pinned_host_key = true
 ```
@@ -217,6 +226,7 @@ identical runs (see `PLAN.md` § Host CAS Store).
 `repo_key` is a stable host-side namespace derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash. It is recorded in `attestation.json` and prevents cross-repo run index collisions.
 
 All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
+For packed artifacts, `manifest.json` records the packing algorithm + version.
 `summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.
 Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommended for CI/agents).
 

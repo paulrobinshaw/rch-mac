@@ -95,6 +95,7 @@ The harness exposes a small set of verbs. Implementations MUST be explicit about
 | `run` | ✅ | ✅ |
 | `cancel` | Optional | ✅ |
 | `status` | Optional | ✅ |
+| `gc` | Optional | ✅ |
 | `cache_query` | Optional | Optional |
 | `prewarm` | Optional | Optional |
 
@@ -124,7 +125,9 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
   - `signing_sha256` (string|null) — Optional digest of the signing blob/requirement.
   - `requirement_sha256` (string|null) — SHA-256 of the designated requirement string (or equivalent stable form). Provides a stronger identity pin than `team_id` alone.
 - `lane_version` (SemVer string) — Lane specification version the harness implements.
-- `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel","status"]` (and optionally `"cache_query"`, `"prewarm"`).
+- `verbs` (array of strings) — Supported verbs, e.g. `["probe","run","cancel","status"]` (and optionally `"cache_query"`, `"prewarm"`, `"gc"`).
+- `event_schema_versions` (array of SemVer strings) — Supported NDJSON event schema versions (e.g., `["1.0.0"]`).
+  The host SHOULD select the highest common version and include it in `job_request.event_schema_version`.
 - `features` (object) — Feature flags/capabilities beyond versions, e.g.:
   - `event_hash_chain` (boolean) — Whether hash-chained events are supported when enabled in config.
   - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
@@ -168,6 +171,13 @@ MUST bump `probe.schema_version`.
 - `roots.*` MUST be **absolute** paths (no `~`, no relative paths).
 - `roots.*` MUST be **expanded and normalized** (no `..` segments). Implementations SHOULD report `realpath(3)` when feasible.
 - If any required root is missing, non-absolute, or fails normalization, the harness MUST refuse `probe` (non-zero) and the host MUST treat the worker as ineligible (see Error Model: `invalid_worker_roots`).
+
+**Root consistency (Normative):**
+If the host has configured worker roots (e.g., in `workers.toml`) for use by stage/fetch confinement,
+the host MUST compare them against `probe.roots.*` and MUST refuse on any mismatch with stable error code
+`worker_roots_mismatch`.
+- `detail` MUST include `{ "configured": {..}, "probed": {..} }`.
+Rationale: prevents silent divergence between data-plane confinement roots and forced-mode path derivation roots.
 - `health` (object) — Best-effort worker health snapshot (**volatile; excluded from `capabilities_sha256`**):
   - `disk_free_bytes` (integer|null)
   - `disk_total_bytes` (integer|null)
@@ -262,10 +272,30 @@ The status verb MUST emit a single self-describing JSON object:
   - `error_code` (string|null)
   - `errors` (array) — array of Error Objects (MAY be truncated; MUST remain JSON-valid)
 
+The harness SHOULD support a seventh verb:
+
+7) `rch-xcode-worker gc` (Normative when `--forced` is used; optional otherwise)
+   - Reads a single JSON object from stdin:
+     - `kind` = `"gc_request"`, `schema_version`
+     - `jobs_max_age_seconds` (integer) — delete job workspaces older than this (best-effort)
+     - `stage_max_age_seconds` (integer) — delete stale stage dirs older than this
+     - `dry_run` (boolean, default false)
+   - MUST delete ONLY within configured `roots.jobs_root` / `roots.stage_root`.
+   - MUST NOT follow symlinks while deleting (treat as entries).
+   - MUST emit a single JSON object to stdout:
+     - `kind` = `"gc_result"`, `schema_version`
+     - `deleted_jobs` (integer), `deleted_stages` (integer)
+     - `bytes_reclaimed` (integer|null), `errors` (array of Error Objects; may be empty)
+   - MUST exit 0 on success even if nothing was deleted.
+   - MUST refuse if requested ages exceed an operator-configured maximum window (defense-in-depth).
+   - **REQUIRED for deployments using `rch-xcode-worker --forced`** so the host can garbage-collect without arbitrary remote commands.
+
 **Job request (stdin) MUST be a self-describing, versioned object and MUST include:**
 - `kind` (string) — MUST be `"job_request"`.
 - `schema_version` (SemVer string) — Schema version for the job request payload (e.g., `"1.0.0"`).
 - `protocol_version` (string, e.g. `"1"`)
+- `event_schema_version` (SemVer string) — Selected event schema version (from probe intersection).
+  The harness MUST refuse with stable error code `event_schema_unsupported` if it does not support the requested version.
 - `job_id`, `run_id`, `attempt`
 - `job_request_sha256` (string) — Lowercase hex SHA-256 computed by the host as:
   `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`
@@ -354,11 +384,16 @@ To make this safe and deterministic, staging MUST be an explicit contract betwee
 
 ### Worker Stage Layout
 
-For a given `job_id`, the host MUST stage into:
-- `stage_root/<job_id>/src.tmp/` (upload target)
-- then atomically rename to `stage_root/<job_id>/src/`
+For a given `job_id`, the host MUST stage a **payload** under `stage_root/<job_id>/` using the restricted stage key.
+The payload layout depends on `stage_receipt.json.method`:
+- `method = "rsync"`: upload a directory tree to `stage_root/<job_id>/src/`
+- `method = "bundle"`: upload a deterministic archive to `stage_root/<job_id>/source.tar.zst`
+- `method = "git_snapshot"`: implementation-defined, but MUST be representable without arbitrary remote commands
 
-After the rename, the host MUST write (atomically):
+**Important:** the host MUST NOT rely on remote `mv`/`rename` operations for atomicity (stage keys are commonly rrsync-confined).
+Atomic "stage complete" is defined ONLY by the receipt + sentinel below; the harness performs atomic materialization into `jobs_root/<job_id>/src/`.
+
+After uploading the payload, the host MUST write (atomically):
 - `stage_root/<job_id>/stage_receipt.json` (self-describing JSON; schema below)
 - `stage_root/<job_id>/STAGE_READY` (empty sentinel file)
 
@@ -379,9 +414,15 @@ The stage receipt MUST be a self-describing JSON object:
   "job_id": "…",
   "run_id": "…",
   "attempt": 1,
-  "method": "rsync|git_snapshot",
+  "method": "rsync|git_snapshot|bundle",
   "source_tree_hash": "…",
   "excludes": ["…"],
+  "payload": {
+    "kind": "rsync_tree|bundle",
+    "path": "src/|source.tar.zst",
+    "sha256": "…",          // REQUIRED when kind="bundle" (sha256 of archive bytes)
+    "bytes": 987654321      // REQUIRED when kind="bundle"
+  },
   "files_total": 789,
   "bytes_total": 987654321,
   "bytes_sent": 123,
@@ -396,12 +437,14 @@ Before backend execution, the harness MUST:
 1. Refuse with stable error code `source_staging_incomplete` if `STAGE_READY` or `stage_receipt.json` is missing.
 2. Refuse with stable error code `stage_receipt_mismatch` if `stage_receipt.json.job_id/run_id/attempt` or `stage_receipt.json.source_tree_hash` do not match the job request (`job_id/run_id/attempt/source_tree_hash`).
 3. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
-4. Populate the job `src/` by atomically swapping a fully materialized tree:
-   - Recommended: stage to `jobs_root/<job_id>/src.tmp/` then rename to `src/`
+4. Materialize the job `src/` from the staged payload:
+   - If `method="rsync"`: copy from `stage_root/<job_id>/src/`
+   - If `method="bundle"`: verify `payload.sha256`, then extract `source.tar.zst` into `jobs_root/<job_id>/src.tmp/`
+   - Then atomically rename `src.tmp/` to `src/` (job workspace atomicity boundary)
 5. Apply the existing **read-only source** rule to the final `src/`.
 6. **Stage cleanup (Normative):**
    - After `src/` is populated (and any configured `verify_after_stage` check completes), the harness MUST remove
-     `stage_root/<job_id>/src/` (and any `src.tmp/`) to reclaim disk.
+     the staged payload (`src/` and/or `source.tar.zst`) to reclaim disk.
    - The harness MUST NOT delete `stage_root/<job_id>/stage_receipt.json` until it has copied it into the job workspace.
    - The harness SHOULD remove the entire `stage_root/<job_id>/` directory once the swap is complete.
 
@@ -480,7 +523,7 @@ The host MUST record the computed `cache_namespace` in `metrics.json` and `attes
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
-- The `hello` event MUST include `event_schema_version` (SemVer string) declaring the schema for all subsequent NDJSON events in the stream.
+- The `hello` event MUST include `event_schema_version` (SemVer string) and MUST equal `job_request.event_schema_version`.
 - The `hello` event MUST include `job_request_sha256` (echoed from the job request).
 - The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `result`, `spm`, `cache`) so audits/debugging can prove where execution happened.
 - Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
@@ -523,9 +566,9 @@ This enables streaming consumers to know the terminal outcome without waiting fo
 Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so the remote account cannot execute arbitrary commands. The harness MUST support `rch-xcode-worker --forced`, which:
 
 - Reads the requested verb from `SSH_ORIGINAL_COMMAND`
-- Allows ONLY `probe`, `run`, `cancel`, `status`, and optionally `cache_query` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
+- Allows ONLY `probe`, `run`, `cancel`, `status`, `gc`, and optionally `cache_query`/`prewarm` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
-- **Note:** `cancel` and `status` MUST be supported in `--forced` mode to enable cancellation + recovery without arbitrary remote commands
+- **Note:** `cancel`, `status`, and `gc` MUST be supported in `--forced` mode to enable cancellation, recovery, and garbage collection without arbitrary remote commands
 
 ---
 
@@ -566,6 +609,26 @@ test_repetition_mode = "retry_on_failure" # optional enum: "none"|"retry_on_fail
 - When present, these fields MUST be included in `effective_config.inputs`.
 - The harness MUST apply them to the selected backend deterministically and MUST record the final applied values in `effective_config.resolved.xcode_run`.
 - The lane MUST reject unknown keys under `xcode_run` (no free-form passthrough).
+
+### Reports (Recommended; Normative when present)
+
+Profiles MAY request derived reports intended for CI/agents:
+
+```toml
+[profiles.<name>.reports]
+junit = true
+test_summary = true
+sarif = false
+annotations = true
+```
+
+- Report toggles MUST be included in `effective_config.inputs` when present.
+- If a report toggle is `false`, the lane MUST NOT emit that report.
+- If a report toggle is `true` but inputs/results are unavailable, the lane MUST emit a warning error object
+  (code `report_unavailable`, retryable false) and continue when possible.
+- If `store != "host"` and `trust.posture = "untrusted"`, enabling any report that may contain raw messages
+  MUST require inline redaction (list `"inline_redaction"` in `job_request.required_features`) or refuse with
+  `untrusted_remote_storage_requires_redaction`.
 
 **Profile inheritance (Normative):**
 
@@ -633,6 +696,12 @@ include_value_fingerprints = true      # include hashed fingerprints of forwarde
 [profiles.ci.safety]
 allow_mutating = false                 # disallow implicit clean/archive
 code_signing_allowed = false           # CODE_SIGNING_ALLOWED=NO
+
+[profiles.ci.reports]
+junit = true
+test_summary = true
+sarif = false
+annotations = true
 
 [profiles.ci.determinism]
 allow_floating_destination = false     # default false; must be true to use os = "latest" in CI
@@ -786,6 +855,21 @@ When `trust.require_stable_capabilities_sha256 = true`:
 
 When capability freeze is enabled, the host SHOULD also include `job_request.selected_capabilities_sha256` so the harness can refuse if its current stable capabilities do not match the selection-time value (see Job Request schema).
 
+#### Reuse Safety Under Drift (Recommended; Normative when enabled)
+
+Profiles MAY require reuse candidates to match current worker capabilities:
+
+```toml
+[profiles.<name>.trust]
+reuse_require_same_capabilities_sha256 = true   # default: false
+```
+
+When enabled, `rch xcode reuse` MUST ignore succeeded attempts whose `attestation.json` records a different
+`capabilities_sha256` than the currently selected worker's probe (or than an explicitly pinned value, if present).
+
+This prevents reusing outputs produced under a different toolchain/harness version, which could lead to subtle
+inconsistencies in CI workflows.
+
 ### Optional Integrity Controls (Recommended for CI / remote storage)
 
 Profiles MAY enable an event hash chain for tamper-evident streaming verification:
@@ -817,6 +901,9 @@ When enabled, the harness MUST include hash chain fields in event output (see `e
 2. If `os` is `"latest"` and `allow_floating_destination` is false, reject with error.
 3. Using `probe.simulators.runtimes` + `probe.simulators.device_types`, resolve the destination spec to stable CoreSimulator IDs:
    - `runtime_id` and `device_type_id` (preferred), or refuse with stable errors if not resolvable.
+3a. If `destination.require_runtime_build = true`:
+   - The host MUST locate the selected runtime entry and, if it includes `build`, MUST include `runtime_build` in `effective_config.inputs.destination`.
+   - If the runtime entry has no `build`, the lane MUST refuse with stable error code `runtime_build_required`.
 4. If zero matches in the probe output, reject with error listing available runtimes.
 5. If multiple matches:
    - Default: reject with an error describing the duplicates and how to fix/disambiguate.
@@ -840,6 +927,8 @@ Under `[profiles.<name>.destination]`, the following fields MAY be used:
 - `on_multiple` — `"error"` (default) | `"select"`
 - `selector` — `"highest_udid"` | `"lowest_udid"` (future: more selectors)
 - `udid` — optional explicit simulator UDID (generally host/worker-specific; best for local-only profiles)
+- `require_runtime_build` — boolean (default false). When true, the host MUST pin `runtime_build` when available
+  in `probe.simulators.runtimes[]` and MUST refuse if the probe does not provide a build for the selected runtime.
 
 ### Worker Selection (Normative)
 
@@ -967,6 +1056,22 @@ where `JCS(effective_config.inputs)` is UTF-8 bytes and `source_tree_hash_hex` i
 Rationale: simple, deterministic, and implementation-portable. The domain prefix (`"rch-xcode-lane/run_id/v1\n"`) prevents accidental digest reuse with other hash computations. Separating inputs from resolved details ensures lane versioning and worker-local details (UDIDs, paths) do not affect run identity.
 
 **Note:** Changing the domain prefix or hash algorithm MUST bump `contract_version`.
+
+### Optional Hash Inputs Artifact (Recommended; Normative when enabled)
+
+Profiles MAY enable emission of canonical hash inputs to aid debugging and conformance testing:
+
+```toml
+[profiles.<name>.determinism]
+emit_hash_inputs = true   # default: false
+```
+
+When `emit_hash_inputs = true`, the host MUST write:
+- `hash_inputs/config_inputs.jcs` (UTF-8 bytes of JCS(effective_config.inputs))
+- `hash_inputs/source_entries.jcs` (UTF-8 bytes of JCS(source_manifest.entries))
+- `hash_inputs/hashes.json` (kind `"hashes"`) containing `config_hash`, `source_tree_hash`, `run_id` and domain prefixes used.
+
+This is especially valuable for cross-language implementations and for "golden fixtures" testing.
 
 ### `config_hash` (Recommended)
 
@@ -1246,6 +1351,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `harness_identity_mismatch` | Harness binary hash or codesign identity does not match expected pins | No |
 | `harness_pin_missing` | Profile requires harness identity pins but worker has none configured | No |
 | `invalid_worker_roots` | Worker reported invalid/non-absolute roots; cannot safely confine paths | No |
+| `worker_roots_mismatch` | Configured worker roots do not match probe-reported roots | No |
 | `capabilities_drift` | Worker capabilities_sha256 changed between selection and run | No |
 | `insufficient_disk_space` | Worker did not meet `min_disk_free_bytes` threshold | Yes |
 | `worker_degraded` | Worker reported degraded execution state | Yes |
@@ -1260,7 +1366,9 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `protocol_version_unsupported` | No common protocol version between host and harness | No |
 | `contract_version_unsupported` | Harness does not support requested contract_version | No |
 | `required_feature_unsupported` | Host required a harness feature that is unavailable | No |
+| `event_schema_unsupported` | No common event_schema_version between host and harness | No |
 | `runtime_not_found` | Requested simulator runtime not installed | No |
+| `runtime_build_required` | Profile requires runtime build pin but probe did not provide it | No |
 | `uncertain_classification` | Command could not be confidently classified | No |
 | `mutating_disallowed` | Mutating command refused by policy | No |
 | `floating_destination_disallowed` | Floating destination (os="latest") refused by policy | No |
@@ -1270,6 +1378,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `canceled` | Job was canceled by user | No |
 | `cancel_failed` | Cancel command executed but worker could not terminate the job | Yes |
 | `cancel_not_supported` | Worker/harness does not support cancel (disallowed in `--forced` deployments) | No |
+| `gc_not_supported` | Worker/harness does not support gc (disallowed in `--forced` deployments) | No |
 | `event_stream_corrupt` | Worker harness could not emit valid JSON event | No |
 | `job_request_sha256_missing` | job_request_sha256 missing/empty in job request | No |
 | `job_request_sha256_mismatch` | job_request_sha256 did not match recomputed digest | Yes |
@@ -1302,6 +1411,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `unsafe_symlink_target` | A symlink target is unsafe under allow_safe policy | No |
 | `hardlinks_disallowed` | Source tree contains hardlinks but policy forbids them | No |
 | `directory_artifact_remote_disallowed` | Directory artifact cannot be stored remotely without packing | No |
+| `report_unavailable` | Report was requested but inputs/results were unavailable | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -1563,6 +1673,11 @@ Artifacts are written under a per-job directory on the host, scoped by `repo_key
 ├── effective_config.json  # Fully-resolved config used for the job
 ├── attestation.json       # Toolchain + environment fingerprint
 ├── source_manifest.json   # Canonical file list + per-entry hashes used to compute source_tree_hash
+├── hash_inputs/           # Optional: canonical hash inputs + computed hashes (when emit_hash_inputs=true)
+│   ├── config_inputs.jcs
+│   ├── source_entries.jcs
+│   └── hashes.json
+├── dependency_fingerprint.json # Recommended when caching is enabled (lockfile-based deps fingerprint)
 ├── manifest.json          # Artifact index + SHA-256 hashes + byte sizes
 ├── decision.json          # Classification + routing decision record
 ├── policy.json            # Captured allowlist/policy bundle (required)
@@ -1652,11 +1767,26 @@ unless it implements **deterministic packing** (see below).
 - The packing algorithm MUST:
   - Sort entries lexicographically by UTF-8 byte order of their relative paths
   - Normalize paths to POSIX `/` separators
-  - Set uid/gid to 0 and omit uname/gname
-  - Set all mtimes to a constant (e.g., Unix epoch `0`)
+  - Use TAR **PAX** format (no GNU extensions) for long path support
+  - Set uid/gid to 0; set uname/gname empty
+  - Set devmajor/devminor to 0
+  - Set all mtimes to a constant epoch (`0`)
+  - Normalize modes: directories `0755`, regular files `0644` (unless an implementation explicitly opts to preserve modes; if so it MUST be consistent and documented)
   - Strip xattrs/ACLs and omit OS-specific metadata
-- When compression is applied (e.g., `.tar.zst`), the compressor settings MUST be deterministic and MUST be recorded in `manifest.json`
-  (`compression` plus an optional `compression_level` field).
+- When compression is applied (e.g., `.tar.zst`), the compressor settings MUST be deterministic (single-threaded) and MUST be recorded in `manifest.json`.
+
+**Packing metadata (Normative when packing is used):**
+`manifest.json` entries for packed directory artifacts MUST include a `packing` object:
+```jsonc
+"packing": {
+  "kind": "tar",
+  "version": "pax_fixed_v1",
+  "mtime_epoch": 0,
+  "uid": 0,
+  "gid": 0,
+  "mode_policy": "normalize_0755_0644"
+}
+```
 
 ### Export Bundles (Recommended; Normative when implemented)
 
@@ -1805,6 +1935,8 @@ For `backend.actual = "xcodebuildmcp"`:
 - `disk_usage_bytes` — Workspace disk usage at completion.
 - `cache_hit` — Object with `derived_data` (boolean) and `spm` (boolean) cache hit/miss status.
 - `cache_keys` — Object with `config_hash`, `derived_data_key`, `spm_key` (strings) when available.
+- `dependencies_fingerprint_sha256` — The computed deps fingerprint (when caching is enabled).
+- `cache_keys.spm_key` — When available: `SHA-256("rch-xcode-lane/spm_cache_key/v1\n" || cache_namespace || "\n" || xcode_build || "\n" || dependencies_fingerprint_sha256)`
 
 ### `events.ndjson` Requirements
 
@@ -2074,6 +2206,8 @@ This provides a one-command path for agents to understand worker selection, pinn
 - `run_id` (string) — The run_id that was queried.
 - `selected` (object|null): `{ job_id, attempt, path }` — The selected succeeded attempt, or null if none found.
 - `validated` (boolean) — true if validation was performed and passed.
+- `reuse_filtered` (object|null) — when filtering was applied (e.g., capabilities mismatch), include:
+  `{ "reason": "capabilities_sha256_mismatch", "expected": "...", "observed": "..." }`
 
 This enables agents to find and reuse existing succeeded runs without re-executing identical jobs.
 
@@ -2110,6 +2244,9 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
 - Verify `job_request.json.source_tree_hash` equals the recomputed `source_tree_hash` (and equals `stage_receipt.json.source_tree_hash`).
 - Recompute `run_id` as `SHA-256( "rch-xcode-lane/run_id/v1\n" || JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
+- If `hash_inputs/config_inputs.jcs` exists, verify it is byte-for-byte equal to the computed JCS(effective_config.inputs).
+- If `hash_inputs/source_entries.jcs` exists, verify it is byte-for-byte equal to the computed JCS(source_manifest.entries).
+- If `hash_inputs/hashes.json` exists, verify it matches recomputed `config_hash`, `source_tree_hash`, and `run_id`.
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
 - If hash chain fields are present, verify the chain (`prev_event_sha256`/`event_sha256`) and that `event_chain_head_sha256` matches the final non-`complete` event.
@@ -2144,7 +2281,24 @@ The `validate` command verifies artifact integrity and consistency for a complet
 | Cache | Key Components |
 |-------|----------------|
 | DerivedData | cache_namespace + config_hash |
-| SwiftPM | Xcode build + resolved dependencies hash (derived from lockfiles such as `Package.resolved`) (+ optional toolchain constraints) |
+| SwiftPM | cache_namespace + xcode.build + dependencies_fingerprint_sha256 |
+
+#### Dependencies Fingerprint (Normative)
+
+The lane MUST compute `dependencies_fingerprint_sha256` as:
+`SHA-256("rch-xcode-lane/deps_fingerprint/v1\n" || JCS(lockfiles))`
+where `lockfiles` is an array of `{ path, sha256 }` entries for recognized lockfiles present in the staged source,
+sorted by `path` (UTF-8 byte order). Recognized lockfiles SHOULD include:
+- `Package.resolved`
+- `Podfile.lock`
+- `Cartfile.resolved`
+
+If no recognized lockfiles exist, the lane MUST use an empty array (still produces a stable hash).
+
+**Artifact (Recommended; Normative when caching is enabled):**
+Emit `dependency_fingerprint.json` (kind `"dependency_fingerprint"`) including:
+- `dependencies_fingerprint_sha256`
+- `lockfiles[]` with `{ path, sha256 }` (no file contents)
 
 ### Cache Policy (Normative)
 
