@@ -106,6 +106,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode fetch <job_id>` | Pull remote artifacts (worker/object store), verify hashes, materialize locally |
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity |
 | `rch xcode watch <job_id>` | Stream structured events + follow logs for a running job |
+| `rch xcode status <job_id>` | Query best-effort remote status (queued/running/terminal) + latest sequence (supports resume) |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserves partial artifacts + terminal summary) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain worker selection + pinning + refusal reasons (human + `--json`) |
 | `rch xcode retry <job_id>` | Retry a failed job (increments attempt; keeps run_id if inputs/source unchanged) |
@@ -163,8 +164,10 @@ require_pinned_host_key = true
 ## Outputs
 
 Artifacts are written to:
-- Canonical per-attempt dir: `~/.local/share/rch/artifacts/jobs/<job_id>/`
-- Stable run index: `~/.local/share/rch/artifacts/runs/<run_id>/attempt-<n>/` (links/pointers to job dirs)
+- Canonical per-attempt dir (repo-scoped): `~/.local/share/rch/artifacts/repos/<repo_key>/jobs/<job_id>/`
+- Stable run index (repo-scoped): `~/.local/share/rch/artifacts/repos/<repo_key>/runs/<run_id>/attempt-<n>/` (links/pointers to job dirs)
+
+`repo_key` is a stable host-side namespace derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash. It is recorded in `attestation.json` and prevents cross-repo run index collisions.
 
 All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
 `summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.
@@ -193,7 +196,8 @@ streaming output to the run index. Deployments MAY also surface a `trace_id` for
 ├── backend_invocation.json# Structured backend invocation record (safe, no secret values)
 ├── build.log              # Captured harness stderr (human logs + backend output)
 ├── redaction_report.json  # Optional: what redaction/truncation was applied (no secret values)
-├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when compression enabled)
+├── result.xcresult/       # When tests are executed (or `result.xcresult.tar.zst` when xcresult_format="tar.zst")
+├── artifact_trees/        # Optional: canonical tree manifests for directory artifacts (e.g. result.xcresult/)
 └── provenance/            # Optional: signatures + verification report
 ```
 

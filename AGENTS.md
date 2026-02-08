@@ -47,7 +47,7 @@ If README.md conflicts with PLAN.md, PLAN.md wins.
 - Start from PLAN.md, not README.md
 - The job lifecycle is: created → staging → queued → running → collecting → uploading → terminal
 - All JSON artifacts use RFC 8785 (JCS) for canonicalization
-- `run_id = SHA-256(JCS(effective_config.inputs) || \n || source_tree_hash_hex)` — note: only `inputs` is hashed, not `resolved`
+- `run_id = SHA-256("rch-xcode-lane/run_id/v1\n" || JCS(effective_config.inputs) || "\n" || source_tree_hash_hex)` — note: only `inputs` is hashed, not `resolved`. All SHA-256 computations use domain prefixes to prevent digest reuse.
 - Worker communication should go through the harness protocol when available
 
 ## Current State

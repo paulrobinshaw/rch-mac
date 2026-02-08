@@ -24,6 +24,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Lane**: The Xcode-specific subsystem within RCH.
 - **Run ID**: Content-derived identifier (SHA-256 of canonical **config inputs** + source tree hash); identical inputs produce the same run ID.
 - **Job ID**: Unique identifier per execution attempt; never reused.
+- **Repo Key**: A stable *host-side* namespace used to segregate artifacts and (optionally) caches per repository/workspace. It MUST NOT be included in `effective_config.inputs` (so it does not affect `run_id`), but MUST be recorded in `attestation.json`. Derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash.
 - **Contract Version**: A stable semantic version of the *lane contract* that is included in `effective_config.inputs` (and therefore influences `run_id`). It MUST be bumped whenever the meaning of any hashed input changes (defaults, canonicalization, policy semantics, backend argument reconstruction), even if `lane_version` changes for other reasons.
 
 ---
@@ -35,7 +36,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 There are four distinct version streams:
 
 - **`protocol_version`**: Negotiated for host↔harness verbs (`probe`, `run`, `cancel`, etc.). Backward compatible changes MUST NOT change the meaning of existing fields.
-- **`contract_version`**: Required overlap; defines semantics of `effective_config.inputs` (hashed). Any semantic change to hashed inputs MUST bump `contract_version`.
+- **`contract_version`**: Required overlap; defines semantics of `effective_config.inputs` (hashed). Any semantic change to hashed inputs MUST bump `contract_version`. This includes changes to domain separation prefixes used in hash computations (`run_id`, `config_hash`, `source_tree_hash`, `capabilities_sha256`, event chain, etc.).
 - **`lane_version`**: Implementation/spec version. MAY change without changing `contract_version`.
 - **`schema_version`**: Per-artifact schema version. Validators MUST key off `kind` + `schema_version`.
 
@@ -104,7 +105,7 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
 **`capabilities_sha256` computation (Normative):**
 
 The harness MUST compute `capabilities_sha256` as:
-`capabilities_sha256 = SHA-256( JCS(stable_capabilities) )` (lowercase hex),
+`capabilities_sha256 = SHA-256( "rch-xcode-worker/capabilities_sha256/v1\n" || JCS(stable_capabilities) )` (lowercase hex),
 where `stable_capabilities` is an object containing ONLY stable fields:
 - `kind`, `schema_version`, `protocol_versions`, `contract_versions`
 - `harness_version`, `harness_binary_sha256`, `codesign`
@@ -118,7 +119,10 @@ Before applying JCS, the harness MUST normalize any set-like arrays inside `stab
 MUST bump `probe.schema_version`.
 - `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
 - `xcode` (object) — `path`, `version`, `build` (Xcode build number).
-- `simulators` (object) — Available runtimes + device types (or a summarized digest).
+- `simulators` (object) — Available runtimes + device types (Normative minimum):
+  - `runtimes` (array) — entries include `runtime_id`, `name`, `version`, optional `build`
+  - `device_types` (array) — entries include `device_type_id`, `name`
+  The probe MUST NOT be required to enumerate all *devices* / UDIDs.
 - `backends` (object) — `xcodebuildmcp` availability + version, `xcodebuild` availability.
 - `event_capabilities` (object) — Declares which event categories the harness can emit (e.g., phases/tests/diagnostics). Enables the host/agents to understand expected event richness.
 - `limits` (object) — `max_concurrent_jobs`, optional disk/space hints.
@@ -183,14 +187,27 @@ The harness MAY support an optional fifth verb:
    - MUST NOT mutate shared caches when `trust.posture` is `"untrusted"` (best-effort).
    - Enables reducing cold-start tax for CI and agent loops.
 
-The harness SHOULD support an optional sixth verb:
+The harness SHOULD support a sixth verb:
 
-6) `rch-xcode-worker status` (Optional; Recommended)
+6) `rch-xcode-worker status` (Optional; **REQUIRED for deployments using `rch-xcode-worker --forced`**)
    - Reads a single JSON object from stdin containing at minimum `job_id`.
-   - Emits a single JSON object describing best-effort job state (`running`, `queued`, `terminal`, `unknown`),
+   - Emits a single JSON object describing best-effort job state (`queued`, `running`, `terminal`, `unknown`),
      and the latest observed `events.sequence` written to disk (when available).
    - Enables watch/fetch resume after transport drops without arbitrary remote commands.
    - MUST NOT reveal paths outside configured roots.
+   - **REQUIRED for deployments using `rch-xcode-worker --forced`** so the host can recover from transport drops without arbitrary remote commands.
+
+**Status output schema (Normative):**
+
+The status verb MUST emit a single self-describing JSON object:
+- `kind` = `"status"`
+- `schema_version` (SemVer string)
+- `job_id`, `run_id`, `attempt`
+- `state` (string) — `queued` | `running` | `terminal` | `unknown`
+- `updated_at` (ISO 8601 string|null)
+- `latest_sequence` (integer|null) — last sequence written to durable `events.ndjson` (best-effort)
+- `lease_id` (string|null)
+- `hints` (array of strings) — human-safe hints (MUST NOT contain secrets)
 
 **Job request (stdin) MUST be a self-describing, versioned object and MUST include:**
 - `kind` (string) — MUST be `"job_request"`.
@@ -198,14 +215,16 @@ The harness SHOULD support an optional sixth verb:
 - `protocol_version` (string, e.g. `"1"`)
 - `job_id`, `run_id`, `attempt`
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
-- `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, destination UDID)
+- `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, resolved destination IDs).
+  The destination UDID MAY be omitted; when omitted, the harness MUST resolve/select/create an appropriate simulator device
+  according to `effective_config.inputs.simulator.*` and record the chosen UDID under `effective_config.resolved`.
 - `paths` (object). In `--forced` mode, the harness MUST ignore any host-supplied absolute paths and MUST derive paths from configured roots + `job_id` (see Path Confinement below).
   - `src`, `work`, `dd`, `result`, `spm`, `cache` MUST be representable (even if some are aliases of others depending on cache policy).
 
 **Job request (stdin) SHOULD include:**
 - `trace` (object) — correlation identifiers for cross-system log correlation:
   - `trace_id` (string) — stable ID for correlating host/harness/CI logs across attempts
-- `job_request_sha256` (string) — Lowercase hex SHA-256 of `JCS(job_request_without_digest)` computed by the host, where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed. The harness MUST echo this value in `hello` and `complete` so the host can detect any request corruption.
+- `job_request_sha256` (string) — Lowercase hex SHA-256 of `"rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest)` computed by the host, where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed. The harness MUST echo this value in `hello` and `complete` so the host can detect any request corruption.
 
 **Path Confinement (Normative):**
 - In `--forced` mode, the harness MUST compute `src/`, `work/`, `dd/` and related paths solely from (`jobs_root`, `stage_root`, `cache_root`) + `job_id` (and optional stable subpaths).
@@ -284,7 +303,7 @@ Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so 
 - Reads the requested verb from `SSH_ORIGINAL_COMMAND`
 - Allows ONLY `probe`, `run`, `cancel`, `status`, and optionally `cache_query` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
-- **Note:** `cancel` MUST be supported in `--forced` mode to enable clean cancellation without arbitrary remote commands
+- **Note:** `cancel` and `status` MUST be supported in `--forced` mode to enable cancellation + recovery without arbitrary remote commands
 
 ---
 
@@ -510,17 +529,24 @@ When enabled, the harness MUST include hash chain fields in event output (see `e
 
 ### Destination Resolution Algorithm
 
+**Host responsibilities (before job submission):**
+
 1. Read `destination.platform`, `destination.name`, `destination.os` from effective config.
    - If `destination.device_type_id` and/or `destination.runtime_id` are present, prefer them for matching (stable CoreSimulator identifiers).
    - Profiles MAY require CoreSimulator identifiers via `destination.require_core_ids = true` (recommended for CI).
 2. If `os` is `"latest"` and `allow_floating_destination` is false, reject with error.
-3. Query worker for available simulators matching the destination spec.
-4. If exactly one match, use its UDID for execution, but record it only under `effective_config.resolved.destination_udid`.
-5. If zero matches, reject with error listing available runtimes.
-6. If multiple matches:
+3. Using `probe.simulators.runtimes` + `probe.simulators.device_types`, resolve the destination spec to stable CoreSimulator IDs:
+   - `runtime_id` and `device_type_id` (preferred), or refuse with stable errors if not resolvable.
+4. If zero matches in the probe output, reject with error listing available runtimes.
+5. If multiple matches:
    - Default: reject with an error describing the duplicates and how to fix/disambiguate.
    - If `destination.on_multiple = "select"` is set, select using `destination.selector` (default selector: `"highest_udid"`), and emit a warning.
-7. Record device/runtime identifiers in `effective_config.inputs` and record resolved UDID in `effective_config.resolved`.
+6. Record `runtime_id` + `device_type_id` in `effective_config.inputs`.
+
+**Harness responsibilities (at run time):**
+
+7. The harness MUST select/create the actual simulator device (UDID) at run time based on `simulator.strategy` and the resolved `runtime_id`/`device_type_id`.
+8. The harness MUST record the chosen UDID under `effective_config.resolved.destination_udid` (and emit it in `hello.worker_paths` or equivalent).
 
 **CoreSimulator ID requirement (Recommended):**
 
@@ -652,15 +678,17 @@ If the meaning of this normalization changes (fields added/removed, sort order c
 Rationale: JCS does not normalize array order. Without semantic normalization, two semantically identical configs could produce different `run_id`s purely due to ordering, causing cache fragmentation.
 
 **`run_id` bytes:** The lane MUST compute:
-`run_id = SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )`
+`run_id = SHA-256( "rch-xcode-lane/run_id/v1\n" || JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )`
 where `JCS(effective_config.inputs)` is UTF-8 bytes and `source_tree_hash_hex` is the lowercase hex string (UTF-8).
 
-Rationale: simple, deterministic, and implementation-portable. Separating inputs from resolved details ensures lane versioning and worker-local details (UDIDs, paths) do not affect run identity.
+Rationale: simple, deterministic, and implementation-portable. The domain prefix (`"rch-xcode-lane/run_id/v1\n"`) prevents accidental digest reuse with other hash computations. Separating inputs from resolved details ensures lane versioning and worker-local details (UDIDs, paths) do not affect run identity.
+
+**Note:** Changing the domain prefix or hash algorithm MUST bump `contract_version`.
 
 ### `config_hash` (Recommended)
 
 For cache addressing and reporting, the lane SHOULD compute:
-`config_hash = SHA-256( JCS(effective_config.inputs) )` as lowercase hex.
+`config_hash = SHA-256( "rch-xcode-lane/config_hash/v1\n" || JCS(effective_config.inputs) )` as lowercase hex.
 
 This is distinct from `run_id` (which includes the source tree hash). The `config_hash` enables efficient cache sharing: jobs with identical configuration (toolchain, destination, scheme, build settings) but different source trees can share DerivedData caches.
 
@@ -696,6 +724,10 @@ The worker MUST execute jobs inside a dedicated per-job workspace root, e.g.:
 - `dd/` — DerivedData (or equivalent) root
 - `result/` — result bundle root (xcresult output lives under here)
 - `spm/` — cloned SourcePackages dir (when supported) or per-job package working dir
+
+**Atomic staging (Normative):**
+
+The harness MUST stage into a temporary directory (e.g., `src.tmp/`) and then atomically replace `src/` (rename swap), so readers never observe a partially-staged tree. If staging is interrupted, the harness MUST remove `src.tmp/` on next run.
 
 **Read-only source (Normative):**
 
@@ -744,7 +776,7 @@ allow = ["CI", "RCH_*"]     # Values forwarded if present (literal names or pref
   - SHOULD include only non-sensitive machine/tool identifiers (Xcode, macOS, runtimes).
   - MAY include allowlisted env variable names with values omitted or redacted.
 
-**Optional log redaction:**
+**Optional log + event redaction:**
 
 ```toml
 [profiles.ci.redaction]
@@ -752,7 +784,12 @@ enabled = true              # Default: false (for local debugging)
 patterns = ["ghp_*", "xox*-*"]  # Optional additional redaction patterns
 ```
 
-When `redaction.enabled = true`, the lane SHOULD redact known secret patterns from `build.log` before storage.
+When `redaction.enabled = true`, the lane SHOULD redact known secret patterns from:
+- `build.log`
+- `events.ndjson`
+- any derived text reports emitted by the lane (e.g., `junit.xml`, `sarif.json`, `annotations.json`) when those reports may embed raw messages
+
+Redaction MUST be applied before any hashing or upload operations.
 
 **Redaction reporting (Recommended):**
 
@@ -761,15 +798,19 @@ When redaction is enabled, the lane SHOULD emit `redaction_report.json` containi
 - `patterns` (array of strings) — Identifiers for patterns applied (no secret values)
 - `replacements` (integer) — Best-effort count of redactions performed
 - `log_truncated` (boolean) — Whether build.log was truncated
+- `events_truncated` (boolean) — Whether events.ndjson was truncated (if a truncation policy exists)
+- `targets` (array of strings) — Which artifacts were processed (e.g., `["build.log", "events.ndjson", "sarif.json"]`)
 
 This enables auditing that redaction policy was applied without exposing what was redacted.
 
 ### Artifact Sensitivity (Normative for remote storage)
 
-Artifacts MAY contain sensitive information (logs, crash dumps, test output).
+Artifacts MAY contain sensitive information (logs, crash dumps, test output, event messages).
 When `store = "object_store"` (or any non-host persistence), the lane MUST:
 
 - Apply configured redaction to `build.log` prior to upload
+- Apply configured redaction to `events.ndjson` prior to upload
+- Apply configured redaction to derived text reports (e.g., `junit.xml`, `sarif.json`, `annotations.json`) prior to upload
 - Avoid uploading `environment.json` values (only identifiers/redacted fields)
 - Never upload credentials; object store auth MUST remain on the host only
 
@@ -875,6 +916,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
 | `unsafe_symlink_target` | A symlink target is unsafe under allow_safe policy | No |
 | `hardlinks_disallowed` | Source tree contains hardlinks but policy forbids them | No |
+| `directory_artifact_remote_disallowed` | Directory artifact cannot be stored remotely without packing | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -1021,10 +1063,10 @@ Each entry in `entries` MUST be an object with:
 **Hash computation:**
 
 ```
-source_tree_hash = SHA-256( JCS(source_manifest.entries) )
+source_tree_hash = SHA-256( "rch-xcode-lane/source_tree_hash/v1\n" || JCS(source_manifest.entries) )
 ```
 
-Where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and the result is lowercase hex.
+Where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and the result is lowercase hex. The domain prefix prevents accidental digest reuse.
 
 **Normalization rules:**
 
@@ -1083,10 +1125,12 @@ For builds that require a verifiable chain of custody, the lane MAY emit a `prov
 
 ## Required Artifacts
 
-Artifacts are written under a per-job directory on the host. The directory is **append-only during execution**, except for `status.json`, which is updated in-place using atomic replacement. The host SHOULD also maintain a stable run index keyed by `run_id` for deduplication and agent/CI ergonomics.
+Artifacts are written under a per-job directory on the host, scoped by `repo_key`. The directory is **append-only during execution**, except for `status.json`, which is updated in-place using atomic replacement. The host SHOULD also maintain a stable run index keyed by `run_id` for deduplication and agent/CI ergonomics.
+
+`repo_key` is a stable host-side namespace derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash. It is recorded in `attestation.json` and prevents cross-repo run index collisions.
 
 ```
-~/.local/share/rch/artifacts/jobs/<job_id>/
+~/.local/share/rch/artifacts/repos/<repo_key>/jobs/<job_id>/
 ├── probe.json             # Captured worker harness probe output used for selection/verification
 ├── summary.json           # Machine-readable outcome + timings
 ├── job_request.json       # Exact JSON request sent to harness `run` (MUST NOT contain secret values)
@@ -1104,13 +1148,15 @@ Artifacts are written under a per-job directory on the host. The directory is **
 ├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
 ├── backend_invocation.json# Structured backend invocation record (safe; no secret values)
 ├── redaction_report.json  # Optional: redaction/truncation report (no secret values; emitted when redaction enabled)
-└── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when compression enabled)
+├── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when xcresult_format="tar.zst")
+├── artifact_trees/        # Optional: canonical tree manifests for directory artifacts (e.g. result.xcresult/)
+└── provenance/            # Optional: signatures + verification report
 ```
 
 ### Run Index (Recommended)
 
 The host SHOULD create:
-`~/.local/share/rch/artifacts/runs/<run_id>/attempt-<attempt>/`
+`~/.local/share/rch/artifacts/repos/<repo_key>/runs/<run_id>/attempt-<attempt>/`
 as a symlink or pointer to `jobs/<job_id>/` for that attempt.
 
 This enables:
@@ -1143,6 +1189,26 @@ Each manifest entry MAY include:
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
 - `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
 - `sensitivity` (string|null) — `"public"` | `"internal"` | `"sensitive"`. Recommended for policy-aware retention/upload decisions. Enables CI to decide what to upload/retain based on sensitivity classification.
+
+#### Directory / Tree Artifacts (Normative)
+
+Some artifacts are directories (e.g., `result.xcresult/`). For these, `manifest.json` MUST represent them with `artifact_type="tree"` and `sha256` MUST be a *tree hash* computed as:
+
+```
+tree_sha256 = SHA-256( "rch-xcode-lane/tree_hash/v1\n" || JCS(tree_entries) )
+```
+
+(lowercase hex), where `tree_entries` is an array of `{ path, bytes, sha256 }` for every file under the directory, with:
+- `path` normalized (POSIX `/`, relative to artifact root), sorted lexicographically by UTF-8 byte order
+- `sha256` = SHA-256(file bytes) for each file (lowercase hex)
+- `bytes` = file size
+
+Implementations SHOULD also emit an optional tree manifest:
+`artifact_trees/<logical_name>.tree.json` (kind `"artifact_tree"`) containing `tree_entries` and `tree_sha256` to aid portability and validation.
+
+**Remote storage + xcresult (Normative):**
+
+If `store != "host"`, profiles SHOULD set `xcresult_format = "tar.zst"`. If `xcresult_format = "directory"` and `store != "host"`, the lane MUST either (a) pack the directory deterministically prior to upload/fetch, or (b) refuse with a stable error code `directory_artifact_remote_disallowed`.
 
 ### Artifact Storage & Compression (Normative)
 
@@ -1243,6 +1309,7 @@ For `backend.actual = "xcodebuildmcp"`:
 - `duration_seconds` — staging phase duration
 
 **Optional fields:**
+- `atomic_swap` (boolean) — true if staging used a temp dir + atomic rename into `src/`
 - `tooling` — best-effort versions: `rsync`, `zstd` (when used)
 - `compression` — whether compression was used during transfer
 - `errors` — array of non-fatal staging errors/warnings
@@ -1292,7 +1359,7 @@ When `[profiles.<name>.integrity].event_hash_chain = true`:
 - Every non-`complete` event MUST include:
   - `prev_event_sha256` (string) — lowercase hex SHA-256 of the previous non-`complete` event's JSON line bytes
   - `event_sha256` (string) — lowercase hex SHA-256 of this event, computed as:
-    `SHA-256( prev_event_sha256 || "\n" || JCS(event_without_chain_fields) )`
+    `SHA-256( "rch-xcode-lane/event_chain/v1\n" || prev_event_sha256 || "\n" || JCS(event_without_chain_fields) )`
   - Where `event_without_chain_fields` is the full event object with `prev_event_sha256` and `event_sha256` removed.
 - The first event (`hello`) MUST use `prev_event_sha256` = 64 zero hex characters (`"0000...0000"`).
 - The terminal `complete` event MUST include `event_chain_head_sha256` equal to the last non-`complete` event's `event_sha256`.
@@ -1352,7 +1419,8 @@ This enables streaming consumers (e.g., `rch xcode watch`) to know when artifact
 
 **Optional stream digest (Recommended):**
 
-- The `complete` event MAY include `events_sha256` computed over the exact UTF-8 bytes of `events.ndjson` (excluding the `complete` event itself).
+- The `complete` event MAY include `events_sha256` computed as:
+  `SHA-256( "rch-xcode-lane/events_stream/v1\n" || <exact UTF-8 bytes of events.ndjson excluding the complete line> )`
 - When present, `summary.json` SHOULD copy the same `events_sha256` for easy validation.
 
 Consumers MUST tolerate unknown event types (forward compatibility).
@@ -1458,6 +1526,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode fetch <job_id>` | Pull artifacts (if stored remotely) |
 | `rch xcode validate <job_id\|path>` | Verify artifacts: schema validation + manifest hashes + event stream integrity (+ provenance if enabled) |
 | `rch xcode watch <job_id>` | Stream events + follow logs for a running job |
+| `rch xcode status <job_id>` | Query best-effort remote status (queued/running/terminal) + latest sequence (supports resume) |
 | `rch xcode cancel <job_id>` | Best-effort cancel (preserve partial artifacts) |
 | `rch xcode explain <job_id\|run_id\|path>` | Explain selection/verification/refusal decisions (human + `--json`) |
 | `rch xcode retry <job_id>` | Retry a failed job with incremented attempt (preserves run_id when unchanged) |
@@ -1527,11 +1596,11 @@ The `validate` command verifies artifact integrity and consistency for a complet
 - All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
 - `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
 - `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
-- If `job_request_sha256` is present in `hello`/`complete` events, recompute and verify it matches `SHA-256(JCS(job_request_without_digest))`.
+- If `job_request_sha256` is present in `hello`/`complete` events, recompute and verify it matches `SHA-256("rch-xcode-lane/job_request_sha256/v1\n" || JCS(job_request_without_digest))`.
 - `probe.json` parses successfully and includes required fields (`kind`, `schema_version`, `protocol_versions`, `harness_version`, `lane_version`, `roots`, `backends`, `verbs`).
 - JSON artifacts validate against their schemas (when schemas are available).
 - Recompute `source_tree_hash` from `source_manifest.entries` using the Normative rules and verify it matches `attestation.json.source.source_tree_hash`.
-- Recompute `run_id` as `SHA-256( JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
+- Recompute `run_id` as `SHA-256( "rch-xcode-lane/run_id/v1\n" || JCS(effective_config.inputs) || "\n" || source_tree_hash_hex )` and verify it matches `summary.json.run_id` (and the `run_id` echoed in `events.ndjson`).
 - `events.ndjson` parses as valid NDJSON, has contiguous `sequence` (no gaps), and ends with a terminal `complete` event.
 - If `events_sha256` is present in the `complete` event, recompute and verify it matches.
 - If hash chain fields are present, verify the chain (`prev_event_sha256`/`event_sha256`) and that `event_chain_head_sha256` matches the final non-`complete` event.
@@ -1543,6 +1612,8 @@ The `validate` command verifies artifact integrity and consistency for a complet
 
 - Provenance signatures verify against `verify.json` public key.
 - `source_manifest.json` entries hash to the recorded `source_tree_hash`.
+- For directory artifacts (e.g., `result.xcresult/`), verify the tree hash matches the `manifest.json` entry using the normative tree hash algorithm.
+- If `artifact_trees/<name>.tree.json` exists, verify its `tree_sha256` matches the manifest entry and the tree entries are consistent.
 
 **Exit codes:**
 
@@ -1802,12 +1873,14 @@ To prevent contract drift between host and harness:
 To prevent cross-language JCS/run_id drift, the repo SHOULD include `fixtures/hashing/` with:
 - `inputs.json` — sample `effective_config.inputs`
 - `inputs.jcs` — expected canonical bytes after JCS
-- `config_hash.sha256` — expected lowercase hex SHA-256 of `inputs.jcs`
+- `config_hash.sha256` — expected lowercase hex SHA-256 of `"rch-xcode-lane/config_hash/v1\n" || inputs.jcs`
 - `source_manifest.entries.json` — sample entries array
-- `source_tree_hash.sha256` — expected lowercase hex hash
-- `run_id.sha256` — expected lowercase hex run_id
+- `source_tree_hash.sha256` — expected lowercase hex hash with domain prefix `"rch-xcode-lane/source_tree_hash/v1\n"`
+- `run_id.sha256` — expected lowercase hex run_id with domain prefix `"rch-xcode-lane/run_id/v1\n"`
+- `tree_entries.json` — sample tree entries for directory artifact
+- `tree_hash.sha256` — expected lowercase hex hash with domain prefix `"rch-xcode-lane/tree_hash/v1\n"`
 
-CI SHOULD recompute and assert exact matches to catch canonicalization drift (Unicode normalization, integer/float encoding, array ordering).
+CI SHOULD recompute and assert exact matches to catch canonicalization drift (Unicode normalization, integer/float encoding, array ordering) and domain prefix changes.
 
 ---
 
