@@ -19,6 +19,9 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 
 - **Host**: Machine running `rch` client + daemon.
 - **Worker**: macOS machine running jobs over SSH.
+- **Control Plane**: Host↔harness verbs (`probe`, `run`, `status`, `cancel`, …) over SSH (run key). Stdout is NDJSON events.
+- **Data Plane**: Staging + artifact fetch using confined keys (stage/fetch) and rsync-like tooling; not allowed to execute arbitrary commands.
+- **Storage Plane**: Optional persistence outside the host (worker retention or object store) addressed by `manifest.json` URIs.
 - **Stage Root**: A worker-confined root (`probe.roots.stage_root`) where the host can upload a source snapshot using a restricted stage key.
 - **Job**: One remote build/test execution with stable, addressable artifacts.
 - **Profile**: Named configuration block (e.g., `ci`, `local`, `release`).
@@ -47,7 +50,10 @@ There are four distinct version streams:
 
 - Host MUST select the **highest** common `protocol_version` from the intersection of host-supported and harness-advertised versions.
 - Host MUST refuse if the job's `effective_config.inputs.contract_version` is not present in the harness `contract_versions`. Error code: `contract_version_unsupported`.
+- If both host and harness implement contract digests (host has a known digest for the selected version and harness provides
+  a matching `contracts[]` entry), the host MUST refuse on mismatch with stable error code `contract_digest_mismatch`.
 - Host MUST record the selected `protocol_version` and enforced `contract_version` in `attestation.json`.
+  When available, the host MUST also record `contract_sha256` for the selected contract version.
 
 ### Deprecation Policy
 
@@ -105,6 +111,11 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
 - `schema_version` (SemVer string) — Schema version for the probe payload (e.g., `"1.0.0"`).
 - `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
 - `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
+- `contracts` (array of objects|null) — Optional digests to prevent semantic drift under the same version label:
+  - Each entry: `{ "contract_version": "…", "contract_sha256": "…" }`
+  - `contract_sha256` MUST be lowercase hex SHA-256 of:
+    `UTF8("rch-xcode-lane/contract_digest/v1\n" + contract_version + "\n" + <canonical_contract_id> + "\n")`
+    where `<canonical_contract_id>` is an implementation-defined stable identifier (e.g., a bundled contract text hash).
 - `harness_version` (SemVer string) — Version of the `rch-xcode-worker` harness.
 - `harness_binary_sha256` (string) — Lowercase hex SHA-256 of the harness executable bytes (or signed package payload).
 - `codesign` (object|null) — Best-effort code signing identity info when available:
@@ -119,6 +130,8 @@ The probe JSON MUST be a self-describing, versioned object and MUST include at m
   - `cache_query` (boolean) — Whether the optional cache query verb is supported (see Cache Query verb below).
   - `cache_namespace` (boolean) — Whether the harness supports explicit cache namespaces supplied by the host.
   - `inline_redaction` (boolean) — Whether the harness can apply configured redaction inline to stdout/stderr and durable artifacts (`events.ndjson`, `build.log`) before integrity hashing.
+  - `job_request_signature` (boolean) — Whether the harness can verify a host signature over `job_request_sha256` (mutual auth).
+  - `network_policy` (boolean) — Whether the harness can enforce a structured egress policy for the backend process group.
 - `capabilities_sha256` (string) — Lowercase hex SHA-256 of **stable** capability fields (MUST exclude `load` and `health`). Enables capability drift detection.
 
 **`capabilities_sha256` computation (Normative):**
@@ -259,6 +272,16 @@ The status verb MUST emit a single self-describing JSON object:
   where `job_request_without_digest` is the full job request object with the `job_request_sha256` field removed.
   **Harness verification (Normative):** The harness MUST recompute this digest and MUST refuse before execution with
   stable error code `job_request_sha256_mismatch` if it differs. If missing/empty, refuse with `job_request_sha256_missing`.
+- `job_request_signature` (object|null) — Optional host signature over `job_request_sha256`:
+  - `algorithm` (string) — MUST be `"ed25519"` (initial version).
+  - `key_id` (string) — Identifier for the host signing key (used for audit + key lookup).
+  - `signature_base64` (string) — Base64 of Ed25519 signature over:
+    `UTF8("rch-xcode-lane/job_request_signature/v1\n" + job_request_sha256 + "\n")`
+  **Verification (Normative when required):**
+  - If `job_request.required_features` includes `"job_request_signature"`, this field MUST be present.
+  - The harness MUST verify the signature using an operator-configured trusted public key for `key_id`.
+  - On missing signature: fail with stable error code `job_request_signature_missing`.
+  - On invalid or untrusted `key_id`: fail with stable error code `job_request_signature_invalid`.
 - `source_tree_hash` (string) — Lowercase hex hash of the staged source snapshot (`source_manifest.entries` hash). Used for staging verification and (optionally) for recomputing/validating `run_id`.
 - `config_inputs` (object) — exact copy of `effective_config.inputs`
 - `config_resolved` (object) — execution-time resolved fields required to run (e.g., xcode path, resolved destination IDs).
@@ -376,6 +399,11 @@ Before backend execution, the harness MUST:
 4. Populate the job `src/` by atomically swapping a fully materialized tree:
    - Recommended: stage to `jobs_root/<job_id>/src.tmp/` then rename to `src/`
 5. Apply the existing **read-only source** rule to the final `src/`.
+6. **Stage cleanup (Normative):**
+   - After `src/` is populated (and any configured `verify_after_stage` check completes), the harness MUST remove
+     `stage_root/<job_id>/src/` (and any `src.tmp/`) to reclaim disk.
+   - The harness MUST NOT delete `stage_root/<job_id>/stage_receipt.json` until it has copied it into the job workspace.
+   - The harness SHOULD remove the entire `stage_root/<job_id>/` directory once the swap is complete.
 
 If `[profiles.<name>.source].verify_after_stage = true`, the harness MUST emit `stage_verification.json`
 recording expected vs observed hashes and fail with `source_hash_mismatch` when they differ.
@@ -392,6 +420,29 @@ The harness MUST:
 2. Refuse before execution with stable error code `required_feature_unsupported` on any missing feature
 
 This prevents "silent downgrade" when new safety knobs are introduced. Without this, an older harness might silently ignore a new enforcement field (e.g., `sandbox.network = deny_all` or `redaction.enabled = true` requiring `features.inline_redaction`), causing the job to run unsafely or leak secrets.
+
+---
+
+## Optional Control-Plane Mutual Authentication (Recommended)
+
+In addition to SSH host-key verification (authenticating the **worker**), deployments MAY require the harness to
+authenticate the **host** by verifying `job_request_signature`. This provides defense-in-depth: a leaked run key
+alone cannot execute jobs without the signing key.
+
+### Profile knob (Normative when enabled)
+
+Profiles MAY require signed job requests:
+
+```toml
+[profiles.ci.trust]
+require_signed_job_requests = true
+```
+
+When `require_signed_job_requests = true`:
+- The host MUST include `job_request_signature` and MUST list `"job_request_signature"` in `job_request.required_features`.
+- If the harness probe does not advertise `features.job_request_signature = true`, the lane MUST refuse with `required_feature_unsupported`.
+
+This is especially valuable for CI environments where SSH key hygiene may be weaker, or for deployments requiring audit trails with cryptographic proof of job authorization.
 
 ---
 
@@ -970,6 +1021,8 @@ If backend execution modifies `src/` (detected via an optional post-run hash che
 The lane MUST provide a garbage-collection mechanism:
 - `rch xcode gc` cleans host job dirs and worker job workspaces according to retention policy.
 - Default retention SHOULD be time-based (e.g., keep last N days) and SHOULD be configurable.
+- `rch xcode gc` MUST also clean stale `stage_root/<job_id>/` directories on the worker (time-based), since staging can
+  fail before a job ever reaches `jobs_root/<job_id>/`.
 
 ---
 
@@ -1063,6 +1116,31 @@ When redaction is enabled, the lane SHOULD emit `redaction_report.json` containi
 - `targets` (array of strings) — Which artifacts were processed (e.g., `["build.log", "events.ndjson", "sarif.json"]`)
 
 This enables auditing that redaction policy was applied without exposing what was redacted.
+
+---
+
+## Network Policy (Recommended; Normative when present)
+
+Profiles MAY define a structured network policy for the backend process group.
+This is intended to reduce exfiltration risk and improve determinism (fewer accidental remote dependencies).
+
+```toml
+[profiles.ci.network]
+mode = "allow_all"         # "allow_all" | "deny_all" | "allowlist"
+allow = ["github.com:443"] # required when mode="allowlist" (host:port entries; exact match)
+```
+
+**Rules (Normative):**
+- When present, `network.*` MUST be included in `effective_config.inputs`.
+- If `network.mode != "allow_all"`, the host MUST include `"network_policy"` in `job_request.required_features`.
+- If the harness cannot apply the requested policy, it MUST fail before backend execution with stable error code
+  `network_policy_apply_failed` (retryable: true).
+- The harness SHOULD emit a `network_policy.json` artifact (kind `"network_policy"`) describing the effective policy applied
+  without revealing secrets.
+
+**Implementation note:** The mechanism for enforcing network policy (pf rules, VM boundary, NEFilter, etc.) is implementation-defined. The contract specifies semantics + audit artifact + feature gate only.
+
+---
 
 ### Artifact Sensitivity (Normative for remote storage)
 
@@ -1215,6 +1293,11 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `memory_quota_exceeded` | Backend exceeded configured peak memory cap | No |
 | `untrusted_remote_storage_requires_redaction` | Untrusted posture requires redaction for remote artifact storage | No |
 | `object_store_encryption_required` | Remote storage requires explicit encryption policy (untrusted posture disallows none) | No |
+| `sensitive_artifact_unencrypted` | Sensitive artifact would be uploaded without encryption | No |
+| `contract_digest_mismatch` | Contract digest mismatch for the selected contract_version | No |
+| `job_request_signature_missing` | Signed job requests required but signature missing | No |
+| `job_request_signature_invalid` | Signature invalid or `key_id` not trusted by harness | No |
+| `network_policy_apply_failed` | Harness could not apply the configured network egress policy | Yes |
 | `symlinks_disallowed` | Source tree contains symlinks but policy forbids them | No |
 | `unsafe_symlink_target` | A symlink target is unsafe under allow_safe policy | No |
 | `hardlinks_disallowed` | Source tree contains hardlinks but policy forbids them | No |
@@ -1494,6 +1577,7 @@ Artifacts are written under a per-job directory on the host, scoped by `repo_key
 ├── build.log              # Captured harness stderr (human logs + backend output). Stdout is reserved for NDJSON events.
 ├── backend_invocation.json# Structured backend invocation record (safe; no secret values)
 ├── redaction_report.json  # Optional: redaction/truncation report (no secret values; emitted when redaction enabled)
+├── network_policy.json    # Optional: effective network egress policy (emitted when network policy is configured)
 ├── result.xcresult/       # When tests run and xcresult is produced (or result.xcresult.tar.zst when xcresult_format="tar.zst")
 ├── artifact_trees/        # Optional: canonical tree manifests for directory artifacts (e.g. result.xcresult/)
 └── provenance/            # Optional: signatures + verification report
@@ -1535,7 +1619,11 @@ Each manifest entry MAY include:
 - `compression` (string) — `"none"` | `"zstd"` (compression applied to the stored artifact).
 - `compression_level` (integer|null) — Optional: numeric level used when `compression != "none"` (recording improves reproducibility + CAS effectiveness).
 - `logical_name` (string|null) — Stable name for the logical artifact (e.g. `"result.xcresult"` even if stored as `result.xcresult.tar.zst`).
-- `sensitivity` (string|null) — `"public"` | `"internal"` | `"sensitive"`. Recommended for policy-aware retention/upload decisions. Enables CI to decide what to upload/retain based on sensitivity classification.
+- `sensitivity` (string|null) — `"public"` | `"internal"` | `"sensitive"`.
+  **Normative policy:**
+  - If `store != "host"` (i.e., artifacts may persist outside the host), `sensitivity` MUST be present for all entries.
+  - If `sensitivity` is absent, consumers (uploaders/exporters) MUST treat the artifact as `"sensitive"` by default.
+  - Profiles MAY define a default mapping (implementation-defined) but MUST record final values in `manifest.json`.
 
 #### Directory / Tree Artifacts (Normative)
 
@@ -1570,6 +1658,15 @@ unless it implements **deterministic packing** (see below).
 - When compression is applied (e.g., `.tar.zst`), the compressor settings MUST be deterministic and MUST be recorded in `manifest.json`
   (`compression` plus an optional `compression_level` field).
 
+### Export Bundles (Recommended; Normative when implemented)
+
+`rch xcode export` SHOULD use the same deterministic packing rules as directory-artifact packing:
+- Pack the job directory (excluding ephemeral temp files) into a byte-stable archive.
+- Include `manifest.json` and (if present) `provenance/` signatures.
+- Consumers SHOULD be able to `rch xcode import` then run `rch xcode validate` without additional context.
+
+This enables agents to **ship a failure** as a single deterministic bundle that another machine can import and immediately run `validate` + `explain`.
+
 ### Artifact Storage & Compression (Normative)
 
 Artifact storage and compression are controlled via `[profiles.<name>.artifacts]`.
@@ -1596,6 +1693,8 @@ kms_key_id = "..."             # optional when supported
 **Object-store encryption enforcement (Normative):**
 - If `store = "object_store"`, the profile MUST specify `artifacts.object_store.encryption`.
 - If `trust.posture = "untrusted"` and `encryption = "none"`, the lane MUST refuse with error code `object_store_encryption_required`.
+- If any artifact has `sensitivity="sensitive"` and `encryption="none"`, the lane SHOULD refuse (recommended) or MUST emit
+  a warning error object with code `sensitive_artifact_unencrypted` (implementation choice; MUST be documented).
 
 #### Compression Options
 
@@ -1912,6 +2011,8 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 | `rch xcode reuse <run_id>` | Locate a succeeded attempt for run_id and return its artifact pointer (optionally validates) |
 | `rch xcode gc` | Garbage-collect old runs + worker workspaces |
 | `rch xcode warm [--profile <name>]` | Ask workers to prewarm simulator runtimes/caches for a profile |
+| `rch xcode export <job_id>` | Deterministically pack a job directory (manifest-driven) for sharing |
+| `rch xcode import <path>` | Import a packed job bundle into local artifacts store + run index |
 
 **Machine-readable CLI output (Normative):**
 
@@ -2320,6 +2421,8 @@ CI SHOULD recompute and assert exact matches to catch canonicalization drift (Un
 | Symlinks in source | `forbid` (untrusted) / `allow_safe` (trusted) | `[profiles.<name>.source] symlinks = "allow_all"` |
 | Post-run source verification | Disabled | `[profiles.<name>.source] verify_after_run = true` |
 | Worker selection | `least_busy` | `[profiles.<name>.worker] selection = "warm_cache"` |
+| Signed job requests | Disabled | `[profiles.<name>.trust] require_signed_job_requests = true` |
+| Network egress policy | `allow_all` | `[profiles.<name>.network] mode = "deny_all"` or `"allowlist"` |
 
 ---
 

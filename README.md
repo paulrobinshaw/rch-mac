@@ -29,6 +29,11 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 └──────────────┘                                   └───────────────────┘
 ```
 
+**Planes (mental model):**
+- **Control plane:** `probe/run/status/cancel/...` over SSH using the **run key**. Stdout is **NDJSON events** only.
+- **Data plane:** Bulk transfer (staging + fetch) using restricted **stage/fetch keys** (rsync/rrsync).
+- **Storage plane (optional):** Object-store persistence addressed by `manifest.json` URIs (upload/download after hashing + redaction).
+
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, supported `verbs`, stable `capabilities_sha256`, Xcode, runtimes, backends).
 2. **Snapshot + stage source** to the worker (rsync working tree, or git snapshot depending on profile policy).
    - Staging writes into `stage_root/<job_id>/` using the restricted **stage key** and finishes by writing
@@ -121,6 +126,8 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 | `rch xcode reuse <run_id>` | Reuse an existing succeeded attempt for a run_id (optionally validates first) |
 | `rch xcode gc` | Garbage-collect old job dirs + worker workspaces (retention policy) |
 | `rch xcode warm [--profile <name>]` | Ask workers to prewarm simulator runtimes/caches for a profile |
+| `rch xcode export <job_id>` | Create a deterministic bundle (e.g., `.tar.zst`) of a job directory for sharing |
+| `rch xcode import <path>` | Import a bundle into the local artifacts store and run index (optionally validates) |
 
 Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 
@@ -142,6 +149,8 @@ Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 - **Separate data-plane keys** (stage write-only to `stage_root/`, fetch read-only from `jobs_root/`).
 - **Pinned SSH host key** (CI profiles SHOULD require this).
 - **Harness identity pinning** (binary hash and/or codesign requirement) for supply-chain integrity.
+- **Optional: signed job requests** (mutual auth): Require the harness to verify a host signature over `job_request_sha256`
+  so a leaked run key cannot execute jobs without the signing key (see `PLAN.md` § Optional Control-Plane Mutual Authentication).
 - **Untrusted posture** for fork PRs: signing off, stricter simulator hygiene, no cache writes, redaction for remote storage.
 - **Absolute worker roots** (avoid `~` and shell expansion; see PLAN.md `roots` requirements).
 - `rch xcode validate` in CI to enforce schema + manifest + event-stream integrity.
