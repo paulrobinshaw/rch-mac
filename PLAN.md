@@ -149,9 +149,15 @@ where `stable_capabilities` is an object containing ONLY stable fields:
 
 and MUST exclude volatile fields such as `load` and `health`.
 
-Before applying JCS, the harness MUST normalize any set-like arrays inside `stable_capabilities`
-(remove duplicates, sort lexicographically by UTF-8 byte order). If these rules change, the harness
-MUST bump `probe.schema_version`.
+**Array canonicalization rules (Normative):**
+- Arrays that represent **sets** MUST be de-duplicated and sorted lexicographically by UTF-8 byte order.
+  At minimum, the following are sets and MUST be normalized:
+  - `protocol_versions`, `contract_versions`
+  - `verbs`, `event_schema_versions`
+- Arrays of **objects** MUST have a deterministic order by a stable key:
+  - `simulators.runtimes` MUST be sorted by `runtime_id` (UTF-8 byte order).
+  - `simulators.device_types` MUST be sorted by `device_type_id` (UTF-8 byte order).
+- If these canonicalization rules change, the harness MUST bump `probe.schema_version`.
 - `worker` (object) — Stable identifiers: `hostname`, optional `machine_id`.
 - `xcode` (object) — `path`, `version`, `build` (Xcode build number).
 - `simulators` (object) — Available runtimes + device types (Normative minimum):
@@ -196,6 +202,17 @@ The host MUST also ensure the job's `effective_config.inputs.contract_version` i
    - Reads exactly one JSON object (the job request) from stdin.
    - Emits NDJSON events to stdout (one JSON object per line).
    - Exits after emitting a terminal `complete` event.
+   - **Exit code contract (Normative):**
+     - If the harness successfully emits a terminal `complete` event, it MUST exit `0`
+       regardless of build/test outcome.
+     - The backend outcome MUST be expressed via `complete.state`, `complete.error_code`,
+       and `complete.exit_code`.
+     - A non-zero harness process exit code indicates a **protocol-level failure**
+       (e.g., could not parse the job request, could not emit valid NDJSON, or crashed)
+       and implies the stream may be incomplete.
+     - On non-zero harness exit, the host MUST treat the job as failed with
+       `error_code="event_stream_corrupt"` unless a subsequent durable `events.ndjson`
+       (or `status`) proves a valid terminal `complete` exists.
 
 The harness SHOULD support a third verb:
 
@@ -217,11 +234,12 @@ The harness MAY support an optional fourth verb:
 4) `rch-xcode-worker cache_query` (Optional; Recommended)
    - Reads a single JSON object from stdin containing at minimum:
      - `protocol_version`
-     - `config_hash` (lowercase hex SHA-256 of `"rch-xcode-lane/config_hash/v1\n" || JCS(effective_config.inputs)`)
-     - `kinds` (array of strings) — e.g. `["derived_data","spm"]`
+     - `cache_keys` (object) — exact cache keys the host wants to query:
+       - `derived_data_key` (string|null) — full cache key for DerivedData (see Cache Buckets)
+       - `spm_key` (string|null) — full cache key for SPM (see Cache Buckets)
      - `cache_namespace` (string) — REQUIRED when `features.cache_namespace=true`
    - Emits a single JSON object to stdout and exits 0 on success:
-     - `config_hash`
+     - `cache_keys` (object) — echoed keys
      - `cache_namespace` (string) — effective cache namespace/trust boundary
      - `namespace` (string) — DEPRECATED alias for `cache_namespace` (for backward compatibility)
      - `derived_data` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
@@ -398,8 +416,14 @@ After uploading the payload, the host MUST write (atomically):
 - `stage_root/<job_id>/STAGE_READY` (empty sentinel file)
 
 **Atomic write rule (Normative):**
-- The host MUST write `stage_receipt.json` via `stage_receipt.json.tmp` + atomic rename.
-- The host MUST create `STAGE_READY` via `STAGE_READY.tmp` + atomic rename (empty file).
+- `STAGE_READY` is the sole authoritative "stage complete" signal. The host MUST create
+  `STAGE_READY` **last**, and MUST do so atomically (e.g., via a temp upload + rename
+  behavior provided by the transport, or via `STAGE_READY.tmp` + atomic rename).
+- The host MUST ensure `stage_receipt.json` is either **absent** or a **fully-written,
+  valid JSON document** at all times.
+  - Implementations SHOULD use temp+rename when the transport supports it.
+  - Transports that already provide atomic file replacement (e.g., rsync default temp+rename)
+    MAY write `stage_receipt.json` directly.
 
 The harness MUST treat staging as complete **only** when `STAGE_READY` exists.
 
@@ -435,6 +459,7 @@ The stage receipt MUST be a self-describing JSON object:
 
 Before backend execution, the harness MUST:
 1. Refuse with stable error code `source_staging_incomplete` if `STAGE_READY` or `stage_receipt.json` is missing.
+1a. Refuse with stable error code `stage_receipt_invalid` if `stage_receipt.json` exists but is not valid JSON (partial/corrupt upload).
 2. Refuse with stable error code `stage_receipt_mismatch` if `stage_receipt.json.job_id/run_id/attempt` or `stage_receipt.json.source_tree_hash` do not match the job request (`job_id/run_id/attempt/source_tree_hash`).
 3. Copy `stage_receipt.json` into the job workspace as `stage_receipt.json` for audit.
 4. Materialize the job `src/` from the staged payload:
@@ -543,6 +568,13 @@ The terminal `complete` event MUST include:
 - `event_chain_head_sha256` (string|null) — when hash chain enabled, the `event_sha256` of the last non-`complete` event
 - `artifact_summary` (object) — small summary, e.g. `{ "xcresult": true, "xcresult_format": "directory|tar.zst" }`
 - `job_request_sha256` (string) — Echoed from `hello` / job request.
+
+**State↔error_code mapping (Normative):**
+- If `state="timed_out"`, `error_code` MUST be `"timeout"`.
+- If `state="canceled"`, `error_code` MUST be `"canceled"`.
+- If `state="succeeded"`, `error_code` MUST be `null`.
+- If `state="failed"`, `error_code` MUST be non-null (a stable code from the Error Model) unless the failure is purely represented by
+  `exit_code` and the implementation explicitly documents a `null` error_code policy (not recommended).
 
 This enables streaming consumers to know the terminal outcome without waiting for artifact assembly.
 
@@ -722,6 +754,7 @@ max_artifact_bytes  = 10_000_000_000   # total collected artifacts cap; enforced
 max_log_bytes       = 200_000_000      # build.log cap; truncate with marker (see Quota Enforcement)
 max_events_bytes    = 50_000_000       # events.ndjson cap; on exceed: fail with complete + error_code
 max_event_line_bytes = 1_000_000       # per-event JSON line cap; on exceed: fail with complete + error_code
+max_complete_line_bytes = 128_000      # cap for terminal complete event line (recommended)
 max_cpu_seconds     = 7200             # optional: cumulative CPU seconds cap for backend process group
 max_memory_bytes    = 8_000_000_000    # optional: peak RSS cap for backend process group (best-effort)
 
@@ -754,6 +787,9 @@ When `limits.*` are configured, the harness/host MUST enforce them deterministic
 **`max_log_bytes`:**
 - When exceeded, `build.log` MUST be truncated with an explicit marker and `redaction_report.json` MUST record `log_truncated=true`.
 - The job MAY still succeed; `summary.json.errors[]` SHOULD include a non-fatal error object with code `log_truncated`.
+- Truncation MUST preserve UTF-8 validity:
+  - Implementations MUST truncate only on a UTF-8 codepoint boundary, then append a final newline-terminated marker line
+    (e.g., `[RCH_XCODE_LANE] build.log truncated (max_log_bytes exceeded)`).
 
 **`source.max_bytes` / `source.max_file_bytes`:**
 - The host MUST compute source snapshot size from `source_manifest.entries` (sum of `bytes`, and max per-entry `bytes`) before staging begins.
@@ -942,7 +978,11 @@ Worker selection is controlled via `[profiles.<name>.worker].selection`:
 
 When `worker.selection = "warm_cache"`:
 - The host MUST compute `config_hash = SHA-256( "rch-xcode-lane/config_hash/v1\n" || JCS(effective_config.inputs) )` as lowercase hex.
+- The host MUST compute `dependencies_fingerprint_sha256` (see Dependencies Fingerprint) and SHOULD compute cache keys:
+  - `derived_data_key` = `cache_namespace + "/" + config_hash` (see Cache Buckets)
+  - `spm_key` = `SHA-256("rch-xcode-lane/spm_cache_key/v1\n" || cache_namespace || "\n" || xcode_build || "\n" || dependencies_fingerprint_sha256)` (see Cache Buckets)
 - For each eligible worker that advertises `"cache_query"` in `probe.verbs` (or `features.cache_query=true`), the host SHOULD invoke `cache_query` and score the worker:
+  - The host MUST supply explicit `cache_keys.derived_data_key` and `cache_keys.spm_key` in the cache_query request.
   - Scoring SHOULD prioritize DerivedData presence over SPM presence.
   - Implementations MAY use weighted scoring (e.g., +100 for DerivedData present, +50 for SPM present) but MUST document their algorithm.
 - Tie-breakers (in order): lower `probe.load.active_jobs`, then lexicographic worker name.
@@ -1386,6 +1426,7 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `event_line_too_long` | A single event exceeded configured per-line cap | No |
 | `source_staging_failed` | Failed to stage source to worker | Yes |
 | `source_staging_incomplete` | Stage receipt/sentinel missing; staging not complete | Yes |
+| `stage_receipt_invalid` | stage_receipt.json present but invalid JSON (partial/corrupt upload) | Yes |
 | `stage_receipt_mismatch` | Stage receipt identity/hash does not match the job request | Yes |
 | `source_hash_mismatch` | Staged source did not match expected source_tree_hash | Yes |
 | `source_tree_modified` | Source tree was modified during execution | No |
@@ -1947,6 +1988,15 @@ The event stream is a newline-delimited JSON file where each line is a self-cont
 - Writers MUST NOT emit partial JSON lines.
 - Writers MUST ensure each event line is <= `max_event_line_bytes` when configured; if the next event would exceed the cap, the harness MUST terminate the job with a final `complete` event using error code `event_line_too_long`.
 - When `max_events_bytes` is configured, if emitting the next event would exceed the cap, the harness MUST terminate the job with a final `complete` event using error code `events_quota_exceeded`.
+- **Event stream caps apply to non-terminal events only (Normative):**
+  - `limits.max_events_bytes` and `limits.max_event_line_bytes` MUST be enforced for all non-`complete` events.
+  - The harness MUST still be able to emit a terminal `complete` event. Implementations MUST either:
+    (a) reserve sufficient space for `complete`, or
+    (b) treat `complete` as exempt from the caps.
+  - If the harness cannot emit a valid terminal `complete` event for any reason, it MUST exit non-zero and the host MUST
+    record `event_stream_corrupt`.
+  - When `limits.max_complete_line_bytes` is configured, the `complete` event line MUST be <= that value.
+    If not configured, implementations SHOULD ensure `complete` fits within `limits.max_event_line_bytes`.
 - Readers MUST tolerate the file growing during reads, and SHOULD ignore a non-terminal final line only if it is not newline-terminated (defensive tail behavior).
 
 **Required fields per event:**
@@ -2129,6 +2179,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 |---------|---------|
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | Enumerate/probe workers; show capability summaries |
+| `rch xcode destinations [--worker <name>]` | List available simulator runtimes + device types (IDs + names); can emit TOML snippet |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
 | `rch xcode plan --profile <name>` | Deterministically resolve effective config, worker selection, destination resolution; optionally compute hashes and show reuse candidates (no staging/run) |
 | `rch xcode build [--profile <name>]` | Remote build gate |

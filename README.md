@@ -114,6 +114,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 |---------|---------|
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | List/probe eligible macOS workers and summarize capabilities |
+| `rch xcode destinations [--worker <name>]` | List available simulator runtimes + device types (IDs + names); can emit TOML snippet |
 | `rch xcode verify [--profile <name>]` | Probe worker + validate config against capabilities |
 | `rch xcode plan --profile <name>` | Resolve effective config + select worker + resolve destination; optionally compute `source_tree_hash`, `config_hash`, `run_id`, and show reuse candidates (`--no-hash` to skip) |
 | `rch xcode build [--profile <name>]` | Remote build gate |
