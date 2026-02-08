@@ -26,6 +26,7 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Job**: One remote build/test execution with stable, addressable artifacts.
 - **Profile**: Named configuration block (e.g., `ci`, `local`, `release`).
 - **Lane**: The Xcode-specific subsystem within RCH.
+- **Lane ID**: A stable identifier string for this lane used across artifacts and event streams. For this lane it MUST be `"rch-xcode-lane"`.
 - **Run ID**: Content-derived identifier (SHA-256 of canonical **config inputs** + source tree hash); identical inputs produce the same run ID.
 - **Job ID**: Unique identifier per execution attempt; never reused.
 - **Repo Key**: A stable *host-side* namespace used to segregate artifacts and (optionally) caches per repository/workspace. It MUST NOT be included in `effective_config.inputs` (so it does not affect `run_id`), but MUST be recorded in `attestation.json`. Derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash.
@@ -109,6 +110,7 @@ The harness MUST support two verbs:
 
 The probe JSON MUST be a self-describing, versioned object and MUST include at minimum:
 - `kind` (string) — MUST be `"probe"`.
+- `lane_id` (string) — MUST be `"rch-xcode-lane"`.
 - `schema_version` (SemVer string) — Schema version for the probe payload (e.g., `"1.0.0"`).
 - `protocol_versions` (array of strings, e.g. `["1"]`) — Supported protocol versions.
 - `contract_versions` (array of SemVer strings) — Supported values of `effective_config.inputs.contract_version`.
@@ -242,8 +244,9 @@ The harness MAY support an optional fourth verb:
      - `cache_keys` (object) — echoed keys
      - `cache_namespace` (string) — effective cache namespace/trust boundary
      - `namespace` (string) — DEPRECATED alias for `cache_namespace` (for backward compatibility)
-     - `derived_data` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
-     - `spm` (object|null): `{ "present": bool, "bytes": int|null, "mtime": string|null }`
+     - `derived_data` (object|null): `{ "present": bool, "valid": bool|null, "bytes": int|null, "mtime": string|null }`
+     - `spm` (object|null): `{ "present": bool, "valid": bool|null, "bytes": int|null, "mtime": string|null }`
+   - `valid` indicates whether cache entry metadata matches expected values; `null` if validation was not performed.
    - MUST NOT reveal any paths outside configured cache roots.
    - Enables warm-cache worker selection (see Worker Selection below).
 
@@ -310,6 +313,7 @@ The harness SHOULD support a seventh verb:
 
 **Job request (stdin) MUST be a self-describing, versioned object and MUST include:**
 - `kind` (string) — MUST be `"job_request"`.
+- `lane_id` (string) — MUST be `"rch-xcode-lane"`.
 - `schema_version` (SemVer string) — Schema version for the job request payload (e.g., `"1.0.0"`).
 - `protocol_version` (string, e.g. `"1"`)
 - `event_schema_version` (SemVer string) — Selected event schema version (from probe intersection).
@@ -389,6 +393,13 @@ The harness MUST tee (write) the same bytes it emits to durable files under the 
 
 This ensures runs remain inspectable and artifacts are fetchable even if the SSH session is interrupted mid-execution. The `status` verb (when supported) can report the latest durable `events.sequence` to enable resume.
 
+**Durability boundary (Recommended; REQUIRED for terminal correctness when feasible):**
+- The harness MUST flush stdout/stderr as specified above.
+- The harness SHOULD `fsync(2)` (or platform equivalent) `events.ndjson` and the per-job control record after writing:
+  1) the first `hello` event, and
+  2) the terminal `complete` event.
+- Implementations MAY additionally fsync periodically (e.g., every 10s or every 4MiB appended) to reduce loss on power failure.
+
 ---
 
 ## Staging Contract (Normative)
@@ -433,19 +444,32 @@ The stage receipt MUST be a self-describing JSON object:
 ```jsonc
 {
   "kind": "stage_receipt",
+  "lane_id": "rch-xcode-lane",
   "schema_version": "1.0.0",
   "lane_version": "0.1.0",
   "job_id": "…",
   "run_id": "…",
   "attempt": 1,
   "method": "rsync|git_snapshot|bundle",
+  "source_mode": "vcs|working_tree",   // RECOMMENDED: clarifies what the bundle represents
   "source_tree_hash": "…",
   "excludes": ["…"],
   "payload": {
     "kind": "rsync_tree|bundle",
     "path": "src/|source.tar.zst",
     "sha256": "…",          // REQUIRED when kind="bundle" (sha256 of archive bytes)
-    "bytes": 987654321      // REQUIRED when kind="bundle"
+    "bytes": 987654321,     // REQUIRED when kind="bundle"
+    "packing": {            // REQUIRED when kind="bundle"
+      "kind": "tar",
+      "version": "pax_fixed_v1",
+      "mtime_epoch": 0,
+      "uid": 0,
+      "gid": 0,
+      "mode_policy": "vcs_or_normalize_0755_0644",
+      "xattrs": "strip",
+      "acls": "strip",
+      "compression": { "kind": "zstd", "deterministic": true, "threads": 1 }
+    }
   },
   "files_total": 789,
   "bytes_total": 987654321,
@@ -454,6 +478,21 @@ The stage receipt MUST be a self-describing JSON object:
   "created_at": "2026-02-08T00:00:00Z"
 }
 ```
+
+### Deterministic Source Bundles (Normative when `method="bundle"` or `method="git_snapshot"`)
+
+When staging uses an archive (`source.tar.zst`), the archive bytes MUST be deterministic for identical staged content. The packing algorithm MUST:
+- Sort entries lexicographically by UTF-8 byte order of relative paths
+- Normalize paths to POSIX `/`
+- Use TAR PAX format (no GNU extensions)
+- Set uid/gid to 0; uname/gname empty
+- Set all mtimes to epoch 0
+- Strip xattrs/ACLs and omit OS-specific metadata
+- Normalize modes for byte-stability:
+  - Prefer VCS-derived modes when `source_mode="vcs"` and available; otherwise normalize dirs=0755, files=0644
+- Use deterministic zstd settings (single-thread) when compressing
+
+The stage receipt `payload.packing` MUST describe the exact policy used, and the harness MUST record it verbatim in the copied `stage_receipt.json` under the job workspace for audit.
 
 ### Harness Staging Behavior (Normative)
 
@@ -548,10 +587,12 @@ The host MUST record the computed `cache_namespace` in `metrics.json` and `attes
 
 **Event stream (stdout) requirements:**
 - The FIRST event MUST be `{"type":"hello", ...}` and MUST include `protocol_version`, `lane_version`, `contract_version`, and the echoed `job_id`/`run_id`/`attempt`.
+- The `hello` event MUST include `lane_id` and MUST equal `"rch-xcode-lane"`.
 - The `hello` event MUST include `event_schema_version` (SemVer string) and MUST equal `job_request.event_schema_version`.
 - The `hello` event MUST include `job_request_sha256` (echoed from the job request).
 - The `hello` event MUST include `worker_paths` (object) describing the *actual derived* paths in use on the worker (`src`, `work`, `dd`, `result`, `spm`, `cache`) so audits/debugging can prove where execution happened.
-- Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`.
+- Every event MUST include: `type`, `timestamp`, `sequence`, `job_id`, `run_id`, `attempt`, `lane_id`.
+- `lane_id` MUST be `"rch-xcode-lane"` for all events.
 - Every event SHOULD include: `trace_id` — when provided in the job request, for cross-system correlation.
 - Every event SHOULD include: `monotonic_ms` — Milliseconds since harness process start (monotonic clock) to provide stable ordering under clock skew.
 - The FINAL event MUST be `{"type":"complete", ...}` and MUST be the last line. After emitting `complete`, the harness MUST exit promptly.
@@ -601,6 +642,17 @@ Operators SHOULD use an SSH key restricted via `authorized_keys command=...` so 
 - Allows ONLY `probe`, `run`, `cancel`, `status`, `gc`, and optionally `cache_query`/`prewarm` (exact match, no extra args) and rejects anything else with `complete` + error code `forbidden_ssh_command`
 - Ignores argv verbs when `--forced` is set (to prevent bypass)
 - **Note:** `cancel`, `status`, and `gc` MUST be supported in `--forced` mode to enable cancellation, recovery, and garbage collection without arbitrary remote commands
+
+**SSH key option guidance (Recommended; SHOULD be checked by `doctor`/`verify` when feasible):**
+
+For the run key in forced mode, operators SHOULD include:
+- `restrict`
+- `no-pty`
+- `no-agent-forwarding`
+- `no-port-forwarding`
+- `no-X11-forwarding`
+
+If any forwarding is enabled, `rch xcode verify` SHOULD emit a warning (non-fatal) because it expands the blast radius.
 
 ---
 
@@ -1179,6 +1231,20 @@ The lane MUST provide a garbage-collection mechanism:
 - When classification is uncertain, lane MUST prefer **not** to intercept (false negatives are acceptable).
 - Default signing policy: `CODE_SIGNING_ALLOWED=NO` unless explicitly enabled.
 
+### Signing Policy (Normative when code signing is enabled)
+
+If `code_signing_allowed = true`, profiles MUST declare an explicit signing policy:
+
+```toml
+[profiles.<name>.signing]
+mode = "existing_keychain" | "ephemeral_keychain"
+```
+
+Rules:
+- If `code_signing_allowed = true` and `signing.mode` is missing, the lane MUST refuse with stable error code `signing_policy_missing`.
+- In `trust.posture = "untrusted"`, the lane MUST force `code_signing_allowed = false` regardless of profile settings.
+- The signing policy MUST be included in `effective_config.inputs` when signing is enabled.
+
 ### Invocation Reconstruction (Normative)
 
 When the lane intercepts an incoming command string, it MUST:
@@ -1210,6 +1276,21 @@ include_value_fingerprints = true         # include hashed fingerprints of forwa
     `SHA-256( "rch-xcode-lane/env_value_sha256/v1\n" || <NAME> || "\n" || <VALUE_BYTES> )`
     where `<VALUE_BYTES>` are the exact UTF-8 bytes of the env value (empty string allowed).
 - `environment.json` MUST continue to omit env values (names only); fingerprints live only in `effective_config.inputs`.
+
+### Backend Environment Sealing (Recommended; Normative when `env.seal=true`)
+
+Profiles MAY request that the harness run the backend under a sealed environment:
+
+```toml
+[profiles.<name>.env]
+seal = true   # default SHOULD be true for CI
+```
+
+When `env.seal = true`:
+- The harness MUST construct the backend process environment from a minimal baseline (no ambient inheritance), plus the allowlisted forwarded vars from the host.
+- The harness MUST set `DEVELOPER_DIR` consistently with the selected Xcode.
+- The harness MUST ensure per-job temp paths (`TMPDIR`) are confined under the job workspace.
+- The harness MUST NOT include env **values** in any artifact; only names are permitted.
 
 ### Secrets & Environment (Normative)
 
@@ -1453,6 +1534,8 @@ Error codes MUST be stable across releases (backward compatible). Codes MUST be 
 | `hardlinks_disallowed` | Source tree contains hardlinks but policy forbids them | No |
 | `directory_artifact_remote_disallowed` | Directory artifact cannot be stored remotely without packing | No |
 | `report_unavailable` | Report was requested but inputs/results were unavailable | No |
+| `signing_policy_missing` | Signing enabled but no explicit signing policy was declared | No |
+| `cache_metadata_mismatch` | Cache entry metadata does not match expected values for the job | No |
 
 Implementations MAY define additional codes; consumers MUST tolerate unknown codes.
 
@@ -1556,6 +1639,7 @@ Every run MUST emit:
 
 Every JSON artifact emitted by the lane MUST include these top-level fields:
 - `kind` — A stable identifier for the artifact type (e.g., `"summary"`, `"manifest"`, `"attestation"`).
+- `lane_id` — MUST be `"rch-xcode-lane"`.
 - `schema_version` — A SemVer-like string for the artifact schema (e.g., `"1.0.0"`).
 - `lane_version` — The lane implementation version (SemVer).
 
@@ -1921,6 +2005,7 @@ For `backend.actual = "xcodebuildmcp"`:
 **Additional required fields:**
 - `paths` (object) — The effective confined paths used (`dd`, `result`, `spm`) for auditability and reproducibility.
 - `env_names` (array of strings) — Allowlisted environment variable names passed (values MUST NOT be included).
+- `env_sealed` (boolean) — Whether `env.seal` was applied for this backend invocation.
 
 **Prohibited:**
 - MUST NOT include secret values (env values, tokens, credentials).
@@ -2177,6 +2262,7 @@ A small, lane-defined diagnostic summary intended for UIs and agents:
 
 | Command | Purpose |
 |---------|---------|
+| `rch xcode init [--profile <name>]` | Scaffold `.rch/xcode.toml` (safe defaults) and print a `workers.toml` snippet |
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | Enumerate/probe workers; show capability summaries |
 | `rch xcode destinations [--worker <name>]` | List available simulator runtimes + device types (IDs + names); can emit TOML snippet |
@@ -2226,6 +2312,18 @@ This enables agent/CI integration without log scraping and provides consistent e
 - `reuse_candidate` (object|null): `{ job_id, attempt, path }` — An existing succeeded attempt for this run_id, if found
 
 The command MUST support `--no-hash` to omit `hashes` and `reuse_candidate`, avoiding hashing large trees when speed matters.
+
+### `init` Output (Normative when `--json`)
+
+`rch xcode init --json` MUST emit a single envelope object:
+- Standard envelope fields: `kind`, `schema_version`, `lane_version`, `ok`, `error_code`, `errors`
+- `kind`: `"init_result"`
+- `repo_config_path` (string) — usually `.rch/xcode.toml`
+- `created` (boolean) — true if a new file was written; false if it already existed
+- `suggested_repo_config` (string|null) — TOML text when `--print` or when `created=false`
+- `suggested_worker_snippet` (string|null) — TOML snippet for `~/.config/rch/workers.toml`
+
+The command MUST NOT overwrite an existing `.rch/xcode.toml` unless an explicit `--force` flag is provided.
 
 ### `watch` Resume Semantics (Normative)
 
@@ -2284,7 +2382,8 @@ The `validate` command verifies artifact integrity and consistency for a complet
 **Required validations:**
 
 - All files listed in `manifest.json` exist and have matching SHA-256 hashes.
-- All JSON artifacts parse successfully and include required `kind`, `schema_version`, `lane_version` fields.
+- All JSON artifacts parse successfully and include required `kind`, `lane_id`, `schema_version`, `lane_version` fields.
+- `lane_id` MUST be consistent across `probe.json`, `job_request.json`, `effective_config.json`, `attestation.json`, `summary.json`, `stage_receipt.json`, and all `events.ndjson` lines.
 - `job_request.json` parses successfully and its `job_id/run_id/attempt` match `summary.json`.
 - `stage_receipt.json` parses successfully and its `job_id/run_id/attempt/source_tree_hash` match `job_request.json`.
 - `job_request.json.config_inputs` is byte-for-byte equal to `effective_config.json.inputs` (after JCS decoding).
@@ -2423,6 +2522,22 @@ The worker MUST segregate caches by the effective `trust_domain` boundary. At mi
 - `cache_namespace` — The computed cache namespace key.
 - `cache_writable` — Boolean indicating if the cache was writable for this job.
 - `cache_posture_partitioned` — Boolean indicating if cache namespace included trust posture separation.
+
+#### Cache Entry Metadata + Validation (Recommended; Normative when caching is enabled)
+
+To prevent incompatible cache reuse, the harness MUST maintain a small metadata file per cache entry:
+- For each cache root written/read (DerivedData/SPM), the harness MUST write `cache_entry.json` at the cache entry root.
+- `cache_entry.json` MUST be safe to store (no secrets) and MUST include at minimum:
+  - `kind` = `"cache_entry"`
+  - `lane_id` = `"rch-xcode-lane"`
+  - `schema_version`, `lane_version`
+  - `cache_namespace` (string)
+  - `contract_version` (SemVer string)
+  - `xcode_build` (string)
+  - `config_hash` (string) for DerivedData entries
+  - `dependencies_fingerprint_sha256` (string) for SPM entries
+  - `trust_posture` (string) — `"trusted"` | `"untrusted"`
+- On cache read, the harness MUST validate metadata matches the expected values for the job. If validation fails, the harness MUST treat the cache as a miss and SHOULD emit a warning error object with code `cache_metadata_mismatch` (retryable: false).
 
 ### Simulator Prewarm
 

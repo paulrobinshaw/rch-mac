@@ -36,7 +36,7 @@ configuration—without installing Xcode locally—while receiving **machine-rea
 
 1. **Select worker** (tagged `macos,xcode`) and probe capabilities (**protocol + contract versions**, supported `verbs`, stable `capabilities_sha256`, Xcode, runtimes, backends).
 2. **Snapshot + stage source** to the worker (rsync working tree, git snapshot, **or deterministic bundle** depending on profile policy).
-   - Bundle staging uploads a single `source.tar.zst` (deterministic archive) then writes `stage_receipt.json` + `STAGE_READY`.
+   - Bundle staging uploads a single `source.tar.zst` (byte-stable deterministic archive; see `PLAN.md` § Deterministic Source Bundles) then writes `stage_receipt.json` + `STAGE_READY`.
    - Staging writes into `stage_root/<job_id>/` using the restricted **stage key** and finishes by writing
      a self-describing `stage_receipt.json` plus a `STAGE_READY` sentinel (atomic "stage complete" signal).
    - The harness refuses to run if staging is incomplete, and performs an atomic swap into the per-job `src/`
@@ -60,7 +60,7 @@ If `protocol_version` or `contract_version` don't overlap between host and harne
 ## Non-goals
 
 - Not a remote IDE and not a general "run anything on the Mac" executor
-- Not a provisioning/signing manager (signing is **off by default**)
+- Not a provisioning/signing manager (signing is **off by default**; when enabled, an explicit signing policy is required)
 - Not a replacement for full CI; this is a deterministic *gate* optimized for agent workflows
 
 ## Safety / Security Model
@@ -73,7 +73,7 @@ Recommended:
 - Harden SSH on the worker:
   - Prefer a forced-command key for `rch-xcode-worker --forced`
     (harness reads `SSH_ORIGINAL_COMMAND` and only allows `probe`/`run`;
-    no-pty, no-agent-forwarding, no-port-forwarding)
+    `restrict`, no-pty, no-agent-forwarding, no-port-forwarding, no-X11-forwarding)
   - Use separate, restricted data-plane keys (recommended):
     - **Stage key**: write-only, confined to the `stage_root/` (push source snapshot)
     - **Fetch key**: read-only, confined to the `jobs_root/` (pull artifacts back)
@@ -112,6 +112,7 @@ Tip: For CI that tests fork PRs or otherwise untrusted sources, enable "untruste
 
 | Command | Purpose |
 |---------|---------|
+| `rch xcode init [--profile <name>]` | Scaffold `.rch/xcode.toml` (safe defaults) and print a `workers.toml` snippet |
 | `rch xcode doctor` | Validate host setup (daemon, config, SSH tooling) |
 | `rch xcode workers [--refresh]` | List/probe eligible macOS workers and summarize capabilities |
 | `rch xcode destinations [--worker <name>]` | List available simulator runtimes + device types (IDs + names); can emit TOML snippet |
@@ -140,7 +141,7 @@ Tip: Most commands support `--json` mode for agents/CI (see PLAN.md).
 
 1. **On the worker (Mac):** install `rch-xcode-worker`, Xcode, sims; enable a **forced-command** run key.
 2. **On the host:** register the worker in `~/.config/rch/workers.toml` (tags: `macos,xcode`) and **pin** its SSH host key.
-3. **In the repo:** add `.rch/xcode.toml` with a `ci` profile (pin destination + safety defaults).
+3. **In the repo:** run `rch xcode init --profile ci` to create `.rch/xcode.toml` (pins destination + safety defaults).
 4. Start daemon: `rch daemon start`
 5. Validate: `rch xcode doctor` then `rch xcode verify --profile ci`
 6. Run: `rch xcode test --profile ci` (or `build`)
@@ -226,12 +227,12 @@ identical runs (see `PLAN.md` § Host CAS Store).
 
 `repo_key` is a stable host-side namespace derived from VCS identity when available (e.g., normalized origin URL hash), otherwise from a workspace identity hash. It is recorded in `attestation.json` and prevents cross-repo run index collisions.
 
-All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_version`).
+All JSON artifacts are **versioned** (`schema_version`) and self-describing (`kind`, `lane_id`, `lane_version`).
 For packed artifacts, `manifest.json` records the packing algorithm + version.
 `summary.json` and `decision.json` include stable `error_code`/`errors[]` fields so CI/agents can react without log scraping.
 Consumers SHOULD validate against schemas in `schemas/rch-xcode-lane/` (recommended for CI/agents).
 
-**Event correlation:** `events.ndjson` lines include `job_id`, `run_id`, and `attempt` so tooling can safely correlate
+**Event correlation:** `events.ndjson` lines include `lane_id`, `job_id`, `run_id`, and `attempt` so tooling can safely correlate
 streaming output to the run index. Deployments MAY also surface a `trace_id` for cross-system correlation
 (CI logs ↔ host logs ↔ worker logs).
 
