@@ -193,6 +193,8 @@ Layout (example):
 - `steps/test/<job_id>/job_index.json`
 - `steps/test/<job_id>/...`
 
+All JSON artifacts follow normative schemas defined in `PLAN.md` (including `summary.json` which has a full schema table).
+
 Includes:
 - run_index.json
 - run_summary.json

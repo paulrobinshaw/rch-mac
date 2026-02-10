@@ -240,6 +240,9 @@ Workers SHOULD restrict `error.code` to a small, documented registry (examples):
 - `FEATURE_MISSING` (required feature absent)
 - `BUSY` (capacity exceeded; include `retry_after_seconds`)
 - `LEASE_EXPIRED` (job lease timed out)
+- `SOURCE_MISSING` (referenced source bundle not in store)
+- `ARTIFACTS_GONE` (job artifacts no longer available for fetch)
+- `PAYLOAD_TOO_LARGE` (upload exceeds size limit)
 
 Error message guidance (recommended):
 - `error.message` SHOULD be a single-line, human-readable sentence describing the problem.
@@ -275,7 +278,7 @@ Worker SHOULD implement these operations with JSON request/response payloads:
 - `status` → returns current job status and pointers to logs/artifacts
 - `tail` → returns the next chunk of logs/events given a cursor (repeatable; host loops to "stream")
 - `cancel` → requests best-effort cancellation
-- `fetch` → returns artifacts (or a signed manifest + download hints)
+- `fetch` → returns job artifacts as a binary-framed response (see below)
 - `has_source` → returns `{exists: bool}` for a given `source_sha256`
 - `upload_source` → accepts a source bundle upload for a given `source_sha256`
 
@@ -378,6 +381,14 @@ Both MUST be updated atomically (write-then-rename) on every state transition.
 
 ### Step execution semantics (normative)
 Steps in `run_plan.json` MUST execute sequentially in plan order.
+
+Classifier rejection in multi-step runs (normative):
+- The classifier runs on the host at plan time for each step's invocation.
+- If a step is rejected, it MUST still appear in `run_plan.json` with `rejected: true`.
+- A rejected step MUST have a `summary.json` emitted at the standard step path (`<run_id>/steps/<action>/<job_id>/summary.json`)
+  with `status=rejected`, but MUST NOT have `job_state.json` (the job state machine is never entered).
+- Rejected steps receive a `job_id` for artifact path purposes but are never submitted to the worker.
+
 If a step ends with `status=failed` or `status=rejected`, subsequent steps MUST be skipped
 (their `job_state.json` MUST NOT be created) unless the run is explicitly configured with
 `run.continue_on_failure = true`, in which case all steps execute regardless of prior failures.
@@ -454,6 +465,15 @@ Protocol expectations:
   - `upload_id` (string), `offset` (int)
 Worker SHOULD respond with `next_offset` to support resumable uploads.
 
+### `fetch` response format (normative)
+`fetch` response MUST use the same binary framing as `upload_source` (JSON header line + raw bytes):
+- Response JSON header includes: `job_id`, `manifest` (the `manifest.json` content), and `stream` object
+  (`content_length`, `content_sha256`, `compression`, `format`).
+- The streamed bytes are a `tar` (optionally zstd-compressed) of the job artifact directory.
+- The host MUST verify `content_sha256` of the received bytes, then verify manifest integrity per
+  "Host manifest verification".
+- If the worker no longer has artifacts for `job_id`, it MUST return error code `ARTIFACTS_GONE`.
+
 Atomicity (normative): `upload_source` MUST be atomic by `source_sha256`. If the bundle already
 exists when the upload completes (e.g. concurrent upload from another host), the worker MUST discard
 the duplicate and return success. Workers SHOULD use write-to-temp-then-rename to prevent partial visibility.
@@ -461,6 +481,12 @@ the duplicate and return success. Workers SHOULD use write-to-temp-then-rename t
 GC expectations:
 - Bundle GC MUST NOT remove bundles referenced by RUNNING jobs.
 - Bundle GC policy MAY align with cache eviction policy (age/size based).
+
+Source availability on submit (normative):
+- On `submit`, if the referenced `source_sha256` is not present in the store, the worker MUST reject
+  with error code `SOURCE_MISSING` (not a generic failure).
+- On receiving `SOURCE_MISSING`, the host MUST re-upload the bundle via `upload_source` and retry `submit` once.
+- This handles the TOCTOU race between `has_source` and `submit` (e.g. concurrent GC eviction).
 
 ## Source bundling canonicalization (normative)
 The host MUST create a canonical source bundle such that identical inputs yield identical `source_sha256`.
@@ -601,6 +627,30 @@ destination rules, allowed flags).
 - 91: WORKER_INCOMPATIBLE
 - 92: BUNDLER
 - 93: ATTESTATION
+
+
+### summary.json schema (normative)
+`summary.json` MUST be emitted per job and MUST include at least:
+
+| Field               | Type   | Description                                          |
+|---------------------|--------|------------------------------------------------------|
+| `schema_version`    | int    | Always `1`                                           |
+| `schema_id`         | string | `rch-xcode/summary@1`                                |
+| `run_id`            | string | Parent run identifier                                |
+| `job_id`            | string | Job identifier                                       |
+| `job_key`           | string | Job key                                              |
+| `created_at`        | string | RFC 3339 UTC                                         |
+| `status`            | string | `success` \| `failed` \| `rejected` \| `cancelled`  |
+| `failure_kind`      | string | (When not success) See failure taxonomy               |
+| `failure_subkind`   | string | (Optional) Additional detail                          |
+| `exit_code`         | int    | Stable exit code per exit code table                  |
+| `backend_exit_code` | int    | (Optional) Backend process exit status                |
+| `backend_term_signal`| string| (Optional) e.g. `"SIGKILL"`                          |
+| `backend`           | string | Backend identity (`xcodebuild` or `mcp`)              |
+| `human_summary`     | string | Short human-readable description                      |
+| `duration_ms`       | int    | Wall-clock job duration                               |
+| `artifact_profile`  | string | (Recommended) `minimal` or `rich` actually produced   |
+| `cached_from_job_id`| string | (Optional) If result was served from cache            |
 
 ### Run-level exit code (normative)
 For multi-step runs, `run_summary.json` MUST include an `exit_code` suitable for scripting and the host CLI
@@ -892,8 +942,9 @@ If pinned and the worker provides a signing key, the host MUST verify the finger
 before accepting signed attestations.
 
 ## Artifact manifest (normative)
-`manifest.json` MUST enumerate produced artifacts with at least:
-- `path` (relative), `size`, `sha256`
+`manifest.json` MUST include the standard artifact envelope (`schema_version`, `schema_id` (`rch-xcode/manifest@1`),
+`created_at`, `run_id`, `job_id`, `job_key`) and MUST enumerate produced artifacts with at least:
+- `entries[]`: each with `path` (relative), `size`, `sha256`
 `manifest.json` MUST also include `artifact_root_sha256` to bind the set.
 
 `entries` MUST be sorted lexicographically by `path` (UTF-8).
@@ -991,14 +1042,18 @@ To make artifact discovery stable for tooling, the system MUST provide:
 - `job_index.json` at `<run_id>/steps/<action>/<job_id>/job_index.json`
 
 `run_index.json` MUST include `schema_version`, `schema_id` (`rch-xcode/run_index@1`), `created_at`, `run_id`, and pointers (relative paths) to:
-- `run_plan.json`, `run_state.json`, `run_summary.json`
-- `worker_selection.json` and the selected `capabilities.json` snapshot
+- `run_plan.json`, `run_state.json`, `run_summary.json`, `source_manifest.json`
+- `worker_selection.json` and the selected `capabilities.json` snapshot (stored at `<run_id>/capabilities.json`)
 - an ordered list of step jobs with `{ index, action, job_id, job_index_path }`
 
 `job_index.json` MUST include pointers (relative paths) to the job's:
 - `job.json`, `job_state.json`, `summary.json`, `manifest.json`, `attestation.json`
+- `toolchain.json`, `destination.json`, `effective_config.json`, `invocation.json`, `job_key_inputs.json`
 - primary human artifacts (`build.log`, `result.xcresult/` when present)
 and MUST record the `artifact_profile` produced.
+`job_index.json` SHOULD also include pointers to optional artifacts when present:
+`metrics.json`, `executor_env.json`, `classifier_policy.json`, `events.jsonl`,
+`test_summary.json`, `build_summary.json`, `junit.xml`.
 
 ### Artifact completion + atomicity (normative)
 To prevent consumers from observing partially-written artifact sets, the worker MUST treat the job artifact
