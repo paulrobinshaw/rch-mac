@@ -36,6 +36,26 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 3. Start daemon: `rch daemon start`
 4. Run: `rch xcode verify`
 
+## Quickstart
+Most common flows:
+
+```bash
+# Validate setup without executing anything
+rch xcode verify --dry-run
+
+# Explain why a command will/won't be intercepted
+rch xcode explain -- xcodebuild test -workspace MyApp.xcworkspace -scheme MyApp
+
+# Run the repo-defined verify lane (usually build+test)
+rch xcode verify
+```
+
+## Trust boundary (important)
+`rch xcode` is **not** a sandbox. If your Xcode project contains Run Script build phases,
+SwiftPM build tool plugins, or other build-time code execution, that code will run on the worker
+under the `rch` user.
+Treat the worker like CI: dedicated account, minimal secrets, and no personal keychains.
+
 ## Mental model (operator view)
 - You run `rch xcode verify` locally (even on Linux).
 - RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
@@ -72,8 +92,10 @@ scheme = "MyApp"
 verify = ["build", "test"]
 
 [destination]
-mode = "pinned"
+mode = "constraints"  # pinned | constraints
 value = "platform=iOS Simulator,name=iPhone 16,OS=latest"
+# In constraints mode, the host resolves "latest" using the selected worker's capabilities snapshot
+# and records the resolved destination into job.json for determinism.
 
 [timeouts]
 overall_seconds = 1800
@@ -98,6 +120,9 @@ Intercept is **deny-by-default**:
 Useful commands:
 - `rch xcode explain -- <command...>`  (why it will/won't be intercepted)
 - `rch xcode verify --dry-run`         (prints resolved plan + selected worker)
+- `rch xcode tail <run_id|job_id>`     (stream logs/events while running)
+- `rch xcode cancel <run_id|job_id>`   (best-effort cancellation)
+- `rch xcode artifacts <run_id|job_id>`(print artifact locations + key files)
 - `rch workers list --tag macos,xcode` (show matching workers)
 - `rch workers probe <name>`           (fetch capabilities snapshot)
 - `rch xcode doctor`                   (validate config, SSH, Xcode, destination)
@@ -143,3 +168,8 @@ Includes:
 - Deterministic: runs produce a JobSpec (`job.json`) and stable `job_key` used for caching and attestation
 - Security posture: prefer a dedicated `rch` user; optionally use SSH forced-command; avoid signing/publishing workflows
 - Integrity: host verifies `manifest.json` digests; attestation binds worker identity + artifact set
+
+### Hardening recommendations
+- Keep the worker "CI-clean": no personal Apple ID sessions, no developer keychains, minimal credentials.
+- Prefer an env allowlist for the executor (only pass through known-safe vars), and redact secrets from logs.
+- Consider running the worker user with reduced permissions (no admin), and keep artifacts + caches on a dedicated volume.

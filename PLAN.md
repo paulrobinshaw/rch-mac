@@ -18,10 +18,11 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Host**: the machine running `rch` (may be Linux/macOS).
 - **Worker**: macOS machine that executes the job.
 - **Run**: a top-level verification attempt (e.g. `rch xcode verify`) that may include multiple jobs.
-- **Run ID** (`run_id`): stable identifier for the run artifact directory.
+- **Run ID** (`run_id`): unique opaque identifier for the run artifact directory (stable once chosen; not required to be deterministic).
 - **Invocation**: user-provided command line (e.g. `xcodebuild test ...`).
 - **Classifier**: deny-by-default gate that accepts/rejects invocations.
 - **JobSpec** (`job.json`): deterministic, fully-resolved step job description.
+- **Job ID** (`job_id`): unique identifier for a single step job within a run (used for cancellation/log streaming and artifact paths).
 - **Job key** (`job_key`): stable hash used for caching and attestation.
 - **Artifact set**: schema-versioned outputs written under `<job_id>/`.
 
@@ -31,6 +32,9 @@ The lane MUST provide these user-facing entry points:
 - `rch xcode run --action <build|test>` — run a single action as a one-step run.
 - `rch xcode explain -- <cmd...>` — classifier explanation and effective constraints.
 - `rch xcode verify --dry-run` — print resolved JobSpec + chosen worker, no execution.
+- `rch xcode tail <run_id|job_id>` — stream logs/events with a cursor (falls back to polling if worker lacks tail).
+- `rch xcode cancel <run_id|job_id>` — request best-effort cancellation and persist cancellation artifacts.
+- `rch xcode artifacts <run_id|job_id>` — print the local artifact path(s) and key files (summary/xcresult/log).
 Optional but recommended:
 - `rch workers list --tag macos,xcode`
 - `rch workers probe <worker>` — capture `capabilities.json` snapshot
@@ -41,10 +45,11 @@ Optional but recommended:
 Pipeline stages:
 1. **Classifier**: detects safe, supported Xcode build/test invocations (deny-by-default).
 2. **Run builder**: resolves repo `verify` actions into an ordered run plan and chooses a worker once.
-3. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
-4. **Transport**: bundles inputs + sends to worker (integrity checked).
-5. **Executor**: runs the job on macOS via a selected backend (**xcodebuild** or **XcodeBuildMCP**).
-6. **Artifacts**: writes a schema-versioned artifact set + attestation.
+3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination.
+4. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
+5. **Transport**: bundles inputs + sends to worker (integrity checked).
+6. **Executor**: runs the job on macOS via a selected backend (**xcodebuild** or **XcodeBuildMCP**).
+7. **Artifacts**: writes a schema-versioned artifact set + attestation.
 
 ## Backends
 - **Backend: xcodebuild (MVP)** — minimal dependencies, fastest path to correctness.
@@ -57,6 +62,23 @@ The system MUST behave as if there is a versioned protocol even if implemented o
 - Host and worker MUST each report `rch_xcode_lane_version` and `protocol_version`.
 - If `protocol_version` is incompatible, the host MUST fail with `failure_kind=WORKER_INCOMPATIBLE`.
 
+### RPC envelope (normative, recommended)
+All worker operations SHOULD accept a single JSON request on stdin and emit a single JSON response on stdout.
+This maps directly to an SSH forced-command entrypoint.
+
+Request:
+- `protocol_version` (int)
+- `op` (string: probe|submit|status|tail|cancel|fetch)
+- `request_id` (string, caller-chosen)
+- `payload` (object)
+
+Response:
+- `protocol_version` (int)
+- `request_id` (string)
+- `ok` (bool)
+- `payload` (object, when ok=true)
+- `error` (object, when ok=false) containing: `code`, `message`, optional `data`
+
 ### Worker RPC surface (recommended, maps cleanly to SSH forced-command)
 Worker SHOULD implement these operations with JSON request/response payloads:
 - `probe` → returns `capabilities.json`
@@ -67,10 +89,14 @@ Worker SHOULD implement these operations with JSON request/response payloads:
 - `fetch` → returns artifacts (or a signed manifest + download hints)
 
 ### Job lifecycle + idempotency
-Worker MUST treat `(job_id, job_key)` as an idempotency key:
-- If a job with the same `(job_id, job_key)` is already COMPLETE, worker MAY return the existing artifacts.
-- If a job with the same `(job_id, job_key)` is RUNNING, worker MUST report status and allow log tailing.
-- If `(job_id, job_key)` mismatches (same job_id, different key), worker MUST reject to prevent artifact confusion.
+Worker MUST treat `job_id` as the idempotency key:
+- If a job with the same `job_id` is already COMPLETE, worker MAY return the existing artifacts.
+- If a job with the same `job_id` is RUNNING, worker MUST report status and allow log tailing.
+- If `job_id` already exists but the submitted `job_key` differs, worker MUST reject to prevent artifact confusion.
+
+Worker MAY additionally maintain a correctness-preserving *result cache* keyed by `job_key`:
+- On submit of a new `job_id` with a previously completed `job_key`, worker MAY materialize artifacts
+  from the cached result into the new `<job_id>/` artifact directory and record `cached_from_job_id`.
 
 ### Cancellation
 - Host MUST be able to request cancellation.
@@ -109,10 +135,11 @@ GC expectations:
 The host MUST create a canonical source bundle such that identical inputs yield identical `source_sha256`.
 
 Rules:
-- Use a deterministic archive format (e.g. `tar`) with:
+- Use a deterministic `tar` archive (PAX recommended) with:
   - sorted file paths (lexicographic, UTF-8)
   - normalized mtimes (e.g. 0) and uid/gid (0)
   - stable file modes (preserve executable bit; normalize others)
+  - fixed pax headers where applicable (avoid host-dependent extended attributes)
 - Exclude by default:
   - `.git/`, `.DS_Store`, `DerivedData/`, `.build/`, `**/*.xcresult/`, `**/.swiftpm/` (build artifacts)
   - any host-local RCH artifact directories
@@ -124,6 +151,13 @@ Rules:
 - The host MUST emit `source_manifest.json` listing:
   - `path`, `size`, `sha256` per file
   - manifest `schema_version`
+
+Transport note (non-normative but recommended):
+- The canonical tar MAY be compressed with zstd for transfer, but `source_sha256` MUST be computed
+  over the canonical (pre-compression) tar bytes.
+
+Compliance (recommended):
+- Provide a fixture-based reproducibility test: identical repo inputs on Linux/macOS produce identical `source_sha256`.
 
 ### Bundle modes (recommended)
 - `worktree`: include tracked + untracked files (except excluded patterns).
@@ -175,6 +209,7 @@ If accepted, the host MUST emit `invocation.json` containing:
 `summary.json` MUST include:
 - `status`: success | failed | rejected
 - `failure_kind`: CLASSIFIER_REJECTED | SSH | TRANSFER | EXECUTOR | XCODEBUILD | MCP | ARTIFACTS | CANCELLED | WORKER_INCOMPATIBLE | BUNDLER | ATTESTATION | WORKER_BUSY
+- `failure_subkind`: optional string for details (e.g. TIMEOUT_OVERALL | TIMEOUT_IDLE | PROTOCOL_ERROR)
 - `exit_code`: stable integer for scripting
 - `human_summary`: short string for console output
 
@@ -189,6 +224,9 @@ If accepted, the host MUST emit `invocation.json` containing:
 - 70: ARTIFACTS_FAILED
 - 80: CANCELLED
 - 90: WORKER_BUSY
+- 91: WORKER_INCOMPATIBLE
+- 92: BUNDLER
+- 93: ATTESTATION
 
 ## Agent-friendly summaries (recommended)
 In addition to `summary.json`, the worker SHOULD emit:
@@ -212,6 +250,16 @@ Caching MUST be correctness-preserving:
 ### Cache namespace (recommended)
 Repo config SHOULD provide a stable `cache_namespace` used as part of shared cache directory names,
 to prevent collisions across unrelated repos on the same worker.
+
+### Cache keying details (normative)
+- Any cache directory that can be reused across jobs MUST be additionally keyed by toolchain identity
+  (at minimum: Xcode build number and macOS major version) to prevent cross-toolchain corruption.
+- `metrics.json` SHOULD record the concrete cache key components used (job_key, xcode_build, macos_version, etc.).
+
+### Result cache (recommended)
+Worker SHOULD maintain an optional result cache keyed by `job_key`:
+- If present and complete, a submit MAY be satisfied by materializing artifacts from the cached result.
+- The worker MUST still emit a correct `attestation.json` for the new `job_id` referencing the same `job_key`.
 
 ### Locking + isolation (normative)
 - `per_job` DerivedData MUST be written under a directory derived from `job_key`.
@@ -269,6 +317,14 @@ The host MUST write:
 - Prefer an implementation that does not require arbitrary interactive shell access.
 - Not in scope: code signing, notarization, exporting archives, publishing.
 
+Clarification (normative):
+- The lane does not attempt to sandbox Xcode builds. Repo-defined build phases/plugins may execute on the worker.
+  Operators MUST treat the worker as a CI machine and scope secrets accordingly.
+
+Recommended mitigations:
+- Executor SHOULD use an environment-variable allowlist and redact obvious secrets in logs/artifacts.
+- Worker SHOULD avoid unlocking or accessing user keychains during execution.
+
 ## SSH hardening (recommended)
 - Use a dedicated `rch` user on the worker.
 - Prefer SSH keys restricted with:
@@ -324,7 +380,14 @@ If signature verification fails, host MUST mark the run as failed (`failure_kind
 All JSON artifacts MUST include:
 - `schema_version`
 - `created_at`
-- `job_id` and `job_key`
+
+Run-scoped artifacts MUST include:
+- `run_id`
+
+Job-scoped artifacts MUST include:
+- `run_id`
+- `job_id`
+- `job_key`
 
 ## Next steps
 1. Bring Mac mini worker online
