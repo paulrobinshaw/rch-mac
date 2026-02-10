@@ -225,6 +225,7 @@ Includes:
 - Deterministic: runs produce a JobSpec (`job.json`) plus the exact `job_key_inputs.json` used to compute a stable `job_key` for caching/attestation
 - Security posture: prefer a dedicated `rch` user; optionally use SSH forced-command; avoid signing/publishing workflows
 - Integrity: host verifies `manifest.json` digests; attestation binds worker identity + artifact set
+- Forward-compatible: consumers ignore unknown fields in artifacts with matching `schema_id` major version
 
 ### Hardening recommendations
 - Keep the worker "CI-clean": no personal Apple ID sessions, no developer keychains, minimal credentials.

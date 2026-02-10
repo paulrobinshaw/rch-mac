@@ -241,6 +241,13 @@ Workers SHOULD restrict `error.code` to a small, documented registry (examples):
 - `BUSY` (capacity exceeded; include `retry_after_seconds`)
 - `LEASE_EXPIRED` (job lease timed out)
 
+Error message guidance (recommended):
+- `error.message` SHOULD be a single-line, human-readable sentence describing the problem.
+- It SHOULD include the specific field or value that caused the error when applicable
+  (e.g. `"protocol_version 3 is outside supported range [1, 2]"`).
+- `error.data` MAY include machine-readable details (the failing field name, expected vs actual values).
+- Workers MUST NOT include secrets, file system paths outside the job directory, or stack traces in `error.message`.
+
 ### Binary framing (recommended)
 Some operations (notably `upload_source`) may need to transmit bytes efficiently.
 Implementations SHOULD support a framed stdin format:
@@ -385,6 +392,8 @@ It MUST include at least:
 - `selected_worker_host`: SSH host of the chosen worker
 - `continue_on_failure`: bool (whether failed steps should skip remaining steps; from config at plan creation time).
   On resumption, the host MUST use the value persisted in `run_plan.json`, not the current config.
+- `protocol_version`: int (the negotiated protocol version used for this run).
+  On resumption, the host MUST use this value for compatibility verification (see "Run resumption").
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
 it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
@@ -409,7 +418,12 @@ On restart, the host MUST:
      - If worker reports unknown `job_id` or is unreachable: re-submit the job with the same `job_id`.
 3. The host MUST NOT skip a failed job on resumption unless the run is already CANCELLED.
 4. `run_state.json` MUST record `resumed_at` (RFC 3339 UTC) when a run is resumed.
-5. If the original worker requires a lease and the host cannot re-acquire it (e.g. `WORKER_BUSY` or unreachable),
+5. The host MUST re-probe the worker and verify the `protocol_version` persisted in `run_plan.json`
+   is still within the worker's `[protocol_min, protocol_max]` range. If not, the host MUST fail with
+   `failure_kind=WORKER_INCOMPATIBLE` and `failure_subkind=PROTOCOL_DRIFT`.
+   The host MUST also verify the worker still has the Xcode build recorded in
+   `job_key_inputs.toolchain.xcode_build`; if absent, fail with `failure_subkind=TOOLCHAIN_CHANGED`.
+6. If the original worker requires a lease and the host cannot re-acquire it (e.g. `WORKER_BUSY` or unreachable),
    the host MUST fail the run with `failure_kind=WORKER_BUSY` (or `SSH` if unreachable).
    The host MUST NOT silently switch to a different worker mid-run, because `job_key_inputs` are bound
    to the original worker's toolchain and destination identity.
@@ -468,6 +482,8 @@ Rules:
 - The host MUST emit `source_manifest.json` (run-scoped, at `<run_id>/source_manifest.json`) listing:
   - `schema_version`, `schema_id` (`rch-xcode/source_manifest@1`), `created_at`, `run_id`, `source_sha256`
   - `entries[]`: each with `path`, `size`, `sha256`
+  - Entries SHOULD also include `type` (`file`|`symlink`|`directory`) and, when `type=symlink` and symlinks
+    are preserved, `symlink_target` (relative path). This enables auditing of symlink handling decisions.
 
 Transport note (non-normative but recommended):
 - The canonical tar MAY be compressed with zstd for transfer, but `source_sha256` MUST be computed
@@ -751,7 +767,7 @@ Worker reports a `capabilities.json` including:
 - capacity (max concurrent jobs, disk free)
 - limits (recommended): `max_upload_bytes`, `max_artifact_bytes`, `max_log_bytes`
 Normative:
-- `capabilities.json` MUST include `schema_version` and `created_at` (RFC 3339 UTC).
+- `capabilities.json` MUST include `schema_version`, `schema_id` (`rch-xcode/capabilities@1`), and `created_at` (RFC 3339 UTC).
 Optional but recommended:
 - worker identity material (SSH host key fingerprint and/or attestation public key fingerprint)
 Host stores the chosen worker capability snapshot in artifacts.
@@ -787,6 +803,25 @@ Selection algorithm (default):
 
 The host MUST write:
 - `worker_selection.json` (inputs, filtered set, chosen worker, reasons)
+
+### worker_selection.json schema (normative)
+`worker_selection.json` MUST include at least:
+
+| Field                        | Type   | Description                                               |
+|------------------------------|--------|-----------------------------------------------------------|
+| `schema_version`             | int    | Always `1`                                                |
+| `schema_id`                  | string | `rch-xcode/worker_selection@1`                            |
+| `created_at`                 | string | RFC 3339 UTC                                              |
+| `run_id`                     | string | Run identifier                                            |
+| `negotiated_protocol_version`| int    | Protocol version selected after probe                     |
+| `worker_protocol_range`      | object | `{ min, max }` from worker probe response                 |
+| `selected_worker`            | string | Chosen worker name                                        |
+| `selected_worker_host`       | string | SSH host of chosen worker                                 |
+| `selection_mode`             | string | `deterministic` or `adaptive`                             |
+| `candidate_count`            | int    | Number of workers passing tag + constraint filters        |
+| `probe_failures`             | array  | `[{ worker, probe_error, probe_duration_ms }]`            |
+| `snapshot_age_seconds`       | int    | Age of the capabilities snapshot used                     |
+| `snapshot_source`            | string | `cached` or `fresh`                                       |
 - `capabilities.json` snapshot as used for the decision
 
 Staleness policy (normative):
@@ -998,6 +1033,13 @@ Job-scoped artifacts MUST include:
   - `rch-xcode/job@1`
   - `rch-xcode/summary@1`
   - `rch-xcode/run_plan@1`
+
+### Unknown schema version handling (normative)
+Consumers encountering a `schema_version` higher than they support MUST NOT reject the artifact outright
+if the `schema_id` major version matches (e.g. consumer knows `@1`, artifact says `schema_version: 2` with `schema_id` still `...@1`).
+They MUST parse known fields and MUST ignore unknown fields (forward-compatible by default).
+If the `schema_id` major version differs (e.g. consumer knows `@1`, artifact says `@2`),
+the consumer MUST reject with a diagnostic naming the expected vs actual `schema_id`.
 
 ## Next steps
 1. Bring Mac mini worker online
