@@ -4,6 +4,7 @@
 > This README is **non-normative**: quickstart, operator notes, and examples.
 
 ## Docs map
+- `IMPLEMENTATION.md` — **practical build plan** (MVP scope, component map, milestone order)
 - `PLAN.md` — **normative** contract (classifier, JobSpec, protocol, artifacts, caching, security)
 - `.rch/xcode.toml` — repo-scoped configuration (checked in)
 - `~/.config/rch/workers.toml` — host-scoped worker inventory + credentials

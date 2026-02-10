@@ -982,6 +982,12 @@ If any check fails, the host MUST:
 - Record the mismatched paths/digests in `summary.json` under `integrity_errors[]`.
 - NOT use the artifacts for caching or attestation verification.
 
+## Scope annotations
+Sections in this spec are normative for the complete system. For MVP build order and practical
+implementation sequence, see IMPLEMENTATION.md which maps spec sections to milestones (M0–M7).
+Sections marked "recommended" or "optional" in this spec are post-MVP unless IMPLEMENTATION.md
+explicitly includes them in an MVP milestone.
+
 ## Milestones
 - **M0**: macOS worker reachable via SSH, tagged `macos,xcode`
 - **M1**: Classifier detects Xcode build/test safely
