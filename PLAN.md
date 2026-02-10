@@ -42,6 +42,13 @@ Generation guidance:
 - All timestamps in JSON artifacts MUST use RFC 3339 with UTC offset (`Z` suffix). Example: `2026-01-15T09:32:00Z`.
 - All text fields and file content MUST be UTF-8 encoded.
 
+### Clock skew tolerance (normative)
+- Host and worker clocks are independent; implementations MUST NOT assume cross-machine timestamp monotonicity.
+- For ordering within a single machine's artifacts, prefer `seq` (monotonic counter) over timestamps.
+- The host SHOULD log a warning if the worker's `probe` response timestamp differs from the host clock
+  by more than 30 seconds, as this may cause confusing artifact timelines.
+- Consumers MUST NOT reject artifacts solely because cross-machine timestamps are non-monotonic.
+
 ### JobSpec schema outline (v1)
 The canonical JobSpec (`job.json`) MUST include at least these fields:
 
@@ -332,8 +339,8 @@ QUEUED → RUNNING → { SUCCEEDED | FAILED | CANCELLED }
 - `CANCELLED`: job was terminated due to cancellation.
 
 ### State artifacts
-- `run_state.json`: persisted at `<run_id>/run_state.json` with fields: `run_id`, `state`, `updated_at`, `schema_version`.
-- `job_state.json`: persisted at `<run_id>/steps/<action>/<job_id>/job_state.json` with fields: `job_id`, `run_id`, `state`, `updated_at`, `schema_version`.
+- `run_state.json`: persisted at `<run_id>/run_state.json` with fields: `schema_version`, `schema_id` (`rch-xcode/run_state@1`), `run_id`, `state`, `created_at`, `updated_at`.
+- `job_state.json`: persisted at `<run_id>/steps/<action>/<job_id>/job_state.json` with fields: `schema_version`, `schema_id` (`rch-xcode/job_state@1`), `run_id`, `job_id`, `job_key`, `state`, `created_at`, `updated_at`.
 
 Both MAY additionally include:
 - `seq` (int): monotonic sequence number incremented on every state transition for the artifact.
@@ -349,6 +356,15 @@ It MUST include at least:
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
 it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
+
+### Concurrent host runs (normative)
+Multiple runs MAY execute concurrently on the same host. To prevent interference:
+- Each run MUST use a unique `run_id`, ensuring artifact directories do not collide.
+- The host MUST NOT hold filesystem locks on shared resources (e.g. the artifact root) across runs.
+- If the worker returns `WORKER_BUSY` (capacity exhausted), the host MUST respect `retry_after_seconds`
+  and MUST NOT busy-loop. The host SHOULD implement bounded retry with exponential backoff (recommended max: 3 retries).
+- Host-side artifact GC MUST acquire a lock before scanning/deleting, and MUST skip artifacts
+  belonging to any RUNNING run (determined by `run_state.json`).
 
 ### Run resumption (normative)
 On restart, the host MUST:
@@ -426,6 +442,15 @@ Compliance (recommended):
 
 If the bundler cannot apply canonicalization, the job MUST be rejected (`failure_kind=BUNDLER`).
 
+### Bundle size enforcement (normative)
+- If `bundle.max_bytes` > 0, the host MUST reject the bundle before upload if it exceeds the limit,
+  with `failure_kind=BUNDLER` and `failure_subkind=SIZE_EXCEEDED`.
+- If the worker's `capabilities.json` includes `max_upload_bytes`, the host MUST reject the bundle
+  before upload if it exceeds that limit (same failure kind/subkind).
+- The effective limit is `min(bundle.max_bytes, worker.max_upload_bytes)` where 0 means "no limit from that source".
+- The worker MUST reject an `upload_source` request if the `content_length` exceeds `max_upload_bytes`,
+  returning error code `PAYLOAD_TOO_LARGE` with the limit in `data.max_bytes`.
+
 ## Classifier (safety gate)
 The classifier MUST:
 - match only supported forms of `xcodebuild` invocations
@@ -493,7 +518,12 @@ destination rules, allowed flags).
 
 ## Failure taxonomy
 `summary.json` MUST include:
-- `status`: success | failed | rejected | cancelled
+- `status`: `success` | `failed` | `rejected` | `cancelled`
+  - `rejected` is used when the classifier rejects the invocation (no job execution occurs;
+    the job state machine is not entered). `rejected` jobs MUST NOT have a `job_state.json`.
+  - `success` corresponds to the `SUCCEEDED` terminal state in the job state machine.
+  - `failed` corresponds to the `FAILED` terminal state.
+  - `cancelled` corresponds to the `CANCELLED` terminal state.
 - `failure_kind`: CLASSIFIER_REJECTED | SSH | TRANSFER | EXECUTOR | XCODEBUILD | MCP | ARTIFACTS | CANCELLED | WORKER_INCOMPATIBLE | BUNDLER | ATTESTATION | WORKER_BUSY
 - `failure_subkind`: optional string for details (e.g. TIMEOUT_OVERALL | TIMEOUT_IDLE | PROTOCOL_ERROR)
 - `exit_code`: stable integer for scripting
@@ -535,7 +565,7 @@ Aggregation rule:
 | `schema_id`      | string | `rch-xcode/run_summary@1`                           |
 | `run_id`         | string | Run identifier                                      |
 | `created_at`     | string | RFC 3339 UTC                                        |
-| `status`         | string | `success` \| `failed` \| `cancelled`                  |
+| `status`         | string | `success` \| `failed` \| `rejected` \| `cancelled`    |
 | `exit_code`      | int    | Aggregated per run-level exit code rules             |
 | `step_count`     | int    | Total steps in the run                               |
 | `steps_succeeded`| int    | Count of steps with `status=success`                 |
@@ -552,10 +582,18 @@ In addition to `summary.json`, the worker SHOULD emit:
 These MUST be derived from authoritative sources (`xcresult` when present; logs as fallback).
 
 ## Timeouts + retries
-- SSH/connect retries with backoff
-- Transfer retries (idempotent)
-- Executor timeout (overall + idle-log watchdog)
-On failure, artifacts MUST still include logs + diagnostics if available.
+
+### Timeout defaults and bounds (normative)
+- `overall_seconds`: maximum wall-clock time for a single job execution. Default: 1800 (30 min). MUST be > 0 and ≤ 86400 (24h).
+- `idle_log_seconds`: maximum time without new log output before the host kills the job. Default: 300 (5 min). MUST be > 0 and ≤ `overall_seconds`.
+- `connect_timeout_seconds`: SSH/transport connection timeout. Default: 30. MUST be > 0 and ≤ 300.
+- If any timeout value is out of bounds, the host MUST reject the configuration and exit with a diagnostic (before run execution).
+
+### Retry policy (normative)
+- SSH/connect: retry with exponential backoff. Default: 3 attempts, initial delay 2s, max delay 30s.
+- Transfer (upload_source): retry with backoff (idempotent by `source_sha256`). Default: 3 attempts.
+- Executor: MUST NOT retry automatically (non-idempotent). Retries require a new run.
+- On failure at any stage, artifacts MUST still include logs + diagnostics if available.
 
 ## Caching
 Caching MUST be correctness-preserving:
@@ -775,6 +813,18 @@ before accepting signed attestations.
 `artifact_root_sha256` MUST be computed as:
 - `sha256_hex( JCS(entries) )`
 where `entries` is the exact array written to `manifest.json`.
+
+### Host manifest verification (normative)
+After fetching a job's artifacts, the host MUST:
+1. Recompute `artifact_root_sha256` from the fetched `manifest.json` entries and verify it matches the declared value.
+2. Verify `sha256` and `size` for every entry in `manifest.json` against the fetched files.
+3. Verify that no extra files exist in the artifact directory beyond those listed in `manifest.json`
+   (plus `manifest.json`, `attestation.json`, and `job_index.json` themselves).
+
+If any check fails, the host MUST:
+- Mark the job as failed with `failure_kind=ARTIFACTS` and `failure_subkind=INTEGRITY_MISMATCH`.
+- Record the mismatched paths/digests in `summary.json` under `integrity_errors[]`.
+- NOT use the artifacts for caching or attestation verification.
 
 ## Milestones
 - **M0**: macOS worker reachable via SSH, tagged `macos,xcode`

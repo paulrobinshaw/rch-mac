@@ -207,6 +207,7 @@ Includes:
 - job_state.json
 - invocation.json
 - toolchain.json
+- destination.json
 - metrics.json
 - source_manifest.json
 - worker_selection.json
