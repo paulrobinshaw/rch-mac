@@ -49,7 +49,7 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 **macOS worker**
 - Xcode installed
 - SSH access
-- rsync + zstd
+- zstd (for source bundle compression)
 - Node.js + XcodeBuildMCP (recommended for `backend="mcp"`)
 - (Recommended) dedicated `rch` user + constrained SSH key/forced-command
   - Recommended: forced-command runs a single `rch-worker xcode ...` entrypoint (no shell)

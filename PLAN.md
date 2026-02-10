@@ -410,7 +410,7 @@ It MUST include at least:
   indicating whether the classifier rejected this step at plan time
 - `selected_worker`: worker name chosen for this run
 - `selected_worker_host`: SSH host of the chosen worker
-- `continue_on_failure`: bool (whether failed steps should skip remaining steps; from config at plan creation time).
+- `continue_on_failure`: bool (if true, execute remaining steps even after a failure; default false means abort on first failure. Persisted from config at plan creation time).
   On resumption, the host MUST use the value persisted in `run_plan.json`, not the current config.
 - `protocol_version`: int (the negotiated protocol version used for this run).
   On resumption, the host MUST use this value for compatibility verification (see "Run resumption").
