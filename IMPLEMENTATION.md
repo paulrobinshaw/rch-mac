@@ -45,7 +45,17 @@ Host (Linux/macOS)                          Worker (macOS)
 - Content-addressed source store on worker (skip re-upload if `source_sha256` matches)
 - Binary framing for `upload_source` (JSON header + raw bytes; zstd compression)
 - Run builder: resolve repo `verify` actions → `run_plan.json` with ordered step jobs
-- Sequential step execution; abort on first failure (unless `continue_on_failure`)
+- Destination resolver: resolve constraints (e.g. ) against worker capabilities snapshot
+  - Record resolved destination (platform, os_version, sim_runtime_identifier) in job_key_inputs
+  - Emit  per job
+- State artifacts: emit  and  on every state transition (atomic write-then-rename)
+  - Required for signal handling, resumption, and observability
+- Destination resolver: resolve constraints (e.g. OS=latest) against worker capabilities snapshot
+  - Record resolved destination (platform, os_version, sim_runtime_identifier) in job_key_inputs
+  - Emit destination.json per job
+- State artifacts: emit run_state.json and job_state.json on every state transition (atomic write-then-rename)
+  - Required for signal handling, resumption, and observability
+- Sequential step execution; abort on first failure (unless continue_on_failure)
 - Worker selection: filter by tags → filter by constraints → sort by priority/name → first
   - Emit `worker_selection.json`
 - Job lifecycle: `submit` → poll `status` → fetch artifacts
@@ -102,6 +112,11 @@ Host (Linux/macOS)                          Worker (macOS)
 - Validate workspace/project/scheme against `.rch/xcode.toml`
 - Emit structured rejection reasons
 - Policy snapshot for auditability (`classifier_policy.json`)
+
+### Destination resolver (src/xcode/destination)
+- Resolve destination constraints against worker capabilities.json
+- Map OS=latest to concrete version + runtime identifiers
+- Validate destination availability on selected worker
 
 ### Source bundler (`src/xcode/bundler`)
 - Deterministic tar (PAX format recommended)
