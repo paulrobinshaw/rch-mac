@@ -308,7 +308,12 @@ On receiving SIGINT or SIGTERM, the host MUST:
 3. Persist `run_state.json` with `state=CANCELLED` and `run_summary.json` with available results.
 4. Exit with code 80 (`CANCELLED`).
 
-On receiving a second SIGINT (double-interrupt), the host MAY exit immediately without waiting for cancellation acknowledgement, but MUST still persist `run_state.json`.
+On receiving a second SIGINT (double-interrupt), the host MAY exit immediately without waiting for
+cancellation acknowledgement, but MUST still persist `run_state.json`. The first SIGINT MUST dispatch
+`cancel` RPCs before returning (fire-and-forget is acceptable); second SIGINT only skips the wait for ack.
+
+Lease-based backstop (normative): if the worker supports leases, it MUST auto-cancel any RUNNING jobs
+whose lease expires without a `release`, providing a safety net for host crashes or unclean exits.
 
 ### Log streaming (recommended)
 - Worker SHOULD support a "tail" mode so host can stream logs while running.
@@ -354,6 +359,8 @@ QUEUED → RUNNING → { SUCCEEDED | FAILED | CANCELLED }
 
 ### State artifacts
 - `run_state.json`: persisted at `<run_id>/run_state.json` with fields: `schema_version`, `schema_id` (`rch-xcode/run_state@1`), `run_id`, `state`, `created_at`, `updated_at`.
+  `run_state.json` SHOULD also include `current_step` (`{ index, job_id, action }` or null) indicating the
+  currently executing step, to allow lightweight observability without scanning per-job state files.
 - `job_state.json`: persisted at `<run_id>/steps/<action>/<job_id>/job_state.json` with fields: `schema_version`, `schema_id` (`rch-xcode/job_state@1`), `run_id`, `job_id`, `job_key`, `state`, `created_at`, `updated_at`.
 
 Both MAY additionally include:
@@ -376,6 +383,8 @@ It MUST include at least:
 - `steps`: ordered array of `{ index, action, job_id }`
 - `selected_worker`: worker name chosen for this run
 - `selected_worker_host`: SSH host of the chosen worker
+- `continue_on_failure`: bool (whether failed steps should skip remaining steps; from config at plan creation time).
+  On resumption, the host MUST use the value persisted in `run_plan.json`, not the current config.
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
 it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
@@ -431,6 +440,10 @@ Protocol expectations:
   - `upload_id` (string), `offset` (int)
 Worker SHOULD respond with `next_offset` to support resumable uploads.
 
+Atomicity (normative): `upload_source` MUST be atomic by `source_sha256`. If the bundle already
+exists when the upload completes (e.g. concurrent upload from another host), the worker MUST discard
+the duplicate and return success. Workers SHOULD use write-to-temp-then-rename to prevent partial visibility.
+
 GC expectations:
 - Bundle GC MUST NOT remove bundles referenced by RUNNING jobs.
 - Bundle GC policy MAY align with cache eviction policy (age/size based).
@@ -452,8 +465,8 @@ Rules:
 - Symlink handling MUST be safe:
   - symlinks that escape the repo root MUST be rejected (`failure_kind=BUNDLER`)
   - host MUST choose either "preserve symlink" or "dereference within root" deterministically per config
-- The host MUST emit `source_manifest.json` (job-scoped) listing:
-  - `schema_version`, `schema_id` (`rch-xcode/source_manifest@1`), `created_at`, `run_id`, `job_id`, `job_key`
+- The host MUST emit `source_manifest.json` (run-scoped, at `<run_id>/source_manifest.json`) listing:
+  - `schema_version`, `schema_id` (`rch-xcode/source_manifest@1`), `created_at`, `run_id`, `source_sha256`
   - `entries[]`: each with `path`, `size`, `sha256`
 
 Transport note (non-normative but recommended):
@@ -598,6 +611,8 @@ Aggregation rule:
 | `steps_succeeded`| int    | Count of steps with `status=success`                 |
 | `steps_failed`   | int    | Count of steps with `status=failed`                  |
 | `steps_cancelled`| int    | Count of steps with `status=cancelled`               |
+| `steps_skipped` | int    | Count of steps skipped due to early-abort              |
+| `steps_rejected`| int    | Count of steps with `status=rejected`                 |
 | `duration_ms`    | int    | Wall-clock duration of the entire run                |
 | `human_summary`  | string | One-line human-readable summary                      |
 
@@ -716,6 +731,11 @@ If the worker advertises feature `lease`, the host SHOULD:
 `release` MUST be idempotent: if the lease is unknown or already expired, the worker MUST return `ok: true` (no error). This simplifies host cleanup after crashes or lease expiry.
 
 If the worker is at capacity, `reserve` SHOULD fail with `failure_kind=WORKER_BUSY` and include `retry_after_seconds`.
+
+Lease TTL guidance (normative): workers SHOULD set lease TTL >= `connect_timeout_seconds + overall_seconds`
+to minimize spurious expiry during slow uploads. If `submit` fails with `LEASE_EXPIRED`, the host MUST
+attempt a single `reserve` + re-submit cycle before failing the run. `run_state.json` SHOULD record
+`lease_renewed: true` if re-reservation occurs.
 
 ## Worker capabilities
 Worker reports a `capabilities.json` including:

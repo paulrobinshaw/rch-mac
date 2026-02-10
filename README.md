@@ -93,7 +93,7 @@ Treat the worker like CI: dedicated account, minimal secrets, and no personal ke
 - The host selects a worker once and (if supported) acquires a time-bounded **lease** to avoid cross-host contention.
 - Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
 - `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`), executed sequentially. A failed step skips the rest (unless `continue_on_failure` is set).
-- The host persists a `run_plan.json` up front (including the selected worker) so runs can be resumed after interruption.
+- The host persists a `run_plan.json` up front (including the selected worker and `continue_on_failure` flag) so runs can be resumed after interruption with identical semantics.
 - The run produces a **run summary** that links to each step job's artifact set.
 
 ## Worker inventory example (`~/.config/rch/workers.toml`)
@@ -209,7 +209,7 @@ Includes:
 - toolchain.json
 - destination.json
 - metrics.json
-- source_manifest.json
+- source_manifest.json (run-scoped)
 - worker_selection.json
 - job_index.json (per job)
 - events.jsonl (recommended)
