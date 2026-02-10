@@ -3,8 +3,16 @@
 > **Normative spec:** `PLAN.md` is the contract.  
 > This README is **non-normative**: quickstart, operator notes, and examples.
 
+## Docs map
+- `PLAN.md` — **normative** contract (classifier, JobSpec, protocol, artifacts, caching, security)
+- `.rch/xcode.toml` — repo-scoped configuration (checked in)
+- `~/.config/rch/workers.toml` — host-scoped worker inventory + credentials
+
 ## What it is
-An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test to a remote Mac mini using XcodeBuildMCP.
+An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test to a remote macOS worker (e.g. a Mac mini).
+Execution can use either:
+- **Backend `xcodebuild` (MVP)**, or
+- **Backend `mcp` (preferred)** via XcodeBuildMCP for richer diagnostics/orchestration.
 
 ## Why
 Agents running on Linux or busy Macs can still validate iOS/macOS projects under pinned Xcode conditions without local Xcode installs.
@@ -14,7 +22,8 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 - Xcode installed
 - SSH access
 - rsync + zstd
-- Node.js + XcodeBuildMCP (recommended)
+- Node.js + XcodeBuildMCP (recommended for `backend="mcp"`)
+- (Recommended) dedicated `rch` user + constrained SSH key/forced-command
 
 **Host**
 - RCH client + daemon
@@ -25,6 +34,11 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 2. Add `.rch/xcode.toml` to your repo
 3. Start daemon: `rch daemon start`
 4. Run: `rch xcode verify`
+
+## Mental model (operator view)
+- You run `rch xcode verify` locally (even on Linux).
+- RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
+- Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
 
 ## Repo config (`.rch/xcode.toml`)
 Example:
@@ -60,6 +74,13 @@ Intercept is **deny-by-default**:
 Useful commands:
 - `rch xcode explain -- <command...>`  (why it will/won't be intercepted)
 - `rch xcode verify --dry-run`         (prints resolved plan + selected worker)
+- `rch workers list --tag macos,xcode` (show matching workers)
+- `rch workers probe <name>`           (fetch capabilities snapshot)
+
+## Common pitfalls
+- **Wrong Xcode selected**: ensure worker `DEVELOPER_DIR` is stable/pinned.
+- **Simulator mismatch**: pinned destination must exist on the worker (see `capabilities.json`).
+- **Long first build**: warm SPM + DerivedData caches (see `cache.*` modes in config).
 
 ## Outputs
 Artifacts are written to:
@@ -74,6 +95,10 @@ Includes:
 - invocation.json
 - toolchain.json
 - metrics.json
+- source_manifest.json
+- worker_selection.json
+- test_summary.json (recommended)
+- build_summary.json (recommended)
 - build.log
 - result.xcresult/
 
