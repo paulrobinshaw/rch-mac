@@ -84,6 +84,7 @@ Treat the worker like CI: dedicated account, minimal secrets, and no personal ke
 ## Mental model (operator view)
 - You run `rch xcode verify` locally (even on Linux).
 - RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
+- The host selects a worker once and (if supported) acquires a time-bounded **lease** to avoid cross-host contention.
 - Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
 - `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`).
 - The host persists a `run_plan.json` up front so runs can be resumed after interruption.
@@ -100,6 +101,7 @@ user = "rch"
 port = 22
 tags = ["macos","xcode"]
 known_host_fingerprint = "SHA256:..."
+attestation_pubkey_fingerprint = "SHA256:..." # optional pin for signed attestation
 ssh_key_path = "~/.ssh/rch_macmini"
 priority = 10
 ```
@@ -173,15 +175,19 @@ Artifacts are written to:
 `~/.local/share/rch/artifacts/xcode/<run_id>/`
 
 Layout (example):
+- `run_index.json`
 - `run_summary.json`
 - `run_plan.json`
 - `run_state.json`
 - `worker_selection.json`
 - `capabilities.json`
+- `steps/build/<job_id>/job_index.json`
 - `steps/build/<job_id>/...`
+- `steps/test/<job_id>/job_index.json`
 - `steps/test/<job_id>/...`
 
 Includes:
+- run_index.json
 - run_summary.json
 - run_plan.json
 - run_state.json
@@ -197,6 +203,7 @@ Includes:
 - metrics.json
 - source_manifest.json
 - worker_selection.json
+- job_index.json (per job)
 - events.jsonl (recommended)
 - test_summary.json (recommended)
 - build_summary.json (recommended)

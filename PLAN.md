@@ -110,7 +110,7 @@ Optional but recommended:
 ## Architecture (high level)
 Pipeline stages:
 1. **Classifier**: detects safe, supported Xcode build/test invocations (deny-by-default).
-2. **Run builder**: resolves repo `verify` actions into an ordered run plan, allocates stable `job_id`s, persists `run_plan.json`, and chooses a worker once.
+2. **Run builder**: resolves repo `verify` actions into an ordered run plan, allocates stable `job_id`s, persists `run_plan.json`, chooses a worker once, and (when supported) acquires a time-bounded **worker lease**.
 3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination (including simulator runtime identifiers/builds).
    - **Destination provisioning (optional, recommended)**: if `destination.provisioning="ephemeral"` and the destination is a Simulator, the worker provisions a clean simulator per job and records the created UDID in artifacts (UDID MUST NOT affect `job_key`).
 4. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
@@ -179,9 +179,25 @@ Response:
 - `payload` (object, when ok=true)
 - `error` (object, when ok=false) containing: `code`, `message`, optional `data`
 
+### Binary framing (recommended)
+Some operations (notably `upload_source`) may need to transmit bytes efficiently.
+Implementations SHOULD support a framed stdin format:
+1) A single UTF-8 JSON header line terminated by `\n`
+2) Immediately followed by exactly `content_length` raw bytes (if `payload.stream` is present)
+
+The header MUST include:
+- `payload.stream.content_length` (int)
+- `payload.stream.content_sha256` (sha256 hex of the raw streamed bytes)
+- `payload.stream.compression` (`none`|`zstd`) and `payload.stream.format` (`tar`)
+
+The worker MUST verify `content_sha256` before processing, then (if compressed) decompress
+and verify the resulting canonical bundle digest matches `source_sha256`.
+
 ### Worker RPC surface (recommended, maps cleanly to SSH forced-command)
 Worker SHOULD implement these operations with JSON request/response payloads:
 - `probe` → returns protocol range/features + `capabilities.json`
+- `reserve` → requests a lease for a run (capacity reservation; optional but recommended)
+- `release` → releases a lease early (optional)
 - `submit` → accepts `job.json` (+ optional bundle upload reference), returns ACK and initial status
 - `status` → returns current job status and pointers to logs/artifacts
 - `tail` → returns the next chunk of logs/events given a cursor (repeatable; host loops to "stream")
@@ -261,6 +277,10 @@ QUEUED → RUNNING → { SUCCEEDED | FAILED | CANCELLED }
 - `run_state.json`: persisted at `<run_id>/run_state.json` with fields: `run_id`, `state`, `updated_at`, `schema_version`.
 - `job_state.json`: persisted at `<run_id>/steps/<action>/<job_id>/job_state.json` with fields: `job_id`, `run_id`, `state`, `updated_at`, `schema_version`.
 
+Both MAY additionally include:
+- `seq` (int): monotonic sequence number incremented on every state transition for the artifact.
+If present, consumers SHOULD prefer `seq` over timestamps for ordering.
+
 Both MUST be updated atomically (write-then-rename) on every state transition.
 
 ### Run plan artifact (normative)
@@ -290,6 +310,13 @@ Protocol expectations:
 - Host MAY query whether the worker already has `source_sha256` (via `has_source` RPC op).
 - If present, host SHOULD skip re-uploading the bundle and submit only `job.json`.
 - If absent, host uploads the canonical bundle once (via `upload_source` RPC op); worker stores it under `source_sha256`.
+
+`upload_source` payload (recommended):
+- `source_sha256` (string)
+- `stream` (object; see "Binary framing") describing the streamed bytes
+- optional `resume` object (if feature `upload_resumable` is present):
+  - `upload_id` (string), `offset` (int)
+Worker SHOULD respond with `next_offset` to support resumable uploads.
 
 GC expectations:
 - Bundle GC MUST NOT remove bundles referenced by RUNNING jobs.
@@ -470,6 +497,15 @@ Eviction MUST NOT delete caches that are currently locked/in use.
 - If capacity exceeded, worker MUST respond with a structured "busy" state so host can retry/backoff.
   - Response SHOULD include `retry_after_seconds`.
 
+## Worker lease (recommended)
+If the worker advertises feature `lease`, the host SHOULD:
+- call `reserve` once per run (before submitting any jobs),
+- include the returned `lease_id` on each `submit`,
+- renew or re-reserve if the lease expires before completion,
+- and call `release` when the run finishes.
+
+If the worker is at capacity, `reserve` SHOULD fail with `failure_kind=WORKER_BUSY` and include `retry_after_seconds`.
+
 ## Worker capabilities
 Worker reports a `capabilities.json` including:
 - Installed Xcode versions as an array of objects, each containing:
@@ -572,10 +608,20 @@ Optional but recommended:
 - Host verifies signature and records `attestation_verification.json`.
 If signature verification fails, host MUST mark the run as failed (`failure_kind=ATTESTATION`).
 
+### Attestation key pinning (recommended)
+Host worker inventory MAY pin an `attestation_pubkey_fingerprint`.
+If pinned and the worker provides a signing key, the host MUST verify the fingerprint match
+before accepting signed attestations.
+
 ## Artifact manifest (normative)
 `manifest.json` MUST enumerate produced artifacts with at least:
 - `path` (relative), `size`, `sha256`
-`manifest.json` SHOULD also include `artifact_root_sha256` (digest over ordered entries) to bind the set.
+`manifest.json` MUST also include `artifact_root_sha256` to bind the set.
+
+`entries` MUST be sorted lexicographically by `path` (UTF-8).
+`artifact_root_sha256` MUST be computed as:
+- `sha256_hex( JCS(entries) )`
+where `entries` is the exact array written to `manifest.json`.
 
 ## Milestones
 - **M0**: macOS worker reachable via SSH, tagged `macos,xcode`
@@ -595,11 +641,16 @@ The project SHOULD maintain a conformance test suite that validates:
 - Source bundle reproducibility: identical repo state → identical `source_sha256` (cross-platform).
 - Artifact schema compliance: all emitted JSON artifacts validate against their JSON Schemas.
 - Protocol round-trip: a mock worker can handle all RPC ops and return valid responses.
+- Protocol replay: recorded request/response transcripts can be replayed deterministically against host logic.
 - State machine transitions: run and job states follow the defined state diagrams.
 - Cache correctness: result cache hits produce artifacts identical to fresh runs.
 
 Tests SHOULD be runnable without a live worker (use a mock worker + fixtures) and integrated into CI.
 The project SHOULD ship a minimal mock worker implementation that validates request/response schemas and exercises host logic deterministically.
+
+Recommended fixtures:
+- A minimal Xcode fixture project (build + test) with stable outputs suitable for golden assertions.
+- Classifier fixtures: a corpus of accepted/rejected `xcodebuild` invocations (including tricky edge cases).
 
 ## JSON Schemas (recommended)
 The project SHOULD ship machine-readable JSON Schemas for all normative artifacts under `schemas/rch-xcode/`.
@@ -611,6 +662,7 @@ Schema authoring recommendations:
 - Use a single JSON Schema draft consistently across the project (2020-12 recommended).
 
 ## Artifacts
+- run_index.json
 - run_summary.json
 - run_plan.json
 - run_state.json
@@ -623,16 +675,33 @@ Schema authoring recommendations:
 - job_state.json
 - invocation.json
 - toolchain.json
-- destination.json (recommended)
+- destination.json
 - metrics.json
 - source_manifest.json
 - worker_selection.json
+- job_index.json
 - events.jsonl (recommended)
 - test_summary.json (recommended)
 - build_summary.json (recommended)
 - junit.xml (recommended, test jobs)
 - build.log
 - result.xcresult/
+
+## Artifact indices (normative)
+To make artifact discovery stable for tooling, the system MUST provide:
+
+- `run_index.json` at `<run_id>/run_index.json`
+- `job_index.json` at `<run_id>/steps/<action>/<job_id>/job_index.json`
+
+`run_index.json` MUST include pointers (relative paths) to:
+- `run_plan.json`, `run_state.json`, `run_summary.json`
+- `worker_selection.json` and the selected `capabilities.json` snapshot
+- an ordered list of step jobs with `{ index, action, job_id, job_index_path }`
+
+`job_index.json` MUST include pointers (relative paths) to the job's:
+- `job.json`, `job_state.json`, `summary.json`, `manifest.json`, `attestation.json`
+- primary human artifacts (`build.log`, `result.xcresult/` when present)
+and MUST record the `artifact_profile` produced.
 
 ## Artifact schemas + versioning
 All JSON artifacts MUST include:
