@@ -195,12 +195,6 @@ Jobs MAY request an `artifact_profile`:
 The system MUST behave as if there is a versioned protocol even if implemented over SSH.
 
 ### Versioning + feature negotiation
-### Protocol version bootstrap (normative)
-`probe` requests MUST use `protocol_version: 0` (sentinel value). The worker MUST accept `protocol_version: 0`
-exclusively for `op: "probe"` and MUST reject `protocol_version: 0` for all other operations with error code
-`UNSUPPORTED_PROTOCOL`. After probe, the host selects a concrete version within the negotiated range and uses
-it for all subsequent requests.
-
 On `probe`, the worker MUST report:
 - `rch_xcode_lane_version` (string)
 - `protocol_min` / `protocol_max` (int; inclusive range supported by the worker)
@@ -247,10 +241,6 @@ Implementations SHOULD support a framed stdin format:
 1) A single UTF-8 JSON header line terminated by `\n`
 2) Immediately followed by exactly `content_length` raw bytes (if `payload.stream` is present)
 
-Discriminator: if the request `payload` contains a `stream` object, the worker MUST parse stdin as framed
-(a single JSON header line terminated by `\n`, followed by exactly `content_length` raw bytes).
-If `payload.stream` is absent, the entire stdin is a single JSON object (no binary payload follows).
-
 The header MUST include:
 - `payload.stream.content_length` (int)
 - `payload.stream.content_sha256` (sha256 hex of the raw streamed bytes)
@@ -277,10 +267,6 @@ Worker MUST treat `job_id` as the idempotency key:
 - If a job with the same `job_id` is already COMPLETE, worker MAY return the existing artifacts.
 - If a job with the same `job_id` is RUNNING, worker MUST report status and allow log tailing.
 - If `job_id` already exists but the submitted `job_key` differs, worker MUST reject to prevent artifact confusion.
-- If `job_id` exists but is in a non-terminal, non-running state (e.g. orphaned after a worker crash with partial artifacts),
-  the worker MUST clean up the partial artifact directory and re-execute the job from scratch.
-  Workers SHOULD detect this state on startup or on submit by checking for a `job_id` directory that lacks a `job_index.json`
-  commit marker and is not actively running.
 
 On `submit`, worker MUST validate:
 - `job_key` matches SHA-256(JCS(`job_key_inputs`)) as defined in "Job key computation"
@@ -362,20 +348,11 @@ If present, consumers SHOULD prefer `seq` over timestamps for ordering.
 
 Both MUST be updated atomically (write-then-rename) on every state transition.
 
-### Step execution semantics (normative)
-Steps in `run_plan.json` MUST execute sequentially in plan order.
-If a step ends with `status=failed` or `status=rejected`, subsequent steps MUST be skipped
-(their `job_state.json` MUST NOT be created) unless the run is explicitly configured with
-`run.continue_on_failure = true`, in which case all steps execute regardless of prior failures.
-Skipped steps MUST be recorded in `run_summary.json` under `steps_skipped` (int).
-
 ### Run plan artifact (normative)
 The host MUST emit `run_plan.json` at `<run_id>/run_plan.json` before starting execution.
 It MUST include at least:
 - `schema_version`, `schema_id` (`rch-xcode/run_plan@1`), `created_at`, `run_id`
 - `steps`: ordered array of `{ index, action, job_id }`
-- `selected_worker`: worker name chosen for this run
-- `selected_worker_host`: SSH host of the chosen worker
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
 it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
@@ -400,10 +377,6 @@ On restart, the host MUST:
      - If worker reports unknown `job_id` or is unreachable: re-submit the job with the same `job_id`.
 3. The host MUST NOT skip a failed job on resumption unless the run is already CANCELLED.
 4. `run_state.json` MUST record `resumed_at` (RFC 3339 UTC) when a run is resumed.
-5. If the original worker requires a lease and the host cannot re-acquire it (e.g. `WORKER_BUSY` or unreachable),
-   the host MUST fail the run with `failure_kind=WORKER_BUSY` (or `SSH` if unreachable).
-   The host MUST NOT silently switch to a different worker mid-run, because `job_key_inputs` are bound
-   to the original worker's toolchain and destination identity.
 
 ## Deterministic JobSpec + Job Key
 Each remote run is driven by a `job.json` (JobSpec) generated on the host.
@@ -658,9 +631,6 @@ Worker SHOULD maintain an optional result cache keyed by `job_key`:
 - The worker MUST still emit a correct `attestation.json` for the new `job_id` referencing the same `job_key`.
 
 Profile-aware reuse (recommended, prevents surprise omissions):
-- When materializing from cache, the worker MUST rewrite `run_id`, `job_id`, `created_at`, and `job_key`
-  in all job-scoped artifacts to reflect the new job context. The worker MUST record `cached_from_job_id`
-  (the original job_id) in `summary.json`.
 - Each cached entry SHOULD record `artifact_profile` it satisfies.
 - A submit MAY be satisfied from cache ONLY if cached `artifact_profile` is >= requested `artifact_profile`.
 - Otherwise, the worker MUST execute the job to produce the missing richer artifacts.
@@ -852,10 +822,6 @@ After fetching a job's artifacts, the host MUST:
 2. Verify `sha256` and `size` for every entry in `manifest.json` against the fetched files.
 3. Verify that no extra files exist in the artifact directory beyond those listed in `manifest.json`
    (plus `manifest.json`, `attestation.json`, and `job_index.json` themselves).
-
-Inclusion rule (normative): `manifest.json` entries MUST include every file and directory in the job artifact
-directory EXCEPT `manifest.json`, `attestation.json`, and `job_index.json` themselves. This makes the
-"no extra files" check above unambiguous: any file not in entries and not in the excluded triple is a violation.
 
 If any check fails, the host MUST:
 - Mark the job as failed with `failure_kind=ARTIFACTS` and `failure_subkind=INTEGRITY_MISMATCH`.

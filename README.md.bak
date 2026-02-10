@@ -92,8 +92,8 @@ Treat the worker like CI: dedicated account, minimal secrets, and no personal ke
 - RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
 - The host selects a worker once and (if supported) acquires a time-bounded **lease** to avoid cross-host contention.
 - Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
-- `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`), executed sequentially. A failed step skips the rest (unless `continue_on_failure` is set).
-- The host persists a `run_plan.json` up front (including the selected worker) so runs can be resumed after interruption.
+- `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`).
+- The host persists a `run_plan.json` up front so runs can be resumed after interruption.
 - The run produces a **run summary** that links to each step job's artifact set.
 
 ## Worker inventory example (`~/.config/rch/workers.toml`)
