@@ -7,12 +7,32 @@
 - `PLAN.md` — **normative** contract (classifier, JobSpec, protocol, artifacts, caching, security)
 - `.rch/xcode.toml` — repo-scoped configuration (checked in)
 - `~/.config/rch/workers.toml` — host-scoped worker inventory + credentials
+- `schemas/rch-xcode/*` — machine-readable JSON Schemas for normative artifacts
 
 ## What it is
 An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test to a remote macOS worker (e.g. a Mac mini).
 Execution can use either:
 - **Backend `xcodebuild` (MVP)**, or
 - **Backend `mcp` (preferred)** via XcodeBuildMCP for richer diagnostics/orchestration.
+
+## Status
+**Pre-implementation / design phase.** The `PLAN.md` spec is being refined through iterative review. No runnable code yet.
+
+## How it fits into RCH (lane boundaries)
+RCH is a multi-lane system. Each lane owns a specific kind of remote work. The **Xcode lane** owns:
+- Remote `xcodebuild build` and `xcodebuild test` on macOS workers.
+- Classifier, JobSpec, transport, artifact collection for those actions.
+
+It does **not** own: code signing, publishing, non-Xcode builds, or arbitrary remote commands. Other lanes (future) may handle those.
+
+## Config precedence
+Configuration is merged in this order (last wins):
+1. Built-in defaults (hardcoded in the RCH client)
+2. Host/user config (`~/.config/rch/`)
+3. Repo config (`.rch/xcode.toml`)
+4. CLI flags (e.g. `--action`, `--worker`)
+
+`effective_config.json` is emitted per job showing the final merged result.
 
 ## Why
 Agents running on Linux or busy Macs can still validate iOS/macOS projects under pinned Xcode conditions without local Xcode installs.
@@ -48,6 +68,9 @@ rch xcode explain -- xcodebuild test -workspace MyApp.xcworkspace -scheme MyApp
 
 # Run the repo-defined verify lane (usually build+test)
 rch xcode verify
+
+# Run a single action directly
+rch xcode run --action test
 ```
 
 ## Trust boundary (important)
@@ -97,6 +120,12 @@ value = "platform=iOS Simulator,name=iPhone 16,OS=latest"
 # In constraints mode, the host resolves "latest" using the selected worker's capabilities snapshot
 # and records the resolved destination into job.json for determinism.
 
+[toolchain]
+# Pin the Xcode build number for reproducible builds.
+# The host matches this against the worker's installed Xcodes.
+xcode_build = "16C5032a"     # preferred: exact build number
+# xcode_version = "16.2"    # alternative: version string (less precise)
+
 [timeouts]
 overall_seconds = 1800
 idle_log_seconds = 300
@@ -120,6 +149,7 @@ Intercept is **deny-by-default**:
 Useful commands:
 - `rch xcode explain -- <command...>`  (why it will/won't be intercepted)
 - `rch xcode verify --dry-run`         (prints resolved plan + selected worker)
+- `rch xcode run --action <build|test>`(run a single action as a one-step run)
 - `rch xcode tail <run_id|job_id>`     (stream logs/events while running)
 - `rch xcode cancel <run_id|job_id>`   (best-effort cancellation)
 - `rch xcode artifacts <run_id|job_id>`(print artifact locations + key files)
@@ -139,6 +169,7 @@ Artifacts are written to:
 
 Layout (example):
 - `run_summary.json`
+- `run_state.json`
 - `worker_selection.json`
 - `capabilities.json`
 - `steps/build/<job_id>/...`
@@ -146,11 +177,13 @@ Layout (example):
 
 Includes:
 - run_summary.json
+- run_state.json
 - summary.json
 - attestation.json
 - manifest.json
 - effective_config.json
 - job.json
+- job_state.json
 - invocation.json
 - toolchain.json
 - metrics.json
@@ -159,6 +192,7 @@ Includes:
 - events.jsonl (recommended)
 - test_summary.json (recommended)
 - build_summary.json (recommended)
+- junit.xml (recommended, test jobs)
 - build.log
 - result.xcresult/
 
@@ -173,3 +207,18 @@ Includes:
 - Keep the worker "CI-clean": no personal Apple ID sessions, no developer keychains, minimal credentials.
 - Prefer an env allowlist for the executor (only pass through known-safe vars), and redact secrets from logs.
 - Consider running the worker user with reduced permissions (no admin), and keep artifacts + caches on a dedicated volume.
+- Use `authorized_keys` options to restrict the SSH key:
+  ```
+  command="/usr/local/bin/rch-worker xcode rpc",no-port-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... rch@host
+  ```
+- Forced-command example for `rch-worker xcode rpc`:
+  ```bash
+  # /usr/local/bin/rch-worker-gate (set as forced command in authorized_keys)
+  #!/bin/sh
+  # Only allow the rch-worker xcode rpc entrypoint
+  if [ "$SSH_ORIGINAL_COMMAND" != "rch-worker xcode rpc" ]; then
+    echo '{"ok":false,"error":{"code":"FORBIDDEN","message":"only rch-worker xcode rpc allowed"}}' >&2
+    exit 1
+  fi
+  exec /usr/local/bin/rch-worker xcode rpc
+  ```
