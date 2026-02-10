@@ -206,8 +206,6 @@ On `probe`, the worker MUST report:
 - `protocol_min` / `protocol_max` (int; inclusive range supported by the worker)
 - `features` (array of strings; see below)
 
-The worker MUST echo `protocol_version: 0` in probe responses (since no version has been negotiated yet).
-
 The host MUST select a single `protocol_version` within the intersection of host- and worker-supported ranges
 and use that value for every subsequent request in the run.
 
@@ -258,10 +256,6 @@ Some operations (notably `upload_source`) may need to transmit bytes efficiently
 Implementations SHOULD support a framed stdin format:
 1) A single UTF-8 JSON header line terminated by `\n`
 2) Immediately followed by exactly `content_length` raw bytes (if `payload.stream` is present)
-
-The JSON header line MUST be serialized as compact single-line JSON (no unescaped newline characters
-within string values). Implementations MUST use standard JSON string escaping (which encodes literal
-newlines as `\n`). Pretty-printed or multi-line JSON headers are a protocol violation.
 
 Discriminator: if the request `payload` contains a `stream` object, the worker MUST parse stdin as framed
 (a single JSON header line terminated by `\n`, followed by exactly `content_length` raw bytes).
@@ -393,8 +387,6 @@ Classifier rejection in multi-step runs (normative):
 - If a step is rejected, it MUST still appear in `run_plan.json` with `rejected: true`.
 - A rejected step MUST have a `summary.json` emitted at the standard step path (`<run_id>/steps/<action>/<job_id>/summary.json`)
   with `status=rejected`, but MUST NOT have `job_state.json` (the job state machine is never entered).
-- For rejected steps, `job_key` in `summary.json` MUST be `null` (source bundling and key computation
-  may not have occurred). Consumers MUST accept `null` for `job_key` when `status=rejected`.
 - Rejected steps receive a `job_id` for artifact path purposes but are never submitted to the worker.
 
 If a step ends with `status=failed` or `status=rejected`, subsequent steps MUST be skipped
@@ -406,8 +398,7 @@ Skipped steps MUST be recorded in `run_summary.json` under `steps_skipped` (int)
 The host MUST emit `run_plan.json` at `<run_id>/run_plan.json` before starting execution.
 It MUST include at least:
 - `schema_version`, `schema_id` (`rch-xcode/run_plan@1`), `created_at`, `run_id`
-- `steps`: ordered array of `{ index, action, job_id, rejected }` where `rejected` is a bool (default `false`)
-  indicating whether the classifier rejected this step at plan time
+- `steps`: ordered array of `{ index, action, job_id }`
 - `selected_worker`: worker name chosen for this run
 - `selected_worker_host`: SSH host of the chosen worker
 - `continue_on_failure`: bool (whether failed steps should skip remaining steps; from config at plan creation time).
@@ -476,8 +467,6 @@ Worker SHOULD respond with `next_offset` to support resumable uploads.
 
 ### `fetch` response format (normative)
 `fetch` response MUST use the same binary framing as `upload_source` (JSON header line + raw bytes):
-- Binary-framed responses (`fetch`) bypass the standard RPC envelope: the JSON header line IS the complete response
-  (it MUST include `protocol_version`, `request_id`, `ok: true`, and the payload fields directly, not nested under `payload`).
 - Response JSON header includes: `job_id`, `manifest` (the `manifest.json` content), and `stream` object
   (`content_length`, `content_sha256`, `compression`, `format`).
 - The streamed bytes are a `tar` (optionally zstd-compressed) of the job artifact directory.
@@ -667,11 +656,11 @@ destination rules, allowed flags).
 For multi-step runs, `run_summary.json` MUST include an `exit_code` suitable for scripting and the host CLI
 MUST exit with that value.
 
-Aggregation rule (applies to both `exit_code` and `status`):
-- If any step has `status=rejected`: run `status` MUST be `rejected`, run `exit_code` MUST be 10.
-- Else if any step has `status=cancelled`: run `status` MUST be `cancelled`, run `exit_code` MUST be 80.
-- Else if any step has `status=failed`: run `status` MUST be `failed`, run `exit_code` MUST be the first failing step's `exit_code` in run order.
-- Else: run `status` MUST be `success`, run `exit_code` MUST be 0.
+Aggregation rule:
+- If any step has `status=rejected`, run `exit_code` MUST be 10.
+- Else if any step has `status=cancelled`, run `exit_code` MUST be 80.
+- Else if any step has `status=failed`, run `exit_code` MUST be the first failing step's `exit_code` in run order.
+- Else run `exit_code` MUST be 0.
 
 ### run_summary.json schema (normative)
 `run_summary.json` MUST include at least:
@@ -959,9 +948,6 @@ before accepting signed attestations.
 `manifest.json` MUST also include `artifact_root_sha256` to bind the set.
 
 `entries` MUST be sorted lexicographically by `path` (UTF-8).
-Each entry MUST include a `type` field (`file` or `directory`).
-For `file` entries, `sha256` and `size` are computed over the file contents as usual.
-For `directory` entries, `sha256` MUST be `null` and `size` MUST be `0`.
 `artifact_root_sha256` MUST be computed as:
 - `sha256_hex( JCS(entries) )`
 where `entries` is the exact array written to `manifest.json`.
