@@ -9,6 +9,12 @@
 - `~/.config/rch/workers.toml` — host-scoped worker inventory + credentials
 - `schemas/rch-xcode/*` — machine-readable JSON Schemas for normative artifacts (see `schema_id` in each JSON)
 
+## At a glance
+- **Gate, not IDE:** this lane validates build/test under pinned Xcode; it is not a signing/export/publish pipeline.
+- **Deny-by-default:** false negatives are preferred; interception is intentionally conservative.
+- **Deterministic + auditable:** every job emits schema-versioned artifacts + a stable `job_key` for caching/attestation.
+- **Not a sandbox:** treat the worker like CI; build phases/plugins execute as the worker user.
+
 ## What it is
 An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test to a remote macOS worker (e.g. a Mac mini).
 Execution can use either:

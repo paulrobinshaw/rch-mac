@@ -48,6 +48,7 @@ The canonical JobSpec (`job.json`) MUST include at least these fields:
 | Field               | Type     | Description                                      |
 |---------------------|----------|--------------------------------------------------|
 | `schema_version`    | int      | Always `1` for this version                      |
+| `schema_id`         | string   | Stable schema identifier (e.g. `rch-xcode/job@1`) |
 | `run_id`            | string   | Parent run identifier                            |
 | `job_id`            | string   | Unique step job identifier                       |
 | `action`            | string   | `build` or `test`                                |
@@ -178,6 +179,14 @@ Response:
 - `ok` (bool)
 - `payload` (object, when ok=true)
 - `error` (object, when ok=false) containing: `code`, `message`, optional `data`
+
+#### Error codes (recommended, stabilizes automation)
+Workers SHOULD restrict `error.code` to a small, documented registry (examples):
+- `INVALID_REQUEST` (malformed JSON, missing fields)
+- `UNSUPPORTED_PROTOCOL` (no version intersection)
+- `FEATURE_MISSING` (required feature absent)
+- `BUSY` (capacity exceeded; include `retry_after_seconds`)
+- `LEASE_EXPIRED` (job lease timed out)
 
 ### Binary framing (recommended)
 Some operations (notably `upload_source`) may need to transmit bytes efficiently.
@@ -386,10 +395,17 @@ If accepted, the host MUST emit `invocation.json` containing:
 - `sanitized_argv` (canonical ordering, normalized quoting)
 - `accepted_action` (`build`|`test`)
 - `rejected_flags` (if any; for dry-run/explain)
+- `classifier_policy_sha256` (sha256 hex of the effective classifier policy snapshot)
 `sanitized_argv` MUST NOT contain:
 - output path overrides
 - script hooks
 - unconstrained destinations
+
+### Classifier policy snapshot (recommended)
+For auditability and replayable `explain`, producers SHOULD emit `classifier_policy.json` per job capturing the
+effective allowlist/denylist and any pinned constraints enforced by the classifier (workspace/project, scheme,
+destination rules, allowed flags).
+`invocation.json.classifier_policy_sha256` SHOULD be the sha256 hex digest of the canonical JSON bytes of that snapshot.
 
 ## Configuration merge (normative)
 ### Sources + precedence (last wins)
@@ -420,6 +436,8 @@ If accepted, the host MUST emit `invocation.json` containing:
 - `failure_kind`: CLASSIFIER_REJECTED | SSH | TRANSFER | EXECUTOR | XCODEBUILD | MCP | ARTIFACTS | CANCELLED | WORKER_INCOMPATIBLE | BUNDLER | ATTESTATION | WORKER_BUSY
 - `failure_subkind`: optional string for details (e.g. TIMEOUT_OVERALL | TIMEOUT_IDLE | PROTOCOL_ERROR)
 - `exit_code`: stable integer for scripting
+- `backend_exit_code`: integer exit status as reported by the backend process (when started)
+- `backend_term_signal`: optional string (e.g. `"SIGKILL"`) when terminated by signal
 - `human_summary`: short string for console output
 
 ### Stable exit codes (normative)
@@ -436,6 +454,16 @@ If accepted, the host MUST emit `invocation.json` containing:
 - 91: WORKER_INCOMPATIBLE
 - 92: BUNDLER
 - 93: ATTESTATION
+
+### Run-level exit code (normative)
+For multi-step runs, `run_summary.json` MUST include an `exit_code` suitable for scripting and the host CLI
+MUST exit with that value.
+
+Aggregation rule:
+- If any step has `status=rejected`, run `exit_code` MUST be 10.
+- Else if any step has `status=cancelled`, run `exit_code` MUST be 80.
+- Else if any step has `status=failed`, run `exit_code` MUST be the first failing step's `exit_code` in run order.
+- Else run `exit_code` MUST be 0.
 
 ## Agent-friendly summaries (recommended)
 In addition to `summary.json`, the worker SHOULD emit:
@@ -469,6 +497,16 @@ to prevent collisions across unrelated repos on the same worker.
 - Any cache directory that can be reused across jobs MUST be additionally keyed by toolchain identity
   (at minimum: Xcode build number and macOS major version) to prevent cross-toolchain corruption.
 - `metrics.json` SHOULD record the concrete cache key components used (job_key, xcode_build, macos_version, etc.).
+
+### Cache directory layout (recommended, stabilizes operability)
+To prevent collisions and simplify GC, workers SHOULD use a predictable cache root layout such as:
+- `caches/<namespace>/spm/<toolchain_key>/...`
+- `caches/<namespace>/derived_data/shared/<toolchain_key>/...`
+- `caches/<namespace>/derived_data/per_job/<job_key>/...`
+Where:
+- `namespace` is `cache.namespace` (filesystem-safe)
+- `toolchain_key` is a filesystem-safe composite derived from toolchain identity (e.g. `xcode_<build>__macos_<major>__<arch>`)
+Workers SHOULD record the resolved cache paths in `metrics.json` for transparency.
 
 ### Result cache (recommended)
 Worker SHOULD maintain an optional result cache keyed by `job_key`:
@@ -518,6 +556,7 @@ Worker reports a `capabilities.json` including:
 - available runtimes/devices (simctl), including runtime identifiers and runtime build strings when available
 - installed tooling versions (rch-worker, XcodeBuildMCP)
 - capacity (max concurrent jobs, disk free)
+- limits (recommended): `max_upload_bytes`, `max_artifact_bytes`, `max_log_bytes`
 Normative:
 - `capabilities.json` MUST include `schema_version` and `created_at` (RFC 3339 UTC).
 Optional but recommended:
@@ -588,6 +627,14 @@ Recommended mitigations:
 - Worker MUST set `DEVELOPER_DIR` to the resolved toolchain `developer_dir` prior to execution.
 - Worker MUST apply an environment allowlist (drop-by-default) when launching the backend.
 - Worker MUST redact secrets from logs/artifacts to the extent feasible (at minimum: do not emit env vars outside the allowlist).
+
+### Executor environment audit (recommended)
+The worker SHOULD emit `executor_env.json` containing:
+- `schema_version`, `schema_id`, `created_at`, `run_id`, `job_id`, `job_key`
+- `passed_keys[]`: environment variable keys passed to the backend (no values by default)
+- `dropped_keys[]`: keys present in the worker process environment but intentionally not passed
+- `overrides[]`: keys the worker set explicitly (e.g. `DEVELOPER_DIR`)
+If values are ever recorded (not recommended), they MUST be explicitly opt-in and MUST be redacted by default.
 
 ## SSH hardening (recommended)
 - Use a dedicated `rch` user on the worker.
@@ -702,6 +749,17 @@ To make artifact discovery stable for tooling, the system MUST provide:
 - `job.json`, `job_state.json`, `summary.json`, `manifest.json`, `attestation.json`
 - primary human artifacts (`build.log`, `result.xcresult/` when present)
 and MUST record the `artifact_profile` produced.
+
+### Artifact completion + atomicity (normative)
+To prevent consumers from observing partially-written artifact sets, the worker MUST treat the job artifact
+directory as a two-phase commit:
+1) Write all job artifacts to their final relative paths (or write-then-rename per file).
+2) Write `manifest.json` enumerating the final set.
+3) Write `attestation.json` binding `manifest.json` (and any signing material).
+4) Write `job_index.json` **last** and atomically (write-then-rename).
+
+Consumers (host CLI, fetchers, tooling) MUST treat the existence of `job_index.json` as the commit marker that
+the job's artifact set is complete and internally consistent.
 
 ## Artifact schemas + versioning
 All JSON artifacts MUST include:
