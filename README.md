@@ -24,6 +24,7 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 - rsync + zstd
 - Node.js + XcodeBuildMCP (recommended for `backend="mcp"`)
 - (Recommended) dedicated `rch` user + constrained SSH key/forced-command
+  - Recommended: forced-command runs a single `rch-worker xcode ...` entrypoint (no shell)
 
 **Host**
 - RCH client + daemon
@@ -39,6 +40,23 @@ Agents running on Linux or busy Macs can still validate iOS/macOS projects under
 - You run `rch xcode verify` locally (even on Linux).
 - RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
 - Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
+- `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`).
+- The run produces a **run summary** that links to each step job's artifact set.
+
+## Worker inventory example (`~/.config/rch/workers.toml`)
+```toml
+schema_version = 1
+
+[[worker]]
+name = "macmini-01"
+host = "macmini.local"
+user = "rch"
+port = 22
+tags = ["macos","xcode"]
+known_host_fingerprint = "SHA256:..."
+ssh_key_path = "~/.ssh/rch_macmini"
+priority = 10
+```
 
 ## Repo config (`.rch/xcode.toml`)
 Example:
@@ -61,7 +79,13 @@ value = "platform=iOS Simulator,name=iPhone 16,OS=latest"
 overall_seconds = 1800
 idle_log_seconds = 300
 
+[bundle]
+mode = "worktree"       # worktree | git_index
+ignore_file = ".rchignore"
+max_bytes = 0           # 0 = unlimited (host may still enforce sane caps)
+
 [cache]
+namespace = "myapp"      # recommended: stable per-repo namespace to avoid collisions
 derived_data = "shared"   # off | per_job | shared
 spm = "shared"            # off | shared
 ```
@@ -76,17 +100,27 @@ Useful commands:
 - `rch xcode verify --dry-run`         (prints resolved plan + selected worker)
 - `rch workers list --tag macos,xcode` (show matching workers)
 - `rch workers probe <name>`           (fetch capabilities snapshot)
+- `rch xcode doctor`                   (validate config, SSH, Xcode, destination)
 
 ## Common pitfalls
 - **Wrong Xcode selected**: ensure worker `DEVELOPER_DIR` is stable/pinned.
+- **Silent Xcode update**: prefer pinning by Xcode build number in worker capabilities + selection constraints.
 - **Simulator mismatch**: pinned destination must exist on the worker (see `capabilities.json`).
 - **Long first build**: warm SPM + DerivedData caches (see `cache.*` modes in config).
 
 ## Outputs
 Artifacts are written to:
-`~/.local/share/rch/artifacts/<job_id>/`
+`~/.local/share/rch/artifacts/xcode/<run_id>/`
+
+Layout (example):
+- `run_summary.json`
+- `worker_selection.json`
+- `capabilities.json`
+- `steps/build/<job_id>/...`
+- `steps/test/<job_id>/...`
 
 Includes:
+- run_summary.json
 - summary.json
 - attestation.json
 - manifest.json
@@ -97,6 +131,7 @@ Includes:
 - metrics.json
 - source_manifest.json
 - worker_selection.json
+- events.jsonl (recommended)
 - test_summary.json (recommended)
 - build_summary.json (recommended)
 - build.log
@@ -107,3 +142,4 @@ Includes:
 - Safe-by-default: avoids intercepting setup or mutating commands
 - Deterministic: runs produce a JobSpec (`job.json`) and stable `job_key` used for caching and attestation
 - Security posture: prefer a dedicated `rch` user; optionally use SSH forced-command; avoid signing/publishing workflows
+- Integrity: host verifies `manifest.json` digests; attestation binds worker identity + artifact set
