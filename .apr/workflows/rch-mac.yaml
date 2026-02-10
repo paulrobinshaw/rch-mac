@@ -1,16 +1,15 @@
 # APR Workflow Configuration
-# Generated: 2026-02-06T14:25:06Z
 
 name: rch-mac
-description: "rch-mac plan interations"
+description: "rch-mac plan iterations"
 
 documents:
-  readme: "/data/projects/rch-mac/README.md"
-  spec: "/data/projects/rch-mac/PLAN.md"
-  implementation: "/data/projects/rch-mac/IMPLEMENTATION.md"
+  readme: "README.md"
+  spec: "PLAN.md"
+  implementation: "IMPLEMENTATION.md"
 
 oracle:
-  model: "gpt-5.2-thinking"
+  model: "5.2 Thinking"
   thinking_time: heavy
 
 rounds:
