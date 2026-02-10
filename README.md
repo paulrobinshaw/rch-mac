@@ -14,6 +14,7 @@ An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test t
 Execution can use either:
 - **Backend `xcodebuild` (MVP)**, or
 - **Backend `mcp` (preferred)** via XcodeBuildMCP for richer diagnostics/orchestration.
+Both backends MUST emit the same **minimum artifact contract** (see `PLAN.md` → "Backend contract").
 
 ## Status
 **Pre-implementation / design phase.** The `PLAN.md` spec is being refined through iterative review. No runnable code yet.
@@ -32,7 +33,8 @@ Configuration is merged in this order (last wins):
 3. Repo config (`.rch/xcode.toml`)
 4. CLI flags (e.g. `--action`, `--worker`)
 
-`effective_config.json` is emitted per job showing the final merged result.
+Config precedence + merge semantics are **normative** (see `PLAN.md` → "Configuration merge").  
+`effective_config.json` is emitted per job showing the final merged result (with secrets redacted).
 
 ## Why
 Agents running on Linux or busy Macs can still validate iOS/macOS projects under pinned Xcode conditions without local Xcode installs.
@@ -84,6 +86,7 @@ Treat the worker like CI: dedicated account, minimal secrets, and no personal ke
 - RCH classifies/sanitizes the invocation, builds a deterministic `job.json`, bundles inputs, and ships to macOS.
 - Worker executes and returns schema-versioned artifacts (`summary.json`, logs, `xcresult`, etc.).
 - `rch xcode verify` is a **run** that may contain multiple **step jobs** (e.g. `build` then `test`).
+- The host persists a `run_plan.json` up front so runs can be resumed after interruption.
 - The run produces a **run summary** that links to each step job's artifact set.
 
 ## Worker inventory example (`~/.config/rch/workers.toml`)
@@ -169,6 +172,7 @@ Artifacts are written to:
 
 Layout (example):
 - `run_summary.json`
+- `run_plan.json`
 - `run_state.json`
 - `worker_selection.json`
 - `capabilities.json`
@@ -177,11 +181,13 @@ Layout (example):
 
 Includes:
 - run_summary.json
+- run_plan.json
 - run_state.json
 - summary.json
 - attestation.json
 - manifest.json
 - effective_config.json
+- job_key_inputs.json
 - job.json
 - job_state.json
 - invocation.json
@@ -199,7 +205,7 @@ Includes:
 ## Notes
 - Designed as a build/test gate, not a full IDE replacement
 - Safe-by-default: avoids intercepting setup or mutating commands
-- Deterministic: runs produce a JobSpec (`job.json`) and stable `job_key` used for caching and attestation
+- Deterministic: runs produce a JobSpec (`job.json`) plus the exact `job_key_inputs.json` used to compute a stable `job_key` for caching/attestation
 - Security posture: prefer a dedicated `rch` user; optionally use SSH forced-command; avoid signing/publishing workflows
 - Integrity: host verifies `manifest.json` digests; attestation binds worker identity + artifact set
 

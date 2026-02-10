@@ -23,7 +23,8 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Classifier**: deny-by-default gate that accepts/rejects invocations.
 - **JobSpec** (`job.json`): deterministic, fully-resolved step job description.
 - **Job ID** (`job_id`): unique identifier for a single step job within a run (used for cancellation/log streaming and artifact paths).
-- **Job key** (`job_key`): stable hash used for caching and attestation. Computed using RFC 8785 (JSON Canonicalization Scheme) over the JobSpec fields that affect output (see "Job key computation" below).
+- **Run plan** (`run_plan.json`): persisted, ordered list of step jobs (actions + allocated `job_id`s) for a run.
+- **Job key** (`job_key`): stable hash used for caching and attestation. Computed using RFC 8785 (JSON Canonicalization Scheme) over a canonical **job key inputs** object (`job_key_inputs`) containing only output-affecting, fully-resolved fields (see "Job key computation" below).
 - **Artifact set**: schema-versioned outputs written under `<job_id>/`.
 
 ### Timestamp and encoding conventions (normative)
@@ -38,21 +39,23 @@ The canonical JobSpec (`job.json`) MUST include at least these fields:
 | `schema_version`    | int      | Always `1` for this version                      |
 | `run_id`            | string   | Parent run identifier                            |
 | `job_id`            | string   | Unique step job identifier                       |
-| `job_key`           | string   | Deterministic cache/attestation key              |
-| `source_sha256`     | string   | Digest of the canonical source bundle            |
 | `action`            | string   | `build` or `test`                                |
-| `sanitized_argv`    | string[] | Canonical xcodebuild arguments                   |
-| `toolchain`         | object   | `{xcode_version, xcode_build, developer_dir}`   |
-| `destination`       | object   | Resolved destination (platform, device, OS)      |
+| `job_key_inputs`    | object   | Canonical key-object hashed to produce `job_key` |
+| `job_key`           | string   | SHA-256 hex digest of JCS(`job_key_inputs`)      |
 | `effective_config`  | object   | Merged repo + host config snapshot               |
 | `created_at`        | string   | RFC 3339 UTC timestamp                           |
 
 ### Job key computation (normative)
-`job_key` is the SHA-256 hex digest of the RFC 8785 JSON Canonicalization of a key-object containing:
-- `source_sha256`
-- `effective_config` (merged, fully resolved)
-- `sanitized_argv`
-- `toolchain` (Xcode build number, DEVELOPER_DIR)
+`job_key_inputs` MUST be an object containing the fully-resolved, output-affecting inputs for the job, and MUST include at least:
+- `source_sha256` (digest of the canonical source bundle)
+- `sanitized_argv` (canonical xcodebuild arguments; no output-path overrides)
+- `toolchain` (at minimum: Xcode build number + `developer_dir`)
+- `destination` (resolved destination details; may also be present inside `sanitized_argv`)
+
+`job_key` is the SHA-256 hex digest of the RFC 8785 JSON Canonicalization (JCS) of `job_key_inputs`.
+
+`job_key_inputs` MUST NOT include host-only operational settings that should not invalidate correctness-preserving caches,
+including (non-exhaustive): timeouts, worker inventory/SSH details, cache toggles, worker selection metadata, backend selection.
 
 ## CLI surface (contract)
 The lane MUST provide these user-facing entry points:
@@ -72,7 +75,7 @@ Optional but recommended:
 ## Architecture (high level)
 Pipeline stages:
 1. **Classifier**: detects safe, supported Xcode build/test invocations (deny-by-default).
-2. **Run builder**: resolves repo `verify` actions into an ordered run plan and chooses a worker once.
+2. **Run builder**: resolves repo `verify` actions into an ordered run plan, allocates stable `job_id`s, persists `run_plan.json`, and chooses a worker once.
 3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination.
 4. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
 5. **Transport**: bundles inputs + sends to worker (integrity checked).
@@ -82,6 +85,17 @@ Pipeline stages:
 ## Backends
 - **Backend: xcodebuild (MVP)** — minimal dependencies, fastest path to correctness.
 - **Backend: XcodeBuildMCP (preferred)** — richer structure, better diagnostics, multi-step orchestration.
+
+## Backend contract (normative)
+Regardless of backend, the worker MUST:
+- execute the action described by `job.json` under the resolved toolchain + destination
+- write the normative artifacts (`summary.json`, `manifest.json`, `attestation.json`, `job_state.json`, logs)
+- control output paths (host/user args MUST NOT override artifact locations)
+
+Minimum artifact expectations (normative):
+- `build.log` MUST be present for all jobs
+- `result.xcresult/` MUST be present for `test` jobs (backend may generate via `-resultBundlePath`)
+- `summary.json` MUST include backend identity (`backend=...`) and a stable exit_code mapping
 
 ## Host↔Worker protocol (normative)
 The system MUST behave as if there is a versioned protocol even if implemented over SSH.
@@ -112,7 +126,7 @@ Worker SHOULD implement these operations with JSON request/response payloads:
 - `probe` → returns `capabilities.json`
 - `submit` → accepts `job.json` (+ optional bundle upload reference), returns ACK and initial status
 - `status` → returns current job status and pointers to logs/artifacts
-- `tail` → streams logs/events with a cursor
+- `tail` → returns the next chunk of logs/events given a cursor (repeatable; host loops to "stream")
 - `cancel` → requests best-effort cancellation
 - `fetch` → returns artifacts (or a signed manifest + download hints)
 - `has_source` → returns `{exists: bool}` for a given `source_sha256`
@@ -124,6 +138,11 @@ Worker MUST treat `job_id` as the idempotency key:
 - If a job with the same `job_id` is RUNNING, worker MUST report status and allow log tailing.
 - If `job_id` already exists but the submitted `job_key` differs, worker MUST reject to prevent artifact confusion.
 
+On `submit`, worker MUST validate:
+- `job_key` matches SHA-256(JCS(`job_key_inputs`)) as defined in "Job key computation"
+- `job_key_inputs.source_sha256` matches the stored source bundle digest for the bundle used (uploaded or previously present)
+If validation fails, worker MUST fail the job with `failure_kind=PROTOCOL_ERROR` (or a more specific subkind) and emit diagnostics.
+
 Worker MAY additionally maintain a correctness-preserving *result cache* keyed by `job_key`:
 - On submit of a new `job_id` with a previously completed `job_key`, worker MAY materialize artifacts
   from the cached result into the new `<job_id>/` artifact directory and record `cached_from_job_id`.
@@ -133,9 +152,20 @@ Worker MAY additionally maintain a correctness-preserving *result cache* keyed b
 - Worker MUST attempt a best-effort cancel (terminate backend process tree) and write artifacts with `status=failed`
   and `failure_kind=CANCELLED`.
 
+On cancellation, `summary.json` MUST set:
+- `status=cancelled`
+- `failure_kind=CANCELLED`
+- `exit_code=80`
+
 ### Log streaming (recommended)
 - Worker SHOULD support a "tail" mode so host can stream logs while running.
 - If not supported, host MUST still periodically fetch/append logs to avoid silent hangs.
+
+`tail` MUST be defined as cursor-based chunk retrieval compatible with the single request/response envelope:
+- Request payload SHOULD include: `job_id`, `cursor` (nullable), and optional limits (`max_bytes`, `max_events`)
+- Response payload SHOULD include: `next_cursor` (nullable), plus either/both:
+  - `log_chunk` (UTF-8 text) and/or
+  - `events` (array of event objects or JSONL strings)
 
 ### Structured events (recommended)
 Worker SHOULD emit `events.jsonl` (JSON Lines) for machine-readable progress.
@@ -175,12 +205,25 @@ QUEUED → RUNNING → { SUCCEEDED | FAILED | CANCELLED }
 
 Both MUST be updated atomically (write-then-rename) on every state transition.
 
+### Run plan artifact (normative)
+The host MUST emit `run_plan.json` at `<run_id>/run_plan.json` before starting execution.
+It MUST include at least:
+- `schema_version`, `created_at`, `run_id`
+- `steps`: ordered array of `{ index, action, job_id }`
+
+`run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
+it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
+
 ## Deterministic JobSpec + Job Key
 Each remote run is driven by a `job.json` (JobSpec) generated on the host.
 The host computes:
-- `source_sha256` — SHA-256 of the sent source bundle (after canonicalization)
-- `job_key` — SHA-256 of the RFC 8785 (JCS) canonicalization of the key-object (see "Job key computation" above)
+- `source_sha256` — SHA-256 of the canonical source bundle bytes
+- `job_key_inputs` — canonical, output-affecting inputs (see "Job key computation")
+- `job_key` — SHA-256 of JCS(`job_key_inputs`)
 Artifacts include both values, enabling reproducible reruns and cache keys.
+
+The host MUST emit a standalone `job_key_inputs.json` artifact (byte-for-byte identical to the `job_key_inputs` object embedded in `job.json`)
+to make cache/attestation inputs directly inspectable.
 
 ## Source bundle store (performance, correctness-preserving)
 Workers SHOULD maintain a content-addressed store keyed by `source_sha256`.
@@ -263,14 +306,32 @@ If accepted, the host MUST emit `invocation.json` containing:
 - script hooks
 - unconstrained destinations
 
-## Configuration
-- Repo-scoped config: `.rch/xcode.toml` (checked in)
-- Host/user config: `~/.config/rch/*` (workers, credentials, defaults)
-`effective_config.json` MUST be emitted per job (post-merge, fully resolved).
+## Configuration merge (normative)
+### Sources + precedence (last wins)
+1. Built-in lane defaults
+2. Host/user config (`~/.config/rch/…`)
+3. Repo config (`.rch/xcode.toml`)
+4. CLI flags
+
+### Merge semantics
+- Config MUST be decoded into a JSON-compatible object model (maps, arrays, scalars).
+- Objects MUST deep-merge by key.
+- Arrays MUST replace (no concatenation) to avoid host-dependent ordering surprises.
+- Scalars MUST override.
+- Merge MUST be deterministic.
+
+### `effective_config.json` (audit, not a cache key)
+`effective_config.json` MUST be emitted per job and MUST:
+- include `schema_version`, `created_at`, `run_id`, `job_id`
+- include the merged config object
+- record the contributing sources (origin + optional file path + a digest of raw bytes)
+- redact secrets (private keys, tokens, passwords). Any redaction MUST be recorded in a `redactions[]` list.
+
+`effective_config` MUST NOT be used for `job_key` computation (only `job_key_inputs` is hashed).
 
 ## Failure taxonomy
 `summary.json` MUST include:
-- `status`: success | failed | rejected
+- `status`: success | failed | rejected | cancelled
 - `failure_kind`: CLASSIFIER_REJECTED | SSH | TRANSFER | EXECUTOR | XCODEBUILD | MCP | ARTIFACTS | CANCELLED | WORKER_INCOMPATIBLE | BUNDLER | ATTESTATION | WORKER_BUSY
 - `failure_subkind`: optional string for details (e.g. TIMEOUT_OVERALL | TIMEOUT_IDLE | PROTOCOL_ERROR)
 - `exit_code`: stable integer for scripting
@@ -354,6 +415,8 @@ Worker reports a `capabilities.json` including:
 - available runtimes/devices (simctl)
 - installed tooling versions (rch-worker, XcodeBuildMCP)
 - capacity (max concurrent jobs, disk free)
+Normative:
+- `capabilities.json` MUST include `schema_version` and `created_at` (RFC 3339 UTC).
 Optional but recommended:
 - worker identity material (SSH host key fingerprint and/or attestation public key fingerprint)
 Host stores the chosen worker capability snapshot in artifacts.
@@ -380,6 +443,11 @@ The host MUST write:
 - `worker_selection.json` (inputs, filtered set, chosen worker, reasons)
 - `capabilities.json` snapshot as used for the decision
 
+Staleness policy (normative):
+- Host MUST define a TTL for cached capability snapshots (e.g. `probe_ttl_seconds`).
+- If a cached snapshot is older than TTL, host MUST re-probe before selecting a worker.
+- `worker_selection.json` MUST record whether the snapshot was cached or freshly probed and the snapshot age.
+
 ### Toolchain resolution (normative)
 When a job requires a specific Xcode toolchain:
 1. The repo config or CLI MAY specify a required Xcode build number (preferred), version, or range.
@@ -403,6 +471,12 @@ Clarification (normative):
 Recommended mitigations:
 - Executor MUST use an environment-variable allowlist and pass through only known-safe variables. Obvious secrets MUST be redacted in logs/artifacts.
 - Worker SHOULD avoid unlocking or accessing user keychains during execution.
+
+## Execution environment (normative)
+- Worker MUST execute each job in an isolated working directory unique per `job_id`.
+- Worker MUST set `DEVELOPER_DIR` to the resolved toolchain `developer_dir` prior to execution.
+- Worker MUST apply an environment allowlist (drop-by-default) when launching the backend.
+- Worker MUST redact secrets from logs/artifacts to the extent feasible (at minimum: do not emit env vars outside the allowlist).
 
 ## SSH hardening (recommended)
 - Use a dedicated `rch` user on the worker.
@@ -431,6 +505,7 @@ If signature verification fails, host MUST mark the run as failed (`failure_kind
 ## Milestones
 - **M0**: macOS worker reachable via SSH, tagged `macos,xcode`
 - **M1**: Classifier detects Xcode build/test safely
+- **M1.5**: Mock worker implements protocol ops (probe/submit/status/tail/cancel/has_source/upload_source) for conformance tests
 - **M2**: MVP remote execution with `xcodebuild`
 - **M3**: Switch to XcodeBuildMCP backend
 - **M4**: Emit summary.json, attestation.json, manifest.json
@@ -448,7 +523,8 @@ The project SHOULD maintain a conformance test suite that validates:
 - State machine transitions: run and job states follow the defined state diagrams.
 - Cache correctness: result cache hits produce artifacts identical to fresh runs.
 
-Tests SHOULD be runnable without a live worker (use mocks/fixtures) and integrated into CI.
+Tests SHOULD be runnable without a live worker (use a mock worker + fixtures) and integrated into CI.
+The project SHOULD ship a minimal mock worker implementation that validates request/response schemas and exercises host logic deterministically.
 
 ## JSON Schemas (recommended)
 The project SHOULD ship machine-readable JSON Schemas for all normative artifacts under `schemas/rch-xcode/`.
@@ -457,11 +533,13 @@ Schemas enable automated validation in CI and by third-party tooling.
 
 ## Artifacts
 - run_summary.json
+- run_plan.json
 - run_state.json
 - summary.json
 - attestation.json
 - manifest.json
 - effective_config.json
+- job_key_inputs.json
 - job.json
 - job_state.json
 - invocation.json
