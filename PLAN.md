@@ -27,6 +27,17 @@ Extend Remote Compilation Helper (RCH) so Xcode build/test commands are routed t
 - **Job key** (`job_key`): stable hash used for caching and attestation. Computed using RFC 8785 (JSON Canonicalization Scheme) over a canonical **job key inputs** object (`job_key_inputs`) containing only output-affecting, fully-resolved fields (see "Job key computation" below).
 - **Artifact set**: schema-versioned outputs written under `<job_id>/`.
 
+### Identifier formats (normative)
+`run_id`, `job_id`, and `request_id` MUST be treated as opaque strings, but MUST be filesystem-safe:
+- MUST NOT contain `/`, `\`, whitespace, control characters, or `..`
+- MUST match: `^[A-Za-z0-9][A-Za-z0-9_-]{9,63}$`
+- MUST be safe to embed in file paths without additional escaping
+
+Generation guidance:
+- Host SHOULD generate `run_id` and `job_id` using a sortable unique ID (ULID or UUIDv7 recommended).
+- `job_id` MUST be globally unique per host over time (host MUST NOT reuse a `job_id` across runs).
+- `request_id` MUST be unique per RPC request (per host process) to allow reliable correlation and retries.
+
 ### Timestamp and encoding conventions (normative)
 - All timestamps in JSON artifacts MUST use RFC 3339 with UTC offset (`Z` suffix). Example: `2026-01-15T09:32:00Z`.
 - All text fields and file content MUST be UTF-8 encoded.
@@ -45,14 +56,38 @@ The canonical JobSpec (`job.json`) MUST include at least these fields:
 | `effective_config`  | object   | Merged repo + host config snapshot               |
 | `created_at`        | string   | RFC 3339 UTC timestamp                           |
 
+Optional but recommended fields (v1, backward-compatible):
+| `artifact_profile`  | string   | `minimal` or `rich` (defaults to `minimal`)      |
+
 ### Job key computation (normative)
 `job_key_inputs` MUST be an object containing the fully-resolved, output-affecting inputs for the job, and MUST include at least:
 - `source_sha256` (digest of the canonical source bundle)
 - `sanitized_argv` (canonical xcodebuild arguments; no output-path overrides)
-- `toolchain` (at minimum: Xcode build number + `developer_dir`)
-- `destination` (resolved destination details; may also be present inside `sanitized_argv`)
+- `toolchain` (resolved toolchain identity; see below)
+- `destination` (fully-resolved destination identity; see below)
 
 `job_key` is the SHA-256 hex digest of the RFC 8785 JSON Canonicalization (JCS) of `job_key_inputs`.
+
+Toolchain identity (normative):
+`job_key_inputs.toolchain` MUST include:
+- `xcode_build` (e.g. `"16C5032a"`)
+- `developer_dir` (absolute path on worker)
+- `macos_version` (e.g. `"15.3.1"`)
+- `macos_build` (e.g. `"24D60"`)
+- `arch` (e.g. `"arm64"`)
+
+Destination identity (normative):
+`job_key_inputs.destination` MUST include enough detail to prevent cross-runtime confusion.
+At minimum it MUST include:
+- `platform` (e.g. `"iOS Simulator"` or `"macOS"`)
+- `name` (device name when applicable)
+- `os_version` (resolved concrete version; MUST NOT be `"latest"`)
+- `provisioning` (`"existing"` | `"ephemeral"`)
+
+For iOS/tvOS/watchOS Simulator destinations, it MUST ALSO include:
+- `sim_runtime_identifier` (e.g. `com.apple.CoreSimulator.SimRuntime.iOS-19-2`)
+- `sim_runtime_build` (runtime build string if available from `simctl`)
+- `device_type_identifier` (e.g. `com.apple.CoreSimulator.SimDeviceType.iPhone-16`)
 
 `job_key_inputs` MUST NOT include host-only operational settings that should not invalidate correctness-preserving caches,
 including (non-exhaustive): timeouts, worker inventory/SSH details, cache toggles, worker selection metadata, backend selection.
@@ -76,7 +111,8 @@ Optional but recommended:
 Pipeline stages:
 1. **Classifier**: detects safe, supported Xcode build/test invocations (deny-by-default).
 2. **Run builder**: resolves repo `verify` actions into an ordered run plan, allocates stable `job_id`s, persists `run_plan.json`, and chooses a worker once.
-3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination.
+3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination (including simulator runtime identifiers/builds).
+   - **Destination provisioning (optional, recommended)**: if `destination.provisioning="ephemeral"` and the destination is a Simulator, the worker provisions a clean simulator per job and records the created UDID in artifacts (UDID MUST NOT affect `job_key`).
 4. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
 5. **Transport**: bundles inputs + sends to worker (integrity checked).
 6. **Executor**: runs the job on macOS via a selected backend (**xcodebuild** or **XcodeBuildMCP**).
@@ -97,25 +133,47 @@ Minimum artifact expectations (normative):
 - `result.xcresult/` MUST be present for `test` jobs (backend may generate via `-resultBundlePath`)
 - `summary.json` MUST include backend identity (`backend=...`) and a stable exit_code mapping
 
+## Artifact profiles (recommended)
+Jobs MAY request an `artifact_profile`:
+- `minimal` (default): only the minimum artifact expectations are required.
+- `rich`: in addition to `minimal`, the worker MUST emit:
+  - `events.jsonl`
+  - `build_summary.json` (for build jobs)
+  - `test_summary.json` + `junit.xml` (for test jobs)
+
+`summary.json` SHOULD record the `artifact_profile` actually produced.
+
 ## Host↔Worker protocol (normative)
 The system MUST behave as if there is a versioned protocol even if implemented over SSH.
 
-### Versioning
-- Host and worker MUST each report `rch_xcode_lane_version` and `protocol_version`.
-- If `protocol_version` is incompatible, the host MUST fail with `failure_kind=WORKER_INCOMPATIBLE`.
+### Versioning + feature negotiation
+On `probe`, the worker MUST report:
+- `rch_xcode_lane_version` (string)
+- `protocol_min` / `protocol_max` (int; inclusive range supported by the worker)
+- `features` (array of strings; see below)
+
+The host MUST select a single `protocol_version` within the intersection of host- and worker-supported ranges
+and use that value for every subsequent request in the run.
+
+If there is no intersection, the host MUST fail with `failure_kind=WORKER_INCOMPATIBLE`.
+If the worker lacks a host-required feature, the host MUST fail with `failure_kind=WORKER_INCOMPATIBLE`
+and `failure_subkind=FEATURE_MISSING`.
+
+`features` is a capability list used for forward-compatible optional behavior. Example feature strings:
+`tail`, `fetch`, `events`, `has_source`, `upload_source`, `attestation_signing`.
 
 ### RPC envelope (normative, recommended)
 All worker operations SHOULD accept a single JSON request on stdin and emit a single JSON response on stdout.
 This maps directly to an SSH forced-command entrypoint.
 
 Request:
-- `protocol_version` (int)
+- `protocol_version` (int; selected by host after probe)
 - `op` (string: probe|submit|status|tail|cancel|fetch|has_source|upload_source)
 - `request_id` (string, caller-chosen)
 - `payload` (object)
 
 Response:
-- `protocol_version` (int)
+- `protocol_version` (int; selected by host after probe)
 - `request_id` (string)
 - `ok` (bool)
 - `payload` (object, when ok=true)
@@ -123,7 +181,7 @@ Response:
 
 ### Worker RPC surface (recommended, maps cleanly to SSH forced-command)
 Worker SHOULD implement these operations with JSON request/response payloads:
-- `probe` → returns `capabilities.json`
+- `probe` → returns protocol range/features + `capabilities.json`
 - `submit` → accepts `job.json` (+ optional bundle upload reference), returns ACK and initial status
 - `status` → returns current job status and pointers to logs/artifacts
 - `tail` → returns the next chunk of logs/events given a cursor (repeatable; host loops to "stream")
@@ -373,8 +431,12 @@ Caching MUST be correctness-preserving:
 `metrics.json` includes cache hit/miss + sizes + timing.
 
 ### Cache namespace (recommended)
-Repo config SHOULD provide a stable `cache_namespace` used as part of shared cache directory names,
+Repo config SHOULD provide a stable `cache.namespace` used as part of shared cache directory names,
 to prevent collisions across unrelated repos on the same worker.
+
+`cache.namespace` MUST be filesystem-safe:
+- MUST match: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
+- MUST NOT contain `/`, `\`, whitespace, or `..`
 
 ### Cache keying details (normative)
 - Any cache directory that can be reused across jobs MUST be additionally keyed by toolchain identity
@@ -385,6 +447,11 @@ to prevent collisions across unrelated repos on the same worker.
 Worker SHOULD maintain an optional result cache keyed by `job_key`:
 - If present and complete, a submit MAY be satisfied by materializing artifacts from the cached result.
 - The worker MUST still emit a correct `attestation.json` for the new `job_id` referencing the same `job_key`.
+
+Profile-aware reuse (recommended, prevents surprise omissions):
+- Each cached entry SHOULD record `artifact_profile` it satisfies.
+- A submit MAY be satisfied from cache ONLY if cached `artifact_profile` is >= requested `artifact_profile`.
+- Otherwise, the worker MUST execute the job to produce the missing richer artifacts.
 
 ### Locking + isolation (normative)
 - `per_job` DerivedData MUST be written under a directory derived from `job_key`.
@@ -412,7 +479,7 @@ Worker reports a `capabilities.json` including:
   - `developer_dir` (e.g. `"/Applications/Xcode-16.2.app/Contents/Developer"`)
 - Active Xcode: currently selected `DEVELOPER_DIR`
 - macOS version + architecture
-- available runtimes/devices (simctl)
+- available runtimes/devices (simctl), including runtime identifiers and runtime build strings when available
 - installed tooling versions (rch-worker, XcodeBuildMCP)
 - capacity (max concurrent jobs, disk free)
 Normative:
@@ -425,10 +492,18 @@ Host stores the chosen worker capability snapshot in artifacts.
 Given a set of eligible workers (tag match + reachable), host MUST choose deterministically
 unless user explicitly requests randomness.
 
+Selection mode (normative):
+- Default: `worker_selection.mode = "deterministic"`
+- Optional: `worker_selection.mode = "adaptive"`
+
+In `deterministic` mode, dynamic metrics (e.g. current load, free disk) MUST NOT affect ordering/choice.
+In `adaptive` mode, dynamic metrics MAY be used as tie-breakers, but the host MUST record the exact
+metric values used in `worker_selection.json`.
+
 Selection inputs:
 - required tags: `macos,xcode` (and any repo-required tags)
 - constraints: Xcode version/build, platform (iOS/macOS), destination availability
-- preference: lowest load / highest free disk MAY be used only as a tie-breaker
+- preference: only in `adaptive` mode, lowest load / highest free disk MAY be used as a tie-breaker
 
 Selection algorithm (default):
 1. Filter by required tags.
@@ -531,6 +606,10 @@ The project SHOULD ship machine-readable JSON Schemas for all normative artifact
 Schema files SHOULD follow the naming convention `<artifact_name>.schema.json` (e.g. `schemas/rch-xcode/job.schema.json`).
 Schemas enable automated validation in CI and by third-party tooling.
 
+Schema authoring recommendations:
+- Each schema SHOULD include a JSON Schema `$id` that corresponds to `schema_id`.
+- Use a single JSON Schema draft consistently across the project (2020-12 recommended).
+
 ## Artifacts
 - run_summary.json
 - run_plan.json
@@ -544,6 +623,7 @@ Schemas enable automated validation in CI and by third-party tooling.
 - job_state.json
 - invocation.json
 - toolchain.json
+- destination.json (recommended)
 - metrics.json
 - source_manifest.json
 - worker_selection.json
@@ -557,6 +637,7 @@ Schemas enable automated validation in CI and by third-party tooling.
 ## Artifact schemas + versioning
 All JSON artifacts MUST include:
 - `schema_version`
+- `schema_id`
 - `created_at`
 
 Run-scoped artifacts MUST include:
@@ -566,6 +647,15 @@ Job-scoped artifacts MUST include:
 - `run_id`
 - `job_id`
 - `job_key`
+
+### Schema compatibility rules (normative)
+- Adding new optional fields is a backward-compatible change and MUST NOT require bumping `schema_version`.
+- Removing fields, changing meanings/types, or tightening constraints in a way that breaks old producers/consumers
+  MUST bump `schema_version`.
+- `schema_id` MUST be a stable string identifier for the artifact schema, e.g.:
+  - `rch-xcode/job@1`
+  - `rch-xcode/summary@1`
+  - `rch-xcode/run_plan@1`
 
 ## Next steps
 1. Bring Mac mini worker online

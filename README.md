@@ -7,7 +7,7 @@
 - `PLAN.md` — **normative** contract (classifier, JobSpec, protocol, artifacts, caching, security)
 - `.rch/xcode.toml` — repo-scoped configuration (checked in)
 - `~/.config/rch/workers.toml` — host-scoped worker inventory + credentials
-- `schemas/rch-xcode/*` — machine-readable JSON Schemas for normative artifacts
+- `schemas/rch-xcode/*` — machine-readable JSON Schemas for normative artifacts (see `schema_id` in each JSON)
 
 ## What it is
 An extension to Remote Compilation Helper (RCH) that offloads Xcode build/test to a remote macOS worker (e.g. a Mac mini).
@@ -122,6 +122,8 @@ mode = "constraints"  # pinned | constraints
 value = "platform=iOS Simulator,name=iPhone 16,OS=latest"
 # In constraints mode, the host resolves "latest" using the selected worker's capabilities snapshot
 # and records the resolved destination into job.json for determinism.
+provisioning = "existing" # existing | ephemeral
+# If ephemeral, the worker provisions a clean Simulator per job (recommended for flaky test suites).
 
 [toolchain]
 # Pin the Xcode build number for reproducible builds.
