@@ -279,7 +279,7 @@ Worker MAY additionally maintain a correctness-preserving *result cache* keyed b
 
 ### Cancellation
 - Host MUST be able to request cancellation.
-- Worker MUST attempt a best-effort cancel (terminate backend process tree) and write artifacts with `status=failed`
+- Worker MUST attempt a best-effort cancel (terminate backend process tree) and write artifacts with `status=cancelled`
   and `failure_kind=CANCELLED`.
 
 On cancellation, `summary.json` MUST set:
@@ -351,7 +351,7 @@ Both MUST be updated atomically (write-then-rename) on every state transition.
 ### Run plan artifact (normative)
 The host MUST emit `run_plan.json` at `<run_id>/run_plan.json` before starting execution.
 It MUST include at least:
-- `schema_version`, `created_at`, `run_id`
+- `schema_version`, `schema_id` (`rch-xcode/run_plan@1`), `created_at`, `run_id`
 - `steps`: ordered array of `{ index, action, job_id }`
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
@@ -425,9 +425,9 @@ Rules:
 - Symlink handling MUST be safe:
   - symlinks that escape the repo root MUST be rejected (`failure_kind=BUNDLER`)
   - host MUST choose either "preserve symlink" or "dereference within root" deterministically per config
-- The host MUST emit `source_manifest.json` listing:
-  - `path`, `size`, `sha256` per file
-  - manifest `schema_version`
+- The host MUST emit `source_manifest.json` (job-scoped) listing:
+  - `schema_version`, `schema_id` (`rch-xcode/source_manifest@1`), `created_at`, `run_id`, `job_id`, `job_key`
+  - `entries[]`: each with `path`, `size`, `sha256`
 
 Transport note (non-normative but recommended):
 - The canonical tar MAY be compressed with zstd for transfer, but `source_sha256` MUST be computed
@@ -509,7 +509,7 @@ destination rules, allowed flags).
 
 ### `effective_config.json` (audit, not a cache key)
 `effective_config.json` MUST be emitted per job and MUST:
-- include `schema_version`, `created_at`, `run_id`, `job_id`
+- include `schema_version`, `created_at`, `run_id`, `job_id`, `job_key`
 - include the merged config object
 - record the contributing sources (origin + optional file path + a digest of raw bytes)
 - redact secrets (private keys, tokens, passwords). Any redaction MUST be recorded in a `redactions[]` list.
@@ -682,6 +682,8 @@ If the worker advertises feature `lease`, the host SHOULD:
 - include the returned `lease_id` on each `submit`,
 - renew or re-reserve if the lease expires before completion,
 - and call `release` when the run finishes.
+
+`release` MUST be idempotent: if the lease is unknown or already expired, the worker MUST return `ok: true` (no error). This simplifies host cleanup after crashes or lease expiry.
 
 If the worker is at capacity, `reserve` SHOULD fail with `failure_kind=WORKER_BUSY` and include `retry_after_seconds`.
 
@@ -883,6 +885,9 @@ Schema authoring recommendations:
 - source_manifest.json
 - worker_selection.json
 - job_index.json
+- executor_env.json (recommended)
+- classifier_policy.json (recommended)
+- attestation_verification.json (recommended)
 - events.jsonl (recommended)
 - test_summary.json (recommended)
 - build_summary.json (recommended)
@@ -896,7 +901,7 @@ To make artifact discovery stable for tooling, the system MUST provide:
 - `run_index.json` at `<run_id>/run_index.json`
 - `job_index.json` at `<run_id>/steps/<action>/<job_id>/job_index.json`
 
-`run_index.json` MUST include pointers (relative paths) to:
+`run_index.json` MUST include `schema_version`, `schema_id` (`rch-xcode/run_index@1`), `created_at`, `run_id`, and pointers (relative paths) to:
 - `run_plan.json`, `run_state.json`, `run_summary.json`
 - `worker_selection.json` and the selected `capabilities.json` snapshot
 - an ordered list of step jobs with `{ index, action, job_id, job_index_path }`

@@ -240,7 +240,7 @@ Includes:
   #!/bin/sh
   # Only allow the rch-worker xcode rpc entrypoint
   if [ "$SSH_ORIGINAL_COMMAND" != "rch-worker xcode rpc" ]; then
-    echo '{"ok":false,"error":{"code":"FORBIDDEN","message":"only rch-worker xcode rpc allowed"}}' >&2
+    echo '{"ok":false,"error":{"code":"FORBIDDEN","message":"only rch-worker xcode rpc allowed"}}'
     exit 1
   fi
   exec /usr/local/bin/rch-worker xcode rpc
