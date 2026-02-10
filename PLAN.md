@@ -114,6 +114,7 @@ Pipeline stages:
 2. **Run builder**: resolves repo `verify` actions into an ordered run plan, allocates stable `job_id`s, persists `run_plan.json`, chooses a worker once, and (when supported) acquires a time-bounded **worker lease**.
 3. **Destination resolver**: resolves any destination constraints (e.g. `OS=latest`) using the chosen worker's `capabilities.json` snapshot and records the resolved destination (including simulator runtime identifiers/builds).
    - **Destination provisioning (optional, recommended)**: if `destination.provisioning="ephemeral"` and the destination is a Simulator, the worker provisions a clean simulator per job and records the created UDID in artifacts (UDID MUST NOT affect `job_key`).
+   - **Ephemeral cleanup (normative)**: when `provisioning="ephemeral"`, the worker MUST delete the provisioned simulator after artifact collection completes (or after cancellation). If cleanup fails, the worker MUST log a warning in `build.log` and record `ephemeral_cleanup_failed: true` in `summary.json`. Workers SHOULD implement a startup sweep that deletes any orphaned ephemeral simulators from previous crashed runs (identifiable by a naming convention, e.g. `rch-ephemeral-<job_id>`).
 4. **JobSpec builder**: produces a fully specified, deterministic step job description (no ambient defaults).
 5. **Transport**: bundles inputs + sends to worker (integrity checked).
 6. **Executor**: runs the job on macOS via a selected backend (**xcodebuild** or **XcodeBuildMCP**).
@@ -143,6 +144,45 @@ Jobs MAY request an `artifact_profile`:
   - `test_summary.json` + `junit.xml` (for test jobs)
 
 `summary.json` SHOULD record the `artifact_profile` actually produced.
+
+### toolchain.json schema (normative)
+`toolchain.json` MUST be emitted per job and MUST include:
+
+| Field             | Type   | Description                                        |
+|-------------------|--------|----------------------------------------------------|
+| `schema_version`  | int    | Always `1`                                         |
+| `schema_id`       | string | `rch-xcode/toolchain@1`                            |
+| `run_id`          | string | Parent run identifier                              |
+| `job_id`          | string | Job identifier                                     |
+| `job_key`         | string | Job key                                            |
+| `created_at`      | string | RFC 3339 UTC                                       |
+| `xcode_version`   | string | e.g. `"16.2"`                                      |
+| `xcode_build`     | string | e.g. `"16C5032a"`                                  |
+| `developer_dir`   | string | Absolute path on worker                            |
+| `macos_version`   | string | e.g. `"15.3.1"`                                    |
+| `macos_build`     | string | e.g. `"24D60"`                                     |
+| `arch`            | string | e.g. `"arm64"`                                     |
+
+### destination.json schema (normative)
+`destination.json` MUST be emitted per job and MUST include:
+
+| Field             | Type   | Description                                        |
+|-------------------|--------|----------------------------------------------------|
+| `schema_version`  | int    | Always `1`                                         |
+| `schema_id`       | string | `rch-xcode/destination@1`                          |
+| `run_id`          | string | Parent run identifier                              |
+| `job_id`          | string | Job identifier                                     |
+| `job_key`         | string | Job key                                            |
+| `created_at`      | string | RFC 3339 UTC                                       |
+| `platform`        | string | e.g. `"iOS Simulator"`                             |
+| `name`            | string | Device name when applicable                        |
+| `os_version`      | string | Resolved concrete version                          |
+| `provisioning`    | string | `"existing"` or `"ephemeral"`                      |
+| `original_constraint` | string | The raw destination string from config          |
+| `sim_runtime_identifier` | string | (Simulator only) Runtime identifier         |
+| `sim_runtime_build` | string | (Simulator only) Runtime build string           |
+| `device_type_identifier` | string | (Simulator only) Device type identifier     |
+| `udid`            | string | (Optional) Actual device/simulator UDID used       |
 
 ## Host↔Worker protocol (normative)
 The system MUST behave as if there is a versioned protocol even if implemented over SSH.
@@ -240,6 +280,15 @@ On cancellation, `summary.json` MUST set:
 - `failure_kind=CANCELLED`
 - `exit_code=80`
 
+### Host signal handling (normative)
+On receiving SIGINT or SIGTERM, the host MUST:
+1. Send `cancel` for all RUNNING jobs in the current run.
+2. Wait up to a bounded grace period (recommended: 10 seconds) for cancellation acknowledgement.
+3. Persist `run_state.json` with `state=CANCELLED` and `run_summary.json` with available results.
+4. Exit with code 80 (`CANCELLED`).
+
+On receiving a second SIGINT (double-interrupt), the host MAY exit immediately without waiting for cancellation acknowledgement, but MUST still persist `run_state.json`.
+
 ### Log streaming (recommended)
 - Worker SHOULD support a "tail" mode so host can stream logs while running.
 - If not supported, host MUST still periodically fetch/append logs to avoid silent hangs.
@@ -300,6 +349,18 @@ It MUST include at least:
 
 `run_plan.json` is the authoritative source for which `job_id`s belong to a run. If the daemon restarts,
 it MUST be able to resume by reading `run_plan.json` and reusing the same `job_id`s (preserving worker idempotency guarantees).
+
+### Run resumption (normative)
+On restart, the host MUST:
+1. Read `run_plan.json` to recover the step list and `job_id`s.
+2. For each step job, check whether `job_index.json` exists (the commit marker):
+   - If present: treat the job as COMPLETE (success or failure per its `summary.json`).
+   - If absent: query the worker via `status` using the original `job_id`.
+     - If worker reports RUNNING: resume tailing/waiting.
+     - If worker reports COMPLETE: fetch artifacts normally.
+     - If worker reports unknown `job_id` or is unreachable: re-submit the job with the same `job_id`.
+3. The host MUST NOT skip a failed job on resumption unless the run is already CANCELLED.
+4. `run_state.json` MUST record `resumed_at` (RFC 3339 UTC) when a run is resumed.
 
 ## Deterministic JobSpec + Job Key
 Each remote run is driven by a `job.json` (JobSpec) generated on the host.
@@ -465,6 +526,24 @@ Aggregation rule:
 - Else if any step has `status=failed`, run `exit_code` MUST be the first failing step's `exit_code` in run order.
 - Else run `exit_code` MUST be 0.
 
+### run_summary.json schema (normative)
+`run_summary.json` MUST include at least:
+
+| Field            | Type   | Description                                         |
+|------------------|--------|-----------------------------------------------------|
+| `schema_version` | int    | Always `1` for this version                         |
+| `schema_id`      | string | `rch-xcode/run_summary@1`                           |
+| `run_id`         | string | Run identifier                                      |
+| `created_at`     | string | RFC 3339 UTC                                        |
+| `status`         | string | `success` \| `failed` \| `cancelled`                  |
+| `exit_code`      | int    | Aggregated per run-level exit code rules             |
+| `step_count`     | int    | Total steps in the run                               |
+| `steps_succeeded`| int    | Count of steps with `status=success`                 |
+| `steps_failed`   | int    | Count of steps with `status=failed`                  |
+| `steps_cancelled`| int    | Count of steps with `status=cancelled`               |
+| `duration_ms`    | int    | Wall-clock duration of the entire run                |
+| `human_summary`  | string | One-line human-readable summary                      |
+
 ## Agent-friendly summaries (recommended)
 In addition to `summary.json`, the worker SHOULD emit:
 - `test_summary.json` (counts, failing tests, duration, top failures)
@@ -524,11 +603,35 @@ Profile-aware reuse (recommended, prevents surprise omissions):
   - Lock MUST have a timeout and emit diagnostics if contention occurs.
 - Worker MUST execute each job in an isolated working directory (unique per job_id).
 
+### metrics.json schema (recommended)
+`metrics.json` SHOULD include at least:
+
+| Field               | Type   | Description                                          |
+|---------------------|--------|------------------------------------------------------|
+| `schema_version`    | int    | Always `1`                                           |
+| `schema_id`         | string | `rch-xcode/metrics@1`                                |
+| `run_id`            | string | Parent run identifier                                |
+| `job_id`            | string | Job identifier                                       |
+| `job_key`           | string | Job key                                              |
+| `created_at`        | string | RFC 3339 UTC                                         |
+| `timings`           | object | `{ bundle_ms, upload_ms, queue_ms, execute_ms, fetch_ms, total_ms }` |
+| `cache`             | object | `{ derived_data_hit: bool, spm_hit: bool, result_cache_hit: bool }` |
+| `cache_paths`       | object | Resolved cache directory paths used                  |
+| `sizes`             | object | `{ source_bundle_bytes, artifact_bytes, xcresult_bytes }` |
+| `cache_key_components` | object | Concrete key components used (job_key, xcode_build, etc.) |
+
 ### Eviction / garbage collection (normative)
 Worker MUST implement at least one:
 - size-based eviction (e.g. keep under N GB)
 - age-based eviction (e.g. delete items unused for N days)
 Eviction MUST NOT delete caches that are currently locked/in use.
+
+### Host artifact retention (recommended)
+The host SHOULD implement artifact retention to bound disk usage under the local artifact root:
+- Retention policy SHOULD support age-based and/or count-based limits (e.g. keep last N runs or last N days).
+- The host MUST NOT delete artifacts for RUNNING runs.
+- `rch xcode gc` (optional CLI) MAY trigger manual garbage collection.
+- The host SHOULD log when artifacts are evicted and record the policy in `effective_config.json`.
 
 ### Concurrency + capacity (normative)
 - Worker MUST enforce `max_concurrent_jobs`.
@@ -583,6 +686,9 @@ Selection inputs:
 Selection algorithm (default):
 1. Filter by required tags.
 2. Probe or load cached `capabilities.json` snapshots (bounded staleness).
+   - If a probe fails (timeout, connection error, or protocol error), the host MUST exclude that worker from the candidate set for this run and record `{ worker, probe_error, probe_duration_ms }` in `worker_selection.json` under a `probe_failures[]` array.
+   - If ALL probes fail, the host MUST fail with `failure_kind=SSH` and `human_summary` listing the unreachable workers.
+   - If a cached snapshot exists but is stale (older than TTL), and the fresh probe fails, the host MUST NOT fall back to the stale snapshot (to prevent using outdated capability data).
 3. Filter by constraints (destination exists, required Xcode available).
 4. Sort deterministically by:
    - explicit worker priority (host config)

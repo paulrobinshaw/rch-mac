@@ -166,6 +166,7 @@ Useful commands:
 - `rch xcode tail <run_id|job_id>`     (stream logs/events while running)
 - `rch xcode cancel <run_id|job_id>`   (best-effort cancellation)
 - `rch xcode artifacts <run_id|job_id>`(print artifact locations + key files)
+- `rch xcode gc`                       (optional: clean old local artifacts)
 - `rch workers list --tag macos,xcode` (show matching workers)
 - `rch workers probe <name>`           (fetch capabilities snapshot)
 - `rch xcode doctor`                   (validate config, SSH, Xcode, destination)

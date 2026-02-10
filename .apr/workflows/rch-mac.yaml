@@ -9,8 +9,7 @@ documents:
   implementation: "IMPLEMENTATION.md"
 
 oracle:
-  model: "5.2 Thinking"
-  thinking_time: heavy
+  model: "claude-4.1-opus"
 
 rounds:
   output_dir: ".apr/rounds/rch-mac"
