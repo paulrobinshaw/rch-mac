@@ -13,6 +13,7 @@ pub mod inventory;
 pub mod mock;
 pub mod protocol;
 pub mod state;
+pub mod summary;
 pub mod worker;
 
 pub use classifier::{
@@ -38,3 +39,6 @@ pub use artifact::{
     ArtifactEntry, ArtifactEntryType, ArtifactManifest, IntegrityError, ManifestError,
 };
 pub use inventory::{InventoryError, WorkerEntry, WorkerInventory};
+pub use summary::{
+    ExitCode, FailureKind, FailureSubkind, JobSummary, RunSummary, Status,
+};

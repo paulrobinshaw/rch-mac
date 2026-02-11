@@ -3,9 +3,11 @@
 //! Entry point for the `rch-xcode` command-line tool.
 
 use clap::{Parser, Subcommand};
-use rch_xcode_lane::{Classifier, ClassifierConfig, RepoConfig, WorkerInventory};
+use rch_xcode_lane::worker::Capabilities;
+use rch_xcode_lane::{Classifier, ClassifierConfig, RpcRequest, RepoConfig, WorkerInventory};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Command, Stdio};
 
 #[derive(Parser)]
 #[command(name = "rch-xcode")]
@@ -62,6 +64,24 @@ enum WorkersCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Probe a worker for capabilities
+    Probe {
+        /// Worker name from inventory
+        worker: String,
+
+        /// Path to workers inventory file (default: ~/.config/rch/workers.toml)
+        #[arg(long, short = 'i')]
+        inventory: Option<PathBuf>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Save capabilities to cache file
+        #[arg(long)]
+        save: bool,
+    },
 }
 
 fn main() {
@@ -77,6 +97,14 @@ fn main() {
         Commands::Workers { action } => match action {
             WorkersCommands::List { tag, inventory, json } => {
                 run_workers_list(tag, inventory, json);
+            }
+            WorkersCommands::Probe {
+                worker,
+                inventory,
+                json,
+                save,
+            } => {
+                run_workers_probe(&worker, inventory, json, save);
             }
         },
     }
@@ -246,4 +274,217 @@ fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, 
             println!();
         }
     }
+}
+
+fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_output: bool, save: bool) {
+    // Load inventory
+    let inventory = match inventory_path {
+        Some(ref path) => WorkerInventory::load(path),
+        None => WorkerInventory::load_default(),
+    };
+
+    let inventory = match inventory {
+        Ok(inv) => inv,
+        Err(e) => {
+            eprintln!("Error loading worker inventory: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Find the worker
+    let worker = match inventory.get(worker_name) {
+        Some(w) => w,
+        None => {
+            eprintln!("Worker '{}' not found in inventory.", worker_name);
+            eprintln!("Available workers: {}",
+                inventory.workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", "));
+            process::exit(1);
+        }
+    };
+
+    // Build SSH command
+    let mut ssh_args = vec![
+        "-o".to_string(), "BatchMode=yes".to_string(),
+        "-o".to_string(), "ConnectTimeout=30".to_string(),
+        "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+
+    // Add identity file if specified
+    if let Some(ref key_path) = worker.ssh_key_path {
+        let expanded = if key_path.starts_with("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                format!("{}/{}", home, &key_path[2..])
+            } else {
+                key_path.clone()
+            }
+        } else {
+            key_path.clone()
+        };
+        ssh_args.push("-i".to_string());
+        ssh_args.push(expanded);
+    }
+
+    // Add port if not default
+    if worker.port != 22 {
+        ssh_args.push("-p".to_string());
+        ssh_args.push(worker.port.to_string());
+    }
+
+    // Add user@host
+    ssh_args.push(format!("{}@{}", worker.user, worker.host));
+
+    // Create probe request
+    let probe_request = RpcRequest {
+        protocol_version: 0,
+        request_id: format!("probe-{}", uuid_simple()),
+        op: rch_xcode_lane::Operation::Probe,
+        payload: serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    let request_json = match serde_json::to_string(&probe_request) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("Error serializing probe request: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Execute SSH command
+    eprintln!("Probing worker '{}'...", worker_name);
+
+    let mut child = match Command::new("ssh")
+        .args(&ssh_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to spawn SSH process: {}", e);
+            process::exit(20); // SSH exit code
+        }
+    };
+
+    // Write request to stdin
+    if let Some(ref mut stdin) = child.stdin {
+        if let Err(e) = writeln!(stdin, "{}", request_json) {
+            eprintln!("Failed to write to SSH stdin: {}", e);
+            process::exit(20);
+        }
+    }
+    drop(child.stdin.take()); // Close stdin to signal EOF
+
+    // Read response from stdout
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = BufReader::new(stdout);
+    let mut response_line = String::new();
+
+    match reader.read_line(&mut response_line) {
+        Ok(0) => {
+            eprintln!("No response from worker");
+            // Read stderr for error details
+            if let Some(mut stderr) = child.stderr.take() {
+                let mut err_output = String::new();
+                if std::io::Read::read_to_string(&mut stderr, &mut err_output).is_ok() && !err_output.is_empty() {
+                    eprintln!("SSH stderr: {}", err_output.trim());
+                }
+            }
+            process::exit(20);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Failed to read from SSH stdout: {}", e);
+            process::exit(20);
+        }
+    }
+
+    // Wait for SSH to complete
+    let status = child.wait().unwrap_or_else(|e| {
+        eprintln!("Failed to wait for SSH process: {}", e);
+        process::exit(20);
+    });
+
+    if !status.success() {
+        eprintln!("SSH command failed with status: {}", status);
+        process::exit(20);
+    }
+
+    // Parse the response
+    let response: serde_json::Value = match serde_json::from_str(&response_line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse probe response: {}", e);
+            eprintln!("Raw response: {}", response_line);
+            process::exit(1);
+        }
+    };
+
+    // Extract capabilities from response payload
+    let capabilities_json = match response.get("payload") {
+        Some(payload) => payload,
+        None => {
+            eprintln!("Probe response missing payload");
+            eprintln!("Response: {}", serde_json::to_string_pretty(&response).unwrap_or_default());
+            process::exit(1);
+        }
+    };
+
+    // Try to parse as Capabilities
+    let capabilities: Capabilities = match serde_json::from_value(capabilities_json.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: Could not parse capabilities struct: {}", e);
+            // Fall back to raw JSON output
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(capabilities_json).unwrap());
+            } else {
+                println!("Raw capabilities:\n{}", serde_json::to_string_pretty(capabilities_json).unwrap());
+            }
+            process::exit(0);
+        }
+    };
+
+    // Save to cache if requested
+    if save {
+        let cache_dir = match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(".cache/rch/capabilities"),
+            Err(_) => {
+                eprintln!("Warning: Could not determine home directory for cache");
+                PathBuf::from("/tmp/rch/capabilities")
+            }
+        };
+
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            eprintln!("Warning: Could not create cache directory: {}", e);
+        } else {
+            let cache_file = cache_dir.join(format!("{}.json", worker_name));
+            match capabilities.write_to_file(&cache_file) {
+                Ok(_) => eprintln!("Saved capabilities to: {}", cache_file.display()),
+                Err(e) => eprintln!("Warning: Could not save capabilities: {}", e),
+            }
+        }
+    }
+
+    // Output
+    if json_output {
+        match capabilities.to_json() {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing capabilities: {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", capabilities.to_human_readable());
+    }
+}
+
+/// Generate a simple UUID-like string for request IDs
+fn uuid_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:016x}{:08x}", now.as_nanos(), std::process::id())
 }
