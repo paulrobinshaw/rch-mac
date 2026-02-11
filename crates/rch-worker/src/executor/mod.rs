@@ -51,6 +51,88 @@ pub const EFFECTIVE_CONFIG_SCHEMA_VERSION: u32 = 1;
 /// Schema identifier for effective_config.json
 pub const EFFECTIVE_CONFIG_SCHEMA_ID: &str = "rch-xcode/effective_config@1";
 
+/// Schema version for events.jsonl
+pub const EVENTS_SCHEMA_VERSION: u32 = 1;
+/// Schema identifier for events.jsonl
+pub const EVENTS_SCHEMA_ID: &str = "rch-xcode/events@1";
+
+/// Structured event for events.jsonl
+///
+/// Each event has a timestamp, stage, kind, and optional data.
+/// Events are appended to events.jsonl in JSON Lines format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    /// RFC 3339 timestamp
+    pub ts: String,
+    /// Execution stage: setup, extraction, execution, completion
+    pub stage: String,
+    /// Event kind within the stage
+    pub kind: String,
+    /// Optional event data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl Event {
+    /// Create a new event with the current timestamp
+    pub fn new(stage: &str, kind: &str) -> Self {
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            stage: stage.to_string(),
+            kind: kind.to_string(),
+            data: None,
+        }
+    }
+
+    /// Create an event with data
+    pub fn with_data(stage: &str, kind: &str, data: serde_json::Value) -> Self {
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            stage: stage.to_string(),
+            kind: kind.to_string(),
+            data: Some(data),
+        }
+    }
+}
+
+/// Event emitter for writing events.jsonl
+pub struct EventEmitter {
+    path: PathBuf,
+}
+
+impl EventEmitter {
+    /// Create a new event emitter for the given artifact directory
+    pub fn new(artifact_dir: &Path) -> Self {
+        Self {
+            path: artifact_dir.join("events.jsonl"),
+        }
+    }
+
+    /// Emit an event to events.jsonl
+    pub fn emit(&self, event: &Event) -> io::Result<()> {
+        let json = serde_json::to_string(event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+
+        writeln!(file, "{}", json)?;
+        Ok(())
+    }
+
+    /// Emit a simple event (no data)
+    pub fn emit_simple(&self, stage: &str, kind: &str) -> io::Result<()> {
+        self.emit(&Event::new(stage, kind))
+    }
+
+    /// Emit an event with data
+    pub fn emit_with_data(&self, stage: &str, kind: &str, data: serde_json::Value) -> io::Result<()> {
+        self.emit(&Event::with_data(stage, kind, data))
+    }
+}
+
 /// Errors from executor operations.
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -241,14 +323,33 @@ impl Executor {
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&artifact_dir)?;
 
+        // Create event emitter for structured events
+        let events = EventEmitter::new(&artifact_dir);
+
+        // Emit job started event
+        let _ = events.emit_with_data("setup", "started", serde_json::json!({
+            "job_id": job.job_id,
+            "run_id": job.run_id,
+            "action": job.action,
+        }));
+
         // Check for cancellation
         if self.is_cancelled() {
+            let _ = events.emit_simple("setup", "cancelled");
             return Ok(self.make_cancelled_result(start_time.elapsed()));
         }
+
+        // Emit extraction started event
+        let _ = events.emit_with_data("extraction", "started", serde_json::json!({
+            "source_sha256": &job.job_key_inputs.source_sha256,
+        }));
 
         // Extract source bundle
         let source_sha256 = &job.job_key_inputs.source_sha256;
         if let Err(e) = self.extract_source(source_sha256, &work_dir) {
+            let _ = events.emit_with_data("extraction", "failed", serde_json::json!({
+                "error": e.to_string(),
+            }));
             let duration_ms = start_time.elapsed().as_millis() as u64;
             self.write_failure_summary(
                 &artifact_dir,
@@ -272,8 +373,12 @@ impl Executor {
             });
         }
 
+        // Emit extraction completed event
+        let _ = events.emit_simple("extraction", "completed");
+
         // Check for cancellation
         if self.is_cancelled() {
+            let _ = events.emit_simple("setup", "cancelled");
             let duration_ms = start_time.elapsed().as_millis() as u64;
             self.write_cancelled_summary(&artifact_dir, job, duration_ms)?;
             return Ok(self.make_cancelled_result(start_time.elapsed()));
@@ -301,6 +406,12 @@ impl Executor {
         writeln!(log_writer, "=== Begin xcodebuild output ===")?;
         log_writer.flush()?;
 
+        // Emit execution started event
+        let _ = events.emit_with_data("execution", "started", serde_json::json!({
+            "command": cmd,
+            "action": job.action,
+        }));
+
         // Execute xcodebuild
         let exec_result = self.run_xcodebuild(
             &cmd,
@@ -323,16 +434,42 @@ impl Executor {
         // Process result and write artifacts
         let result = match exec_result {
             Ok((status, backend_exit_code, term_signal)) => {
-                self.process_execution_result(
+                let res = self.process_execution_result(
                     &artifact_dir,
                     job,
                     status,
                     backend_exit_code,
                     term_signal,
                     duration_ms,
-                )?
+                )?;
+
+                // Emit execution event based on result
+                match res.status {
+                    ExecutionStatus::Success => {
+                        let _ = events.emit_with_data("execution", "completed", serde_json::json!({
+                            "exit_code": res.exit_code,
+                            "duration_ms": duration_ms,
+                        }));
+                    }
+                    ExecutionStatus::Failed => {
+                        let _ = events.emit_with_data("execution", "failed", serde_json::json!({
+                            "exit_code": res.exit_code,
+                            "backend_exit_code": res.backend_exit_code,
+                            "failure_kind": res.failure_kind,
+                        }));
+                    }
+                    ExecutionStatus::Cancelled => {
+                        let _ = events.emit_simple("execution", "cancelled");
+                    }
+                }
+
+                res
             }
             Err(e) => {
+                let _ = events.emit_with_data("execution", "error", serde_json::json!({
+                    "error": e.to_string(),
+                }));
+
                 self.write_failure_summary(
                     &artifact_dir,
                     job,
@@ -362,6 +499,18 @@ impl Executor {
         if let Some(ref config) = job.effective_config {
             self.write_effective_config_json(&artifact_dir, job, config)?;
         }
+
+        // Emit completion event
+        let completion_kind = match result.status {
+            ExecutionStatus::Success => "success",
+            ExecutionStatus::Failed => "failure",
+            ExecutionStatus::Cancelled => "cancelled",
+        };
+        let _ = events.emit_with_data("completion", completion_kind, serde_json::json!({
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "status": format!("{:?}", result.status),
+        }));
 
         Ok(result)
     }
@@ -1609,5 +1758,76 @@ mod tests {
                 failure_kind, expected_exit_code
             );
         }
+    }
+
+    // Test 29: Event struct creation
+    #[test]
+    fn test_event_creation() {
+        let event = Event::new("setup", "started");
+        assert_eq!(event.stage, "setup");
+        assert_eq!(event.kind, "started");
+        assert!(event.data.is_none());
+        assert!(!event.ts.is_empty());
+    }
+
+    // Test 30: Event with data
+    #[test]
+    fn test_event_with_data() {
+        let data = serde_json::json!({
+            "job_id": "test-123",
+            "action": "build"
+        });
+        let event = Event::with_data("execution", "started", data.clone());
+        assert_eq!(event.stage, "execution");
+        assert_eq!(event.kind, "started");
+        assert!(event.data.is_some());
+        assert_eq!(event.data.unwrap()["job_id"], "test-123");
+    }
+
+    // Test 31: Event emitter writes to events.jsonl
+    #[test]
+    fn test_event_emitter() {
+        let temp_dir = TempDir::new().unwrap();
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let emitter = EventEmitter::new(&artifact_dir);
+        emitter.emit_simple("setup", "started").unwrap();
+        emitter.emit_with_data("execution", "completed", serde_json::json!({
+            "exit_code": 0
+        })).unwrap();
+
+        let events_path = artifact_dir.join("events.jsonl");
+        assert!(events_path.exists(), "events.jsonl should be created");
+
+        // Read and verify content
+        let content = fs::read_to_string(&events_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "Should have 2 event lines");
+
+        // Parse and verify first event
+        let event1: Event = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event1.stage, "setup");
+        assert_eq!(event1.kind, "started");
+
+        // Parse and verify second event
+        let event2: Event = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(event2.stage, "execution");
+        assert_eq!(event2.kind, "completed");
+        assert_eq!(event2.data.as_ref().unwrap()["exit_code"], 0);
+    }
+
+    // Test 32: Event serialization format
+    #[test]
+    fn test_event_serialization() {
+        let event = Event::new("completion", "success");
+        let json = serde_json::to_string(&event).unwrap();
+
+        // Verify JSON structure
+        assert!(json.contains("\"ts\":"));
+        assert!(json.contains("\"stage\":\"completion\""));
+        assert!(json.contains("\"kind\":\"success\""));
+        // data should be absent when None (skip_serializing_if)
+        assert!(!json.contains("\"data\":null"));
     }
 }
