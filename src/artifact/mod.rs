@@ -1,11 +1,25 @@
 //! Artifact management for RCH Xcode Lane
 //!
-//! Handles artifact manifests, attestation, indices, and integrity verification
-//! per PLAN.md normative spec.
+//! Handles artifact manifests, attestation, indices, integrity verification,
+//! and schema versioning per PLAN.md normative spec.
+//!
+//! ## Schema versioning
+//!
+//! All artifacts include `schema_version`, `schema_id`, and `created_at` fields.
+//! Schema IDs use the format `rch-xcode/<artifact-type>@<major-version>`.
+//!
+//! Compatibility rules:
+//! - Adding optional fields: backward-compatible (no version bump needed)
+//! - Removing/changing fields: requires version bump
+//!
+//! Unknown version handling:
+//! - Same major version: parse known fields, ignore unknown (forward-compatible)
+//! - Different major version: reject with diagnostic
 
 mod attestation;
 mod indices;
 mod manifest;
+pub mod schema;
 mod verify;
 
 pub use attestation::{
@@ -22,4 +36,8 @@ pub use manifest::{
 };
 pub use verify::{
     verify_artifacts, verify_manifest_consistency, VerificationError, VerificationResult,
+};
+pub use schema::{
+    extract_and_validate_header, is_forward_compatible, validate_schema_compatibility,
+    ArtifactHeader, JobScopedHeader, RunScopedHeader, SchemaError, SchemaId,
 };
