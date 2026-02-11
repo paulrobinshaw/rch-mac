@@ -1011,3 +1011,121 @@ fn test_run_summary_serialization() {
     assert_eq!(parsed.status, run.status);
     assert_eq!(parsed.duration_ms, 1234);
 }
+
+// =============================================================================
+// Test 18: Bundle Size Enforcement
+// =============================================================================
+
+#[test]
+fn test_payload_too_large_rejection() {
+    // Test that worker rejects uploads exceeding max_upload_bytes with PAYLOAD_TOO_LARGE
+    let transport = MockTransport::new();
+    let worker = transport.worker();
+
+    // Set a small upload limit
+    worker.set_max_upload_bytes(1000);
+
+    // Try to upload a large payload
+    let upload = make_request(
+        Operation::UploadSource,
+        1,
+        json!({
+            "source_sha256": "sha-large-test",
+            "content_length": 5000,  // Exceeds 1000 byte limit
+            "content": "base64-content",
+        }),
+    );
+
+    let resp = transport.execute(&upload).unwrap();
+    assert!(!resp.ok, "Upload should fail when exceeding size limit");
+
+    let error = resp.error.unwrap();
+    assert_eq!(error.code, "PAYLOAD_TOO_LARGE");
+    assert!(error.data.is_some());
+
+    let data = error.data.unwrap();
+    assert_eq!(data["max_bytes"], 1000);
+    assert_eq!(data["content_length"], 5000);
+}
+
+#[test]
+fn test_payload_within_limit_succeeds() {
+    // Test that uploads within limit succeed
+    let transport = MockTransport::new();
+    let worker = transport.worker();
+
+    // Set upload limit
+    worker.set_max_upload_bytes(5000);
+
+    // Upload within limit
+    let upload = make_request(
+        Operation::UploadSource,
+        1,
+        json!({
+            "source_sha256": "sha-ok-test",
+            "content_length": 1000,  // Within 5000 byte limit
+            "content": "base64-content",
+        }),
+    );
+
+    let resp = transport.execute(&upload).unwrap();
+    assert!(resp.ok, "Upload should succeed when within size limit");
+}
+
+#[test]
+fn test_no_upload_limit_when_zero() {
+    // Test that 0 means no limit
+    let transport = MockTransport::new();
+    let worker = transport.worker();
+
+    // Default is 0 (no limit)
+    worker.set_max_upload_bytes(0);
+
+    // Large upload should succeed
+    let upload = make_request(
+        Operation::UploadSource,
+        1,
+        json!({
+            "source_sha256": "sha-nolimit-test",
+            "content_length": 1_000_000_000,  // 1 GB
+            "content": "base64-content",
+        }),
+    );
+
+    let resp = transport.execute(&upload).unwrap();
+    assert!(resp.ok, "Upload should succeed when no limit is set");
+}
+
+#[test]
+fn test_probe_includes_limits() {
+    // Test that probe response includes limits section
+    let transport = MockTransport::new();
+    let worker = transport.worker();
+
+    // Set an upload limit
+    worker.set_max_upload_bytes(10_000_000);
+
+    let probe = make_request(Operation::Probe, 0, json!({}));
+    let resp = transport.execute(&probe).unwrap();
+    assert!(resp.ok);
+
+    let payload = resp.payload.unwrap();
+    assert!(payload["limits"].is_object(), "Probe should include limits");
+
+    let limits = &payload["limits"];
+    assert_eq!(limits["max_upload_bytes"], 10_000_000);
+}
+
+#[test]
+fn test_probe_limits_null_when_no_limit() {
+    // Test that max_upload_bytes is null when 0 (no limit)
+    let transport = MockTransport::new();
+
+    let probe = make_request(Operation::Probe, 0, json!({}));
+    let resp = transport.execute(&probe).unwrap();
+    assert!(resp.ok);
+
+    let payload = resp.payload.unwrap();
+    let limits = &payload["limits"];
+    assert!(limits["max_upload_bytes"].is_null(), "max_upload_bytes should be null when no limit");
+}
