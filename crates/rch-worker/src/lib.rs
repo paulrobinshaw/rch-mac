@@ -35,4 +35,5 @@ pub use cache::{
     DerivedDataCache, DerivedDataMode, CacheConfig, CacheError, CacheResult, CacheStats,
     CacheLock, LockError, LockResult, ToolchainKey,
     SpmCache, SpmCacheMode, SpmCacheKey, SpmCacheStats,
+    ResultCache, ResultCacheEntry, ResultCacheStats,
 };

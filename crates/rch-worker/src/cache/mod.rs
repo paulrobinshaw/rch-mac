@@ -29,10 +29,12 @@
 
 mod derived_data;
 mod lock;
+mod result;
 mod spm;
 mod toolchain_key;
 
 pub use derived_data::{DerivedDataCache, DerivedDataMode, CacheConfig, CacheError, CacheResult, CacheStats};
 pub use lock::{CacheLock, LockError, LockResult};
+pub use result::{ResultCache, ResultCacheEntry, ResultCacheStats};
 pub use spm::{SpmCache, SpmCacheMode, SpmCacheKey, SpmCacheStats};
 pub use toolchain_key::ToolchainKey;
