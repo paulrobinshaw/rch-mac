@@ -438,6 +438,7 @@ mod tests {
             probe_failures: vec![],
             snapshot_age_seconds: 0,
             snapshot_source: SnapshotSource::Fresh,
+            adaptive_metrics: None,
         }
     }
 

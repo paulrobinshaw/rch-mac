@@ -101,6 +101,27 @@ pub struct WorkerSelection {
 
     /// Source of the snapshot
     pub snapshot_source: SnapshotSource,
+
+    /// Metrics used for adaptive selection (only set if mode=adaptive)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_metrics: Option<AdaptiveMetrics>,
+}
+
+/// Metrics used for adaptive worker selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveMetrics {
+    /// Selected worker's free disk in bytes
+    pub disk_free_bytes: u64,
+
+    /// Selected worker's available memory in bytes (if reported)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+
+    /// Whether disk_free was a deciding factor
+    pub disk_was_tiebreaker: bool,
+
+    /// Whether memory was a deciding factor
+    pub memory_was_tiebreaker: bool,
 }
 
 /// Source of capabilities snapshot
@@ -255,6 +276,12 @@ pub struct SelectionResult<'a> {
 
     /// Workers filtered out by destination constraint
     pub filtered_no_destination: Vec<String>,
+
+    /// Selection mode used
+    pub selection_mode: SelectionMode,
+
+    /// Adaptive metrics (if mode=adaptive)
+    pub adaptive_metrics: Option<AdaptiveMetrics>,
 }
 
 impl<'a> SelectionResult<'a> {
@@ -272,7 +299,7 @@ impl<'a> SelectionResult<'a> {
             },
             selected_worker: self.candidate.worker.name.clone(),
             selected_worker_host: self.candidate.worker.host.clone(),
-            selection_mode: SelectionMode::Deterministic,
+            selection_mode: self.selection_mode,
             candidate_count: self.constraint_filtered_count as u32,
             probe_failures: self.probe_failures.clone(),
             snapshot_age_seconds: self.candidate.snapshot_age_seconds(),
@@ -281,6 +308,7 @@ impl<'a> SelectionResult<'a> {
             } else {
                 SnapshotSource::Cached
             },
+            adaptive_metrics: self.adaptive_metrics.clone(),
         }
     }
 }
@@ -388,13 +416,34 @@ pub fn select_worker<'a>(
 
     let constraint_filtered_count = protocol_filtered.len();
 
-    // Phase 5: Sort deterministically by priority then name
+    // Phase 5: Sort by priority, then (if adaptive) by dynamic metrics, then by name
     let mut sorted = protocol_filtered;
     sorted.sort_by(|a, b| {
-        a.worker
-            .priority
-            .cmp(&b.worker.priority)
-            .then_with(|| a.worker.name.cmp(&b.worker.name))
+        let priority_cmp = a.worker.priority.cmp(&b.worker.priority);
+        if priority_cmp != std::cmp::Ordering::Equal {
+            return priority_cmp;
+        }
+
+        // In adaptive mode, use dynamic metrics as tie-breakers
+        if constraints.mode == SelectionMode::Adaptive {
+            // Prefer workers with more free disk (descending)
+            let disk_cmp = b.capabilities.capacity.disk_free_bytes
+                .cmp(&a.capabilities.capacity.disk_free_bytes);
+            if disk_cmp != std::cmp::Ordering::Equal {
+                return disk_cmp;
+            }
+
+            // Prefer workers with more free memory (descending), if available
+            let a_mem = a.capabilities.capacity.memory_available_bytes.unwrap_or(0);
+            let b_mem = b.capabilities.capacity.memory_available_bytes.unwrap_or(0);
+            let mem_cmp = b_mem.cmp(&a_mem);
+            if mem_cmp != std::cmp::Ordering::Equal {
+                return mem_cmp;
+            }
+        }
+
+        // Final tie-breaker: stable name (alphabetical)
+        a.worker.name.cmp(&b.worker.name)
     });
 
     // Phase 6: Choose first
@@ -406,6 +455,44 @@ pub fn select_worker<'a>(
         host_protocol_range.1,
     );
 
+    // Build adaptive metrics if in adaptive mode
+    let adaptive_metrics = if constraints.mode == SelectionMode::Adaptive {
+        // Determine if metrics were tiebreakers by checking if there were
+        // other workers with same priority
+        let same_priority_count = sorted
+            .iter()
+            .filter(|c| c.worker.priority == selected.worker.priority)
+            .count();
+
+        // If multiple workers had same priority, something broke the tie
+        let disk_was_tiebreaker = same_priority_count > 1 && sorted.len() > 1 && {
+            // Check if any other same-priority worker has different disk
+            sorted.iter().any(|c| {
+                c.worker.priority == selected.worker.priority
+                    && c.capabilities.capacity.disk_free_bytes
+                        != selected.capabilities.capacity.disk_free_bytes
+            })
+        };
+
+        let memory_was_tiebreaker = same_priority_count > 1 && !disk_was_tiebreaker && {
+            // Disk was same, check if memory differed
+            sorted.iter().any(|c| {
+                c.worker.priority == selected.worker.priority
+                    && c.capabilities.capacity.memory_available_bytes
+                        != selected.capabilities.capacity.memory_available_bytes
+            })
+        };
+
+        Some(AdaptiveMetrics {
+            disk_free_bytes: selected.capabilities.capacity.disk_free_bytes,
+            memory_available_bytes: selected.capabilities.capacity.memory_available_bytes,
+            disk_was_tiebreaker,
+            memory_was_tiebreaker,
+        })
+    } else {
+        None
+    };
+
     Ok(SelectionResult {
         candidate: selected.clone(),
         tag_filtered_count,
@@ -414,6 +501,8 @@ pub fn select_worker<'a>(
         negotiated_protocol_version: negotiated,
         filtered_no_xcode,
         filtered_no_destination,
+        selection_mode: constraints.mode,
+        adaptive_metrics,
     })
 }
 
@@ -774,6 +863,7 @@ mod tests {
             }],
             snapshot_age_seconds: 120,
             snapshot_source: SnapshotSource::Cached,
+            adaptive_metrics: None,
         };
 
         let json = artifact.to_json().unwrap();
@@ -784,5 +874,184 @@ mod tests {
         let parsed = WorkerSelection::from_json(&json).unwrap();
         assert_eq!(parsed.selected_worker, "worker-a");
         assert_eq!(parsed.probe_failures.len(), 1);
+    }
+
+    // =============================================================================
+    // Adaptive Mode Tests
+    // =============================================================================
+
+    fn sample_capabilities_with_capacity(
+        xcode_versions: Vec<(&str, &str)>,
+        disk_free_bytes: u64,
+        memory_available_bytes: Option<u64>,
+    ) -> Capabilities {
+        let mut caps = sample_capabilities(xcode_versions, vec!["18.0"]);
+        caps.capacity.disk_free_bytes = disk_free_bytes;
+        caps.capacity.memory_available_bytes = memory_available_bytes;
+        caps
+    }
+
+    #[test]
+    fn test_adaptive_selection_by_disk() {
+        // Three workers, same priority, different disk space
+        let worker_a = sample_worker("worker-a", 1, vec!["macos", "xcode"]);
+        let worker_b = sample_worker("worker-b", 1, vec!["macos", "xcode"]);
+        let worker_c = sample_worker("worker-c", 1, vec!["macos", "xcode"]);
+
+        // worker-b has most disk space
+        let caps_a = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 100_000_000_000, None);
+        let caps_b = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 500_000_000_000, None);
+        let caps_c = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 200_000_000_000, None);
+
+        let candidates = vec![
+            WorkerCandidate::new(&worker_a, caps_a, true),
+            WorkerCandidate::new(&worker_b, caps_b, true),
+            WorkerCandidate::new(&worker_c, caps_c, true),
+        ];
+
+        // Adaptive mode should prefer worker-b (most disk)
+        let constraints = SelectionConstraints::xcode_lane().with_mode(SelectionMode::Adaptive);
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        assert_eq!(result.candidate.worker.name, "worker-b");
+        assert_eq!(result.selection_mode, SelectionMode::Adaptive);
+
+        // Should have adaptive metrics
+        let metrics = result.adaptive_metrics.as_ref().unwrap();
+        assert_eq!(metrics.disk_free_bytes, 500_000_000_000);
+        assert!(metrics.disk_was_tiebreaker);
+        assert!(!metrics.memory_was_tiebreaker);
+    }
+
+    #[test]
+    fn test_adaptive_selection_by_memory_when_disk_equal() {
+        // Three workers, same priority, same disk, different memory
+        let worker_a = sample_worker("worker-a", 1, vec!["macos", "xcode"]);
+        let worker_b = sample_worker("worker-b", 1, vec!["macos", "xcode"]);
+        let worker_c = sample_worker("worker-c", 1, vec!["macos", "xcode"]);
+
+        let disk = 100_000_000_000;
+        // worker-c has most memory
+        let caps_a = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], disk, Some(8_000_000_000));
+        let caps_b = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], disk, Some(16_000_000_000));
+        let caps_c = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], disk, Some(32_000_000_000));
+
+        let candidates = vec![
+            WorkerCandidate::new(&worker_a, caps_a, true),
+            WorkerCandidate::new(&worker_b, caps_b, true),
+            WorkerCandidate::new(&worker_c, caps_c, true),
+        ];
+
+        // Adaptive mode should prefer worker-c (most memory, since disk is equal)
+        let constraints = SelectionConstraints::xcode_lane().with_mode(SelectionMode::Adaptive);
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        assert_eq!(result.candidate.worker.name, "worker-c");
+
+        let metrics = result.adaptive_metrics.as_ref().unwrap();
+        assert_eq!(metrics.memory_available_bytes, Some(32_000_000_000));
+        assert!(!metrics.disk_was_tiebreaker); // disk was same
+        assert!(metrics.memory_was_tiebreaker);
+    }
+
+    #[test]
+    fn test_adaptive_falls_back_to_name_when_metrics_equal() {
+        // Three workers, same priority, same disk, same memory
+        let worker_c = sample_worker("worker-c", 1, vec!["macos", "xcode"]);
+        let worker_a = sample_worker("worker-a", 1, vec!["macos", "xcode"]);
+        let worker_b = sample_worker("worker-b", 1, vec!["macos", "xcode"]);
+
+        let caps = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 100_000_000_000, Some(16_000_000_000));
+
+        // Pass in different order to test sorting
+        let candidates = vec![
+            WorkerCandidate::new(&worker_c, caps.clone(), true),
+            WorkerCandidate::new(&worker_a, caps.clone(), true),
+            WorkerCandidate::new(&worker_b, caps.clone(), true),
+        ];
+
+        // Adaptive mode should still fall back to alphabetical order
+        let constraints = SelectionConstraints::xcode_lane().with_mode(SelectionMode::Adaptive);
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        // worker-a should be selected (alphabetically first after metrics are equal)
+        assert_eq!(result.candidate.worker.name, "worker-a");
+
+        let metrics = result.adaptive_metrics.as_ref().unwrap();
+        assert!(!metrics.disk_was_tiebreaker);
+        assert!(!metrics.memory_was_tiebreaker);
+    }
+
+    #[test]
+    fn test_adaptive_priority_still_takes_precedence() {
+        // Two workers: one with lower priority but less disk, one with higher priority and more disk
+        let worker_high_priority = sample_worker("worker-z", 0, vec!["macos", "xcode"]); // priority 0 = highest
+        let worker_low_priority = sample_worker("worker-a", 1, vec!["macos", "xcode"]); // priority 1 = lower
+
+        let caps_high_priority = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 50_000_000_000, None);
+        let caps_low_priority = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 500_000_000_000, None);
+
+        let candidates = vec![
+            WorkerCandidate::new(&worker_high_priority, caps_high_priority, true),
+            WorkerCandidate::new(&worker_low_priority, caps_low_priority, true),
+        ];
+
+        // Even in adaptive mode, priority still wins
+        let constraints = SelectionConstraints::xcode_lane().with_mode(SelectionMode::Adaptive);
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        // worker-z should be selected (higher priority, even though less disk)
+        assert_eq!(result.candidate.worker.name, "worker-z");
+    }
+
+    #[test]
+    fn test_adaptive_metrics_in_artifact() {
+        let worker = sample_worker("worker-a", 1, vec!["macos", "xcode"]);
+        let caps = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 123_456_789, Some(9_876_543_210));
+
+        let candidates = vec![
+            WorkerCandidate::new(&worker, caps, true),
+        ];
+
+        let constraints = SelectionConstraints::xcode_lane().with_mode(SelectionMode::Adaptive);
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        let artifact = result.to_artifact("run-adaptive-test");
+
+        assert_eq!(artifact.selection_mode, SelectionMode::Adaptive);
+        assert!(artifact.adaptive_metrics.is_some());
+
+        let metrics = artifact.adaptive_metrics.clone().unwrap();
+        assert_eq!(metrics.disk_free_bytes, 123_456_789);
+        assert_eq!(metrics.memory_available_bytes, Some(9_876_543_210));
+
+        // Serialize to JSON and verify adaptive_metrics is included
+        let json = artifact.to_json().unwrap();
+        assert!(json.contains("\"adaptive_metrics\""));
+        assert!(json.contains("123456789"));
+    }
+
+    #[test]
+    fn test_deterministic_has_no_adaptive_metrics() {
+        let worker = sample_worker("worker-a", 1, vec!["macos", "xcode"]);
+        let caps = sample_capabilities_with_capacity(vec![("16.2", "16C5032a")], 100_000_000_000, Some(16_000_000_000));
+
+        let candidates = vec![
+            WorkerCandidate::new(&worker, caps, true),
+        ];
+
+        // Deterministic mode (default)
+        let constraints = SelectionConstraints::xcode_lane();
+        let result = select_worker(&candidates, &constraints, (1, 1)).unwrap();
+
+        assert_eq!(result.selection_mode, SelectionMode::Deterministic);
+        assert!(result.adaptive_metrics.is_none());
+
+        let artifact = result.to_artifact("run-deterministic-test");
+        assert!(artifact.adaptive_metrics.is_none());
+
+        // JSON should NOT contain adaptive_metrics when None
+        let json = artifact.to_json().unwrap();
+        assert!(!json.contains("adaptive_metrics"));
     }
 }

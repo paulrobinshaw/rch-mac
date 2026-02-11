@@ -432,6 +432,7 @@ impl Pipeline {
             probe_failures: vec![],
             snapshot_age_seconds: 0,
             snapshot_source: crate::selection::SnapshotSource::Fresh,
+            adaptive_metrics: None,
         };
 
         self.worker_selection = Some(selection);
