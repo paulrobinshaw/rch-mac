@@ -14,6 +14,7 @@ pub mod mock;
 pub mod protocol;
 pub mod state;
 pub mod summary;
+pub mod toolchain;
 pub mod worker;
 
 pub use classifier::{
@@ -41,4 +42,7 @@ pub use artifact::{
 pub use inventory::{InventoryError, WorkerEntry, WorkerInventory};
 pub use summary::{
     ExitCode, FailureKind, FailureSubkind, JobSummary, RunSummary, Status,
+};
+pub use toolchain::{
+    resolve_toolchain, ToolchainError, ToolchainIdentity, ToolchainResolution, XcodeConstraint,
 };
