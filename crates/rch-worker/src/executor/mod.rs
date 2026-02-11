@@ -1,26 +1,35 @@
-//! xcodebuild backend executor for the RCH worker.
+//! Backend executors for the RCH worker.
 //!
-//! Implements the execution logic per bead axz.10. This module handles:
+//! This module provides two backend executors:
+//! - **xcodebuild** (default): Direct xcodebuild invocation (M2)
+//! - **XcodeBuildMCP**: Richer structured output via MCP protocol (M3)
+//!
+//! Both executors implement the same artifact contract and share common functionality:
 //! - Creating isolated working directories per job
 //! - Extracting source bundles from the content-addressed store
-//! - Constructing xcodebuild commands from job.json
-//! - Executing xcodebuild with streaming log capture
+//! - Executing commands with streaming log capture
 //! - Writing normative artifacts (summary.json, toolchain.json, etc.)
 //! - Handling cancellation via SIGTERM
 //!
-//! Agent-friendly summaries (per bead t7z):
+//! ## Backend selection
+//! The backend is selected via `backend = "mcp"` or `backend = "xcodebuild"` in
+//! `.rch/xcode.toml`. XcodeBuildMCP is NOT a fallback — it's an explicit choice.
+//!
+//! ## Agent-friendly summaries (per bead t7z)
 //! - test_summary.json: test counts, failing tests, duration
 //! - build_summary.json: targets, warnings/errors, first error
 //! - junit.xml: JUnit XML report for CI integration
 //!
-//! Artifact integrity (per bead y6s.1):
+//! ## Artifact integrity (per bead y6s.1)
 //! - manifest.json: artifact entries with SHA-256 hashes
 //!
-//! Attestation (per bead y6s.3):
+//! ## Attestation (per bead y6s.3)
 //! - attestation.json: binds artifacts to job inputs and worker identity
 
 pub mod attestation;
 pub mod manifest;
+pub mod mcp;
+pub mod metrics;
 pub mod summary;
 
 use std::collections::HashMap;
