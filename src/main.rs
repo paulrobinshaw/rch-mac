@@ -2,14 +2,18 @@
 //!
 //! Entry point for the `rch-xcode` command-line tool.
 
-use clap::{Parser, Subcommand};
-use rch_xcode_lane::worker::Capabilities;
-use rch_xcode_lane::{
-    Classifier, ClassifierConfig, RpcRequest, RepoConfig, WorkerInventory,
-};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+
+use rch_xcode_lane::worker::Capabilities;
+use rch_xcode_lane::{
+    Action, Classifier, ClassifierConfig, Pipeline, PipelineConfig, RpcRequest, RepoConfig,
+    WorkerInventory, execute_tail,
+};
 
 #[derive(Parser)]
 #[command(name = "rch-xcode")]
@@ -627,4 +631,105 @@ fn run_cancel(id: &str, reason_str: &str, json_output: bool) {
     // Exit with success - the cancel request was acknowledged
     // In full implementation, exit code depends on cancel result
     process::exit(0);
+}
+
+/// Run pipeline for verify/run commands
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline(
+    config: Option<PathBuf>,
+    inventory: Option<PathBuf>,
+    output: PathBuf,
+    action: Option<String>,
+    continue_on_failure: bool,
+    timeout: u64,
+    idle_timeout: u64,
+    verbose: bool,
+    json_output: bool,
+) {
+    let config_path = config.unwrap_or_else(|| PathBuf::from(".rch/xcode.toml"));
+
+    // Build pipeline config
+    let pipeline_config = PipelineConfig {
+        repo_config_path: config_path,
+        inventory_path: inventory,
+        artifacts_dir: output,
+        overall_timeout_seconds: timeout,
+        idle_timeout_seconds: idle_timeout,
+        continue_on_failure,
+        tail_poll_interval: Duration::from_secs(1),
+        verbose,
+    };
+
+    let mut pipeline = Pipeline::new(pipeline_config);
+
+    // Execute based on action
+    let result = if let Some(action_str) = action {
+        let action = match action_str.to_lowercase().as_str() {
+            "build" => Action::Build,
+            "test" => Action::Test,
+            _ => {
+                eprintln!("Invalid action '{}'. Valid: build, test", action_str);
+                process::exit(1);
+            }
+        };
+        pipeline.execute_action(action)
+    } else {
+        pipeline.execute_verify()
+    };
+
+    match result {
+        Ok(summary) => {
+            if json_output {
+                match serde_json::to_string_pretty(&summary) {
+                    Ok(json) => println!("{}", json),
+                    Err(e) => {
+                        eprintln!("Error serializing summary: {}", e);
+                        process::exit(1);
+                    }
+                }
+            } else {
+                println!();
+                println!("Run completed: {}", summary.run_id);
+                println!("  Status: {:?}", summary.status);
+                println!("  Duration: {}ms", summary.duration_ms);
+                println!("  Steps succeeded: {}", summary.steps_succeeded);
+                println!("  Steps failed: {}", summary.steps_failed);
+                if summary.steps_skipped > 0 {
+                    println!("  Steps skipped: {}", summary.steps_skipped);
+                }
+                if summary.steps_rejected > 0 {
+                    println!("  Steps rejected: {}", summary.steps_rejected);
+                }
+            }
+
+            process::exit(summary.exit_code);
+        }
+        Err(e) => {
+            if json_output {
+                let error_json = serde_json::json!({
+                    "error": e.to_string(),
+                    "exit_code": e.exit_code()
+                });
+                println!("{}", serde_json::to_string_pretty(&error_json).unwrap());
+            } else {
+                eprintln!("Error: {}", e);
+            }
+            process::exit(e.exit_code());
+        }
+    }
+}
+
+/// Stream logs from a job
+fn run_tail(id: &str, _artifacts_dir: PathBuf, follow: bool, _from_start: bool) {
+    // Note: artifacts_dir and from_start are for future enhancements
+    // Currently execute_tail only needs id, inventory path, follow, and verbose
+    match execute_tail(id, None, follow, true) {
+        Ok(()) => {
+            // Success
+        }
+        Err(e) => {
+            eprintln!("Tail error: {}", e);
+            process::exit(e.exit_code());
+        }
+    }
 }

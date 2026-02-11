@@ -14,6 +14,7 @@ pub mod host;
 pub mod inventory;
 pub mod job;
 pub mod mock;
+pub mod pipeline;
 pub mod protocol;
 pub mod run;
 pub mod selection;
@@ -79,3 +80,4 @@ pub use cancel::{
 pub use timeout::{
     TimeoutConfig, TimeoutEnforcer, TimeoutStatus, TimeoutValidationError,
 };
+pub use pipeline::{Pipeline, PipelineConfig, PipelineError, PipelineResult, execute_tail};
