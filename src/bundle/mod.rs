@@ -545,6 +545,45 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_tar_properties() {
+        use tar::Archive;
+        use std::io::Cursor;
+
+        let dir = create_test_dir();
+        let bundler = Bundler::new(dir.path().to_path_buf());
+        let result = bundler.create_bundle("test-run").unwrap();
+
+        // Parse the tar archive and verify canonical properties
+        let mut archive = Archive::new(Cursor::new(&result.tar_bytes));
+
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let header = entry.header();
+
+            // Verify mtime is normalized to 0
+            assert_eq!(header.mtime().unwrap(), 0, "mtime should be 0 for canonical tar");
+
+            // Verify uid/gid are normalized to 0
+            assert_eq!(header.uid().unwrap(), 0, "uid should be 0 for canonical tar");
+            assert_eq!(header.gid().unwrap(), 0, "gid should be 0 for canonical tar");
+
+            // Verify mode is normalized (644 for files, 755 for dirs)
+            let mode = header.mode().unwrap();
+            match header.entry_type() {
+                tar::EntryType::Regular => {
+                    // Files should be 644 or 755
+                    assert!(mode == 0o644 || mode == 0o755,
+                        "File mode should be 644 or 755, got {:o}", mode);
+                }
+                tar::EntryType::Directory => {
+                    assert_eq!(mode, 0o755, "Directory mode should be 755");
+                }
+                _ => {} // Symlinks and other types are fine
+            }
+        }
+    }
+
+    #[test]
     fn test_size_limit_enforced() {
         let dir = create_test_dir();
 
@@ -626,5 +665,104 @@ mod tests {
         assert_eq!(BundleResult::effective_limit(100, 200), 100);
         assert_eq!(BundleResult::effective_limit(300, 150), 150);
         assert_eq!(BundleResult::effective_limit(50, 50), 50);
+    }
+
+    // Symlink tests (Unix only due to symlink support)
+    #[cfg(unix)]
+    mod symlink_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        #[test]
+        fn test_symlink_escape_rejected() {
+            let dir = TempDir::new().unwrap();
+
+            // Create a normal file
+            fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+            // Create a symlink that escapes the root
+            // Points to ../../etc/passwd which escapes the temp dir
+            let escape_link = dir.path().join("escape_link");
+            symlink("../../etc/passwd", &escape_link).unwrap();
+
+            let bundler = Bundler::new(dir.path().to_path_buf());
+            let result = bundler.create_bundle("test-run");
+
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                BundleError::SymlinkEscapesRoot { path } => {
+                    assert!(path.to_string_lossy().contains("escape_link"));
+                }
+                _ => panic!("Expected SymlinkEscapesRoot error"),
+            }
+        }
+
+        #[test]
+        fn test_symlink_to_sibling_preserved() {
+            let dir = TempDir::new().unwrap();
+
+            // Create a target file
+            fs::write(dir.path().join("target.txt"), "target content").unwrap();
+
+            // Create a symlink to the sibling file (within root)
+            let link = dir.path().join("link.txt");
+            symlink("target.txt", &link).unwrap();
+
+            let bundler = Bundler::new(dir.path().to_path_buf());
+            let result = bundler.create_bundle("test-run").unwrap();
+
+            // Symlink should be recorded in manifest
+            let symlink_entry = result.manifest.entries.iter()
+                .find(|e| e.path == "link.txt")
+                .expect("Symlink should be in manifest");
+
+            assert_eq!(symlink_entry.entry_type, EntryType::Symlink);
+            assert_eq!(symlink_entry.symlink_target, Some("target.txt".to_string()));
+        }
+
+        #[test]
+        fn test_symlink_dereferenced_when_enabled() {
+            let dir = TempDir::new().unwrap();
+
+            // Create a target file
+            fs::write(dir.path().join("target.txt"), "target content").unwrap();
+
+            // Create a symlink
+            let link = dir.path().join("link.txt");
+            symlink("target.txt", &link).unwrap();
+
+            // Bundle with dereference enabled
+            let bundler = Bundler::new(dir.path().to_path_buf())
+                .with_dereference_symlinks(true);
+            let result = bundler.create_bundle("test-run").unwrap();
+
+            // With dereferencing, the entry should be a File, not a Symlink
+            let entry = result.manifest.entries.iter()
+                .find(|e| e.path == "link.txt")
+                .expect("Link should be in manifest");
+
+            assert_eq!(entry.entry_type, EntryType::File);
+            assert!(entry.symlink_target.is_none());
+            // Should have the size of the target file
+            assert_eq!(entry.size, "target content".len() as u64);
+        }
+
+        #[test]
+        fn test_absolute_symlink_in_root_allowed() {
+            let dir = TempDir::new().unwrap();
+
+            // Create a target file
+            fs::write(dir.path().join("target.txt"), "content").unwrap();
+
+            // Create an absolute symlink pointing within root
+            let link = dir.path().join("abs_link.txt");
+            let abs_target = dir.path().join("target.txt").canonicalize().unwrap();
+            symlink(&abs_target, &link).unwrap();
+
+            let bundler = Bundler::new(dir.path().to_path_buf());
+            // This should succeed because the absolute path is still within root
+            let result = bundler.create_bundle("test-run");
+            assert!(result.is_ok());
+        }
     }
 }
