@@ -12,7 +12,15 @@
 //! - test_summary.json: test counts, failing tests, duration
 //! - build_summary.json: targets, warnings/errors, first error
 //! - junit.xml: JUnit XML report for CI integration
+//!
+//! Artifact integrity (per bead y6s.1):
+//! - manifest.json: artifact entries with SHA-256 hashes
+//!
+//! Attestation (per bead y6s.3):
+//! - attestation.json: binds artifacts to job inputs and worker identity
 
+pub mod attestation;
+pub mod manifest;
 pub mod summary;
 
 use std::collections::HashMap;
@@ -179,6 +187,12 @@ pub struct ExecutorConfig {
     pub shared_derived_data: Option<PathBuf>,
     /// Grace period in seconds for SIGTERM before SIGKILL.
     pub termination_grace_seconds: u64,
+    /// Worker name for attestation (e.g., "macmini-01")
+    pub worker_name: String,
+    /// Worker fingerprint for attestation (e.g., SSH host key fingerprint)
+    pub worker_fingerprint: String,
+    /// Worker capabilities JSON for attestation digest
+    pub capabilities_json: String,
 }
 
 impl Default for ExecutorConfig {
@@ -188,6 +202,9 @@ impl Default for ExecutorConfig {
             source_store_root: PathBuf::from("/var/lib/rch/sources"),
             shared_derived_data: Some(PathBuf::from("/var/lib/rch/DerivedData")),
             termination_grace_seconds: 10,
+            worker_name: "unknown".to_string(),
+            worker_fingerprint: "unknown".to_string(),
+            capabilities_json: "{}".to_string(),
         }
     }
 }
@@ -516,6 +533,38 @@ impl Executor {
             &job.job_key,
             &job.action,
         );
+
+        // Generate manifest.json (y6s.1)
+        // This must succeed for artifact integrity
+        let manifest_result = manifest::generate_manifest(
+            &artifact_dir,
+            &job.run_id,
+            &job.job_id,
+            &job.job_key,
+        );
+
+        // Generate attestation.json (y6s.3)
+        // Requires manifest to compute manifest_sha256
+        if let Ok(ref manifest) = manifest_result {
+            if let Ok(manifest_sha256) = manifest.compute_sha256() {
+                // Get backend version from toolchain
+                let backend_version = &job.job_key_inputs.toolchain.xcode_build;
+
+                let _ = attestation::generate_attestation(
+                    &artifact_dir,
+                    &job.run_id,
+                    &job.job_id,
+                    &job.job_key,
+                    &job.job_key_inputs.source_sha256,
+                    &self.config.worker_name,
+                    &self.config.worker_fingerprint,
+                    self.config.capabilities_json.as_bytes(),
+                    "xcodebuild",
+                    backend_version,
+                    &manifest_sha256,
+                );
+            }
+        }
 
         // Emit completion event
         let completion_kind = match result.status {
@@ -1148,6 +1197,9 @@ mod tests {
             source_store_root: temp_dir.path().join("sources"),
             shared_derived_data: Some(temp_dir.path().join("DerivedData")),
             termination_grace_seconds: 10,
+            worker_name: "test-worker".to_string(),
+            worker_fingerprint: "SHA256:test-fingerprint".to_string(),
+            capabilities_json: r#"{"max_upload_bytes":104857600}"#.to_string(),
         };
         fs::create_dir_all(&config.jobs_root).unwrap();
         fs::create_dir_all(&config.source_store_root).unwrap();
