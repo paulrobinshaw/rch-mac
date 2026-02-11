@@ -4,10 +4,12 @@
 //! Apple-platform projects that routes safe, allowlisted Xcode commands
 //! to macOS workers.
 
+pub mod artifact;
 pub mod bundle;
 pub mod classifier;
 pub mod config;
 pub mod host;
+pub mod inventory;
 pub mod mock;
 pub mod protocol;
 pub mod state;
@@ -32,3 +34,7 @@ pub use bundle::{
 };
 pub use host::{RpcClient, RpcClientConfig, RpcResult, RpcError as HostRpcError, Transport, MockTransport, SshTransport};
 pub use worker::RpcHandler;
+pub use artifact::{
+    ArtifactEntry, ArtifactEntryType, ArtifactManifest, IntegrityError, ManifestError,
+};
+pub use inventory::{InventoryError, WorkerEntry, WorkerInventory};
