@@ -4,13 +4,23 @@
 //! invocations based on an allowlist. It ensures only safe, supported commands
 //! are routed to remote workers.
 
+mod config;
+mod explain;
+mod invocation;
 mod parser;
+mod policy;
 mod result;
 
+pub use config::{ConfigError, RepoConfig, VerifyAction};
+pub use explain::{ConfigConstraints, EffectivePolicy, ExplainOutput, MatchedConstraintsOutput};
+pub use invocation::Invocation;
 pub use parser::parse_xcodebuild_argv;
+pub use policy::{ClassifierPolicy, PolicyAllowlist, PolicyConstraints, PolicyDenylist};
 pub use result::{ClassifierResult, MatchedConstraints, RejectionReason};
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 /// Configuration for the classifier, typically from `.rch/xcode.toml`
 #[derive(Debug, Clone, Default)]
@@ -249,6 +259,147 @@ impl Classifier {
             configuration: parsed.flags.get("-configuration").and_then(|v| v.clone()),
         }
     }
+
+    /// Compute SHA-256-like hash of the classifier policy
+    ///
+    /// This includes all allowlist/denylist entries and config constraints
+    /// to enable reproducibility audits. Uses DefaultHasher for simplicity
+    /// (actual SHA-256 would require a crypto dependency).
+    pub fn policy_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+
+        // Hash config
+        self.config.workspace.hash(&mut hasher);
+        self.config.project.hash(&mut hasher);
+        self.config.scheme.hash(&mut hasher);
+        self.config.destination.hash(&mut hasher);
+        for config in &self.config.allowed_configurations {
+            config.hash(&mut hasher);
+        }
+
+        // Hash allowlists (sorted for determinism)
+        let mut actions: Vec<_> = self.allowed_actions.iter().collect();
+        actions.sort();
+        for action in actions {
+            action.hash(&mut hasher);
+        }
+
+        let mut flags: Vec<_> = self.allowed_flags.iter().collect();
+        flags.sort();
+        for flag in flags {
+            flag.hash(&mut hasher);
+        }
+
+        // Hash denylists (sorted for determinism)
+        let mut denied: Vec<_> = self.denied_actions.iter().collect();
+        denied.sort();
+        for d in denied {
+            d.hash(&mut hasher);
+        }
+
+        let mut denied_f: Vec<_> = self.denied_flags.iter().collect();
+        denied_f.sort();
+        for d in denied_f {
+            d.hash(&mut hasher);
+        }
+
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// Create an Invocation record from a successful classification
+    ///
+    /// Returns None if the classification was rejected
+    pub fn create_invocation(
+        &self,
+        original_argv: &[String],
+        result: &ClassifierResult,
+    ) -> Option<Invocation> {
+        if !result.accepted {
+            return None;
+        }
+
+        Some(Invocation::new(
+            original_argv.to_vec(),
+            result.sanitized_argv.clone().unwrap_or_default(),
+            result.action.clone().unwrap_or_default(),
+            result.rejected_flags.clone(),
+            self.policy_sha256(),
+        ))
+    }
+
+    /// Generate the effective policy for explain output
+    pub fn effective_policy(&self) -> EffectivePolicy {
+        let mut allowed_actions: Vec<_> = self.allowed_actions.iter().cloned().collect();
+        allowed_actions.sort();
+
+        let mut denied_actions: Vec<_> = self.denied_actions.iter().cloned().collect();
+        denied_actions.sort();
+
+        let mut allowed_flags: Vec<_> = self.allowed_flags.iter().cloned().collect();
+        allowed_flags.sort();
+
+        let mut denied_flags: Vec<_> = self.denied_flags.iter().cloned().collect();
+        denied_flags.sort();
+
+        EffectivePolicy {
+            allowed_actions,
+            denied_actions,
+            allowed_flags,
+            denied_flags,
+            config_constraints: ConfigConstraints {
+                workspace: self.config.workspace.clone(),
+                project: self.config.project.clone(),
+                required_scheme: self.config.scheme.clone(),
+                allowed_configurations: self.config.allowed_configurations.clone(),
+            },
+        }
+    }
+
+    /// Run classification and produce an explanation
+    pub fn explain(&self, argv: &[String]) -> ExplainOutput {
+        let result = self.classify(argv);
+        ExplainOutput::from_result(argv.to_vec(), &result, self.effective_policy())
+    }
+
+    /// Create a classifier policy snapshot
+    pub fn create_policy_snapshot(&self) -> ClassifierPolicy {
+        let mut allowed_actions: Vec<_> = self.allowed_actions.iter().cloned().collect();
+        allowed_actions.sort();
+
+        let mut denied_actions: Vec<_> = self.denied_actions.iter().cloned().collect();
+        denied_actions.sort();
+
+        let mut allowed_flags: Vec<_> = self.allowed_flags.iter().cloned().collect();
+        allowed_flags.sort();
+
+        let mut denied_flags: Vec<_> = self.denied_flags.iter().cloned().collect();
+        denied_flags.sort();
+
+        ClassifierPolicy::new(
+            PolicyAllowlist {
+                actions: allowed_actions,
+                flags: allowed_flags,
+            },
+            PolicyDenylist {
+                actions: denied_actions,
+                flags: denied_flags,
+            },
+            PolicyConstraints {
+                workspace: self.config.workspace.clone(),
+                project: self.config.project.clone(),
+                scheme: self.config.scheme.clone(),
+                destination: self.config.destination.clone(),
+                allowed_configurations: self.config.allowed_configurations.clone(),
+            },
+        )
+    }
+
+    /// Get the SHA-256 hash of the classifier policy
+    pub fn policy_sha256(&self) -> String {
+        self.create_policy_snapshot()
+            .sha256()
+            .unwrap_or_else(|_| "error-computing-hash".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -401,5 +552,91 @@ mod tests {
         assert_eq!(sanitized[4], "MyApp");
         assert_eq!(sanitized[5], "-workspace");
         assert_eq!(sanitized[6], "MyApp.xcworkspace");
+    }
+
+    #[test]
+    fn test_policy_hash_deterministic() {
+        let classifier1 = Classifier::new(test_config());
+        let classifier2 = Classifier::new(test_config());
+
+        // Same config should produce same hash
+        assert_eq!(classifier1.policy_hash(), classifier2.policy_hash());
+    }
+
+    #[test]
+    fn test_policy_hash_differs_with_config() {
+        let classifier1 = Classifier::new(test_config());
+
+        let mut config2 = test_config();
+        config2.scheme = "DifferentScheme".to_string();
+        let classifier2 = Classifier::new(config2);
+
+        // Different config should produce different hash
+        assert_ne!(classifier1.policy_hash(), classifier2.policy_hash());
+    }
+
+    #[test]
+    fn test_create_invocation_accepted() {
+        let classifier = Classifier::new(test_config());
+        let argv: Vec<String> = vec![
+            "build",
+            "-workspace",
+            "MyApp.xcworkspace",
+            "-scheme",
+            "MyApp",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let result = classifier.classify(&argv);
+        let invocation = classifier.create_invocation(&argv, &result);
+
+        assert!(invocation.is_some());
+        let inv = invocation.unwrap();
+        assert_eq!(inv.original_argv, argv);
+        assert_eq!(inv.accepted_action, "build");
+        assert!(inv.rejected_flags.is_empty());
+        assert!(!inv.classifier_policy_sha256.is_empty());
+    }
+
+    #[test]
+    fn test_create_invocation_rejected() {
+        let classifier = Classifier::new(test_config());
+        let argv: Vec<String> = vec!["archive", "-scheme", "MyApp"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let result = classifier.classify(&argv);
+        let invocation = classifier.create_invocation(&argv, &result);
+
+        // Rejected classifications don't produce an invocation
+        assert!(invocation.is_none());
+    }
+
+    #[test]
+    fn test_invocation_to_json() {
+        let classifier = Classifier::new(test_config());
+        let argv: Vec<String> = vec![
+            "test",
+            "-workspace",
+            "MyApp.xcworkspace",
+            "-scheme",
+            "MyApp",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let result = classifier.classify(&argv);
+        let invocation = classifier.create_invocation(&argv, &result).unwrap();
+
+        let json = invocation.to_json().unwrap();
+        assert!(json.contains("\"original_argv\""));
+        assert!(json.contains("\"sanitized_argv\""));
+        assert!(json.contains("\"accepted_action\""));
+        assert!(json.contains("\"test\""));
+        assert!(json.contains("\"classifier_policy_sha256\""));
     }
 }

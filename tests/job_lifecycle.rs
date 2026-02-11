@@ -2,7 +2,7 @@
 //!
 //! Tests for bead rch-mac-666.4: Job lifecycle state machine and idempotency.
 
-use rch_xcode_lane::{MockWorker, Operation, RpcRequest, JobState};
+use rch_xcode_lane::{MockWorker, Operation, RpcRequest, MockJobState};
 use serde_json::json;
 
 /// Helper to create an RPC request
@@ -439,7 +439,7 @@ fn test_get_job_state_api() {
     // Now exists
     let state = worker.get_job_state("job-api-001");
     assert!(state.is_some());
-    assert_eq!(state.unwrap(), JobState::Queued);
+    assert_eq!(state.unwrap(), MockJobState::Queued);
 }
 
 // =============================================================================

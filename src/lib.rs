@@ -4,12 +4,31 @@
 //! Apple-platform projects that routes safe, allowlisted Xcode commands
 //! to macOS workers.
 
+pub mod bundle;
 pub mod classifier;
+pub mod config;
+pub mod host;
 pub mod mock;
 pub mod protocol;
+pub mod state;
 pub mod worker;
 
-pub use classifier::{Classifier, ClassifierConfig, ClassifierResult};
-pub use mock::{MockWorker, MockState, Job, JobState, Lease, FailureConfig, FailureInjector};
+pub use classifier::{
+    Classifier, ClassifierConfig, ClassifierPolicy, ClassifierResult, ConfigConstraints,
+    ConfigError, EffectivePolicy, ExplainOutput, Invocation, MatchedConstraintsOutput,
+    PolicyAllowlist, PolicyConstraints, PolicyDenylist, RepoConfig, VerifyAction,
+};
+pub use config::{
+    BuiltinDefaults, ConfigError as MergeConfigError, ConfigOrigin, ConfigSource, EffectiveConfig,
+};
+pub use mock::{MockWorker, MockState, Job, JobState as MockJobState, Lease, FailureConfig, FailureInjector};
 pub use protocol::{RpcRequest, RpcResponse, Operation, ErrorCode, RpcError};
+pub use state::{
+    CurrentStep, JobState, JobStateData, JobStateError, RunState, RunStateData, RunStateError,
+};
+pub use bundle::{
+    BundleError, BundleMode, BundleResult, Bundler, EntryType, ExcludeError, ExcludeRules,
+    ManifestEntry, SourceManifest,
+};
+pub use host::{RpcClient, RpcClientConfig, RpcResult, RpcError as HostRpcError, Transport, MockTransport, SshTransport};
 pub use worker::RpcHandler;
