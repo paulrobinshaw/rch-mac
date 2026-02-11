@@ -2,18 +2,16 @@
 //!
 //! Entry point for the `rch-xcode` command-line tool.
 
+use clap::{Parser, Subcommand};
+use rch_xcode_lane::worker::Capabilities;
+use rch_xcode_lane::{
+    Action, Classifier, ClassifierConfig, Pipeline, PipelineConfig, RepoConfig, RpcRequest,
+    WorkerInventory, execute_tail,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
 use std::time::Duration;
-
-use clap::{Parser, Subcommand};
-
-use rch_xcode_lane::worker::Capabilities;
-use rch_xcode_lane::{
-    Action, Classifier, ClassifierConfig, Pipeline, PipelineConfig, RpcRequest, RepoConfig,
-    WorkerInventory, execute_tail,
-};
 
 #[derive(Parser)]
 #[command(name = "rch-xcode")]
@@ -111,17 +109,17 @@ enum Commands {
         /// Job ID or Run ID to tail
         id: String,
 
-        /// Path to artifacts directory (to find state files)
-        #[arg(long, short = 'o', default_value = ".rch/artifacts")]
-        artifacts_dir: PathBuf,
+        /// Path to workers inventory file
+        #[arg(long, short = 'i')]
+        inventory: Option<PathBuf>,
 
         /// Follow mode - keep streaming until job completes
         #[arg(long, short = 'f')]
         follow: bool,
 
-        /// Start from beginning of log instead of current position
-        #[arg(long)]
-        from_start: bool,
+        /// Verbose output
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 }
 
@@ -198,21 +196,30 @@ fn main() {
             verbose,
             json,
         } => {
-            run_pipeline(config, inventory, output, action, continue_on_failure, timeout, idle_timeout, verbose, json);
+            run_pipeline(
+                config,
+                inventory,
+                output,
+                action,
+                continue_on_failure,
+                timeout,
+                idle_timeout,
+                verbose,
+                json,
+            );
         }
         Commands::Tail {
             id,
-            artifacts_dir,
+            inventory,
             follow,
-            from_start,
+            verbose,
         } => {
-            run_tail(&id, artifacts_dir, follow, from_start);
+            run_tail(&id, inventory, follow, verbose);
         }
     }
 }
 
 fn run_explain(human: bool, config_path: Option<PathBuf>, cmd: Vec<String>) {
-    // Load config
     let classifier_config = match load_classifier_config(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -221,11 +228,9 @@ fn run_explain(human: bool, config_path: Option<PathBuf>, cmd: Vec<String>) {
         }
     };
 
-    // Create classifier and run explain
     let classifier = Classifier::new(classifier_config);
     let explanation = classifier.explain(&cmd);
 
-    // Output
     if human {
         println!("{}", explanation.to_human());
     } else {
@@ -238,7 +243,6 @@ fn run_explain(human: bool, config_path: Option<PathBuf>, cmd: Vec<String>) {
         }
     }
 
-    // Exit with appropriate code
     if explanation.accepted {
         process::exit(0);
     } else {
@@ -285,13 +289,11 @@ fn load_classifier_config(config_path: Option<PathBuf>) -> Result<ClassifierConf
             .map(|c| c.to_classifier_config())
             .map_err(|e| e.to_string())
     } else {
-        // Use default config if no file exists
         Ok(ClassifierConfig::default())
     }
 }
 
 fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, json_output: bool) {
-    // Load inventory
     let inventory = match inventory_path {
         Some(path) => WorkerInventory::load(&path),
         None => WorkerInventory::load_default(),
@@ -305,7 +307,6 @@ fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, 
         }
     };
 
-    // Filter by tags if specified
     let workers: Vec<_> = if let Some(ref tag_list) = tags {
         let tag_refs: Vec<&str> = tag_list.iter().map(|s| s.as_str()).collect();
         inventory.filter_by_tags(&tag_refs)
@@ -313,12 +314,10 @@ fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, 
         inventory.workers.iter().collect()
     };
 
-    // Sort by priority
     let mut workers = workers;
     workers.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.name.cmp(&b.name)));
 
     if json_output {
-        // JSON output
         let output: Vec<serde_json::Value> = workers
             .iter()
             .map(|w| {
@@ -344,7 +343,6 @@ fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, 
             }
         }
     } else {
-        // Human-readable output
         if workers.is_empty() {
             if tags.is_some() {
                 println!("No workers found matching the specified tags.");
@@ -377,8 +375,12 @@ fn run_workers_list(tags: Option<Vec<String>>, inventory_path: Option<PathBuf>, 
     }
 }
 
-fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_output: bool, save: bool) {
-    // Load inventory
+fn run_workers_probe(
+    worker_name: &str,
+    inventory_path: Option<PathBuf>,
+    json_output: bool,
+    save: bool,
+) {
     let inventory = match inventory_path {
         Some(ref path) => WorkerInventory::load(path),
         None => WorkerInventory::load_default(),
@@ -392,25 +394,32 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         }
     };
 
-    // Find the worker
     let worker = match inventory.get(worker_name) {
         Some(w) => w,
         None => {
             eprintln!("Worker '{}' not found in inventory.", worker_name);
-            eprintln!("Available workers: {}",
-                inventory.workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "Available workers: {}",
+                inventory
+                    .workers
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             process::exit(1);
         }
     };
 
-    // Build SSH command
     let mut ssh_args = vec![
-        "-o".to_string(), "BatchMode=yes".to_string(),
-        "-o".to_string(), "ConnectTimeout=30".to_string(),
-        "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=30".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
     ];
 
-    // Add identity file if specified
     if let Some(ref key_path) = worker.ssh_key_path {
         let expanded = if key_path.starts_with("~/") {
             if let Ok(home) = std::env::var("HOME") {
@@ -425,16 +434,13 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         ssh_args.push(expanded);
     }
 
-    // Add port if not default
     if worker.port != 22 {
         ssh_args.push("-p".to_string());
         ssh_args.push(worker.port.to_string());
     }
 
-    // Add user@host
     ssh_args.push(format!("{}@{}", worker.user, worker.host));
 
-    // Create probe request
     let probe_request = RpcRequest {
         protocol_version: 0,
         request_id: format!("probe-{}", uuid_simple()),
@@ -450,7 +456,6 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         }
     };
 
-    // Execute SSH command
     eprintln!("Probing worker '{}'...", worker_name);
 
     let mut child = match Command::new("ssh")
@@ -463,20 +468,18 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn SSH process: {}", e);
-            process::exit(20); // SSH exit code
+            process::exit(20);
         }
     };
 
-    // Write request to stdin
     if let Some(ref mut stdin) = child.stdin {
         if let Err(e) = writeln!(stdin, "{}", request_json) {
             eprintln!("Failed to write to SSH stdin: {}", e);
             process::exit(20);
         }
     }
-    drop(child.stdin.take()); // Close stdin to signal EOF
+    drop(child.stdin.take());
 
-    // Read response from stdout
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut reader = BufReader::new(stdout);
     let mut response_line = String::new();
@@ -484,10 +487,11 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
     match reader.read_line(&mut response_line) {
         Ok(0) => {
             eprintln!("No response from worker");
-            // Read stderr for error details
             if let Some(mut stderr) = child.stderr.take() {
                 let mut err_output = String::new();
-                if std::io::Read::read_to_string(&mut stderr, &mut err_output).is_ok() && !err_output.is_empty() {
+                if std::io::Read::read_to_string(&mut stderr, &mut err_output).is_ok()
+                    && !err_output.is_empty()
+                {
                     eprintln!("SSH stderr: {}", err_output.trim());
                 }
             }
@@ -500,7 +504,6 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         }
     }
 
-    // Wait for SSH to complete
     let status = child.wait().unwrap_or_else(|e| {
         eprintln!("Failed to wait for SSH process: {}", e);
         process::exit(20);
@@ -511,7 +514,6 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         process::exit(20);
     }
 
-    // Parse the response
     let response: serde_json::Value = match serde_json::from_str(&response_line) {
         Ok(v) => v,
         Err(e) => {
@@ -521,32 +523,37 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         }
     };
 
-    // Extract capabilities from response payload
     let capabilities_json = match response.get("payload") {
         Some(payload) => payload,
         None => {
             eprintln!("Probe response missing payload");
-            eprintln!("Response: {}", serde_json::to_string_pretty(&response).unwrap_or_default());
+            eprintln!(
+                "Response: {}",
+                serde_json::to_string_pretty(&response).unwrap_or_default()
+            );
             process::exit(1);
         }
     };
 
-    // Try to parse as Capabilities
     let capabilities: Capabilities = match serde_json::from_value(capabilities_json.clone()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Warning: Could not parse capabilities struct: {}", e);
-            // Fall back to raw JSON output
             if json_output {
-                println!("{}", serde_json::to_string_pretty(capabilities_json).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(capabilities_json).unwrap()
+                );
             } else {
-                println!("Raw capabilities:\n{}", serde_json::to_string_pretty(capabilities_json).unwrap());
+                println!(
+                    "Raw capabilities:\n{}",
+                    serde_json::to_string_pretty(capabilities_json).unwrap()
+                );
             }
             process::exit(0);
         }
     };
 
-    // Save to cache if requested
     if save {
         let cache_dir = match std::env::var("HOME") {
             Ok(home) => PathBuf::from(home).join(".cache/rch/capabilities"),
@@ -567,7 +574,6 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
         }
     }
 
-    // Output
     if json_output {
         match capabilities.to_json() {
             Ok(json) => println!("{}", json),
@@ -581,7 +587,6 @@ fn run_workers_probe(worker_name: &str, inventory_path: Option<PathBuf>, json_ou
     }
 }
 
-/// Generate a simple UUID-like string for request IDs
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -593,25 +598,19 @@ fn uuid_simple() -> String {
 fn run_cancel(id: &str, reason_str: &str, json_output: bool) {
     use rch_xcode_lane::host::rpc::CancelReason;
 
-    // Parse reason
     let reason = match reason_str.to_lowercase().as_str() {
         "user" => CancelReason::User,
         "signal" => CancelReason::Signal,
         "timeout" | "timeout_overall" => CancelReason::TimeoutOverall,
         "timeout_idle" => CancelReason::TimeoutIdle,
         _ => {
-            eprintln!("Invalid reason '{}'. Valid: user, signal, timeout, timeout_idle", reason_str);
+            eprintln!(
+                "Invalid reason '{}'. Valid: user, signal, timeout, timeout_idle",
+                reason_str
+            );
             process::exit(1);
         }
     };
-
-    // Determine if this is a run_id or job_id
-    // For now, we treat it as a job_id and would need worker connection for actual cancel
-    // In a full implementation, this would:
-    // 1. Check if it's a run_id (look for run_plan.json in artifacts)
-    // 2. If run_id, get all job_ids from the run and cancel each
-    // 3. If job_id, cancel just that job
-    // 4. Connect to worker and send cancel RPC
 
     if json_output {
         println!("{{");
@@ -628,33 +627,40 @@ fn run_cancel(id: &str, reason_str: &str, json_output: bool) {
         println!("      This command will be fully functional when integrated with run execution.");
     }
 
-    // Exit with success - the cancel request was acknowledged
-    // In full implementation, exit code depends on cancel result
     process::exit(0);
 }
 
-/// Run pipeline for verify/run commands
-#[allow(clippy::too_many_arguments)]
 fn run_pipeline(
-    config: Option<PathBuf>,
-    inventory: Option<PathBuf>,
-    output: PathBuf,
-    action: Option<String>,
+    config_path: Option<PathBuf>,
+    inventory_path: Option<PathBuf>,
+    artifacts_dir: PathBuf,
+    action_str: Option<String>,
     continue_on_failure: bool,
-    timeout: u64,
-    idle_timeout: u64,
+    timeout_secs: u64,
+    idle_timeout_secs: u64,
     verbose: bool,
     json_output: bool,
 ) {
-    let config_path = config.unwrap_or_else(|| PathBuf::from(".rch/xcode.toml"));
+    let action = match action_str {
+        Some(ref s) => match s.to_lowercase().as_str() {
+            "build" => Some(Action::Build),
+            "test" => Some(Action::Test),
+            _ => {
+                eprintln!("Invalid action '{}'. Valid: build, test", s);
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
 
-    // Build pipeline config
+    let repo_config_path = config_path.unwrap_or_else(|| PathBuf::from(".rch/xcode.toml"));
+
     let pipeline_config = PipelineConfig {
-        repo_config_path: config_path,
-        inventory_path: inventory,
-        artifacts_dir: output,
-        overall_timeout_seconds: timeout,
-        idle_timeout_seconds: idle_timeout,
+        repo_config_path,
+        inventory_path,
+        artifacts_dir,
+        overall_timeout_seconds: timeout_secs,
+        idle_timeout_seconds: idle_timeout_secs,
         continue_on_failure,
         tail_poll_interval: Duration::from_secs(1),
         verbose,
@@ -662,19 +668,9 @@ fn run_pipeline(
 
     let mut pipeline = Pipeline::new(pipeline_config);
 
-    // Execute based on action
-    let result = if let Some(action_str) = action {
-        let action = match action_str.to_lowercase().as_str() {
-            "build" => Action::Build,
-            "test" => Action::Test,
-            _ => {
-                eprintln!("Invalid action '{}'. Valid: build, test", action_str);
-                process::exit(1);
-            }
-        };
-        pipeline.execute_action(action)
-    } else {
-        pipeline.execute_verify()
+    let result = match action {
+        Some(a) => pipeline.execute_action(a),
+        None => pipeline.execute_verify(),
     };
 
     match result {
@@ -688,47 +684,42 @@ fn run_pipeline(
                     }
                 }
             } else {
-                println!();
-                println!("Run completed: {}", summary.run_id);
-                println!("  Status: {:?}", summary.status);
-                println!("  Duration: {}ms", summary.duration_ms);
-                println!("  Steps succeeded: {}", summary.steps_succeeded);
-                println!("  Steps failed: {}", summary.steps_failed);
+                println!("\n=== Run Summary ===");
+                println!("Run ID: {}", summary.run_id);
+                println!("Status: {:?}", summary.status);
+                println!(
+                    "Steps: {} total, {} succeeded, {} failed",
+                    summary.step_count,
+                    summary.steps_succeeded,
+                    summary.steps_failed,
+                );
                 if summary.steps_skipped > 0 {
-                    println!("  Steps skipped: {}", summary.steps_skipped);
+                    println!("  Skipped: {}", summary.steps_skipped);
                 }
                 if summary.steps_rejected > 0 {
-                    println!("  Steps rejected: {}", summary.steps_rejected);
+                    println!("  Rejected: {}", summary.steps_rejected);
                 }
+                println!("Duration: {:.1}s", summary.duration_ms as f64 / 1000.0);
             }
 
             process::exit(summary.exit_code);
         }
         Err(e) => {
             if json_output {
-                let error_json = serde_json::json!({
-                    "error": e.to_string(),
-                    "exit_code": e.exit_code()
-                });
-                println!("{}", serde_json::to_string_pretty(&error_json).unwrap());
+                eprintln!("{{\"error\": \"{}\"}}", e);
             } else {
-                eprintln!("Error: {}", e);
+                eprintln!("Pipeline error: {}", e);
             }
             process::exit(e.exit_code());
         }
     }
 }
 
-/// Stream logs from a job
-fn run_tail(id: &str, _artifacts_dir: PathBuf, follow: bool, _from_start: bool) {
-    // Note: artifacts_dir and from_start are for future enhancements
-    // Currently execute_tail only needs id, inventory path, follow, and verbose
-    match execute_tail(id, None, follow, true) {
-        Ok(()) => {
-            // Success
-        }
+fn run_tail(id: &str, inventory_path: Option<PathBuf>, follow: bool, verbose: bool) {
+    match execute_tail(id, inventory_path, follow, verbose) {
+        Ok(()) => process::exit(0),
         Err(e) => {
-            eprintln!("Tail error: {}", e);
+            eprintln!("Error tailing {}: {}", id, e);
             process::exit(e.exit_code());
         }
     }
