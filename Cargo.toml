@@ -1,0 +1,22 @@
+[package]
+name = "rch-xcode-lane"
+version = "0.1.0"
+edition = "2021"
+description = "Remote Xcode build/test lane for RCH"
+license = "MIT"
+
+[lib]
+name = "rch_xcode_lane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rch-xcode"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
