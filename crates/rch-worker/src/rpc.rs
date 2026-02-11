@@ -12,9 +12,12 @@ use std::io::{self, BufRead, Write};
 
 use rch_protocol::{
     ops::names,
-    ErrorCode, RpcError, RpcRequest, RpcResponse,
-    PROTOCOL_VERSION_PROBE, PROTOCOL_MIN, PROTOCOL_MAX,
+    RpcError, RpcRequest, RpcResponse,
+    PROTOCOL_VERSION_PROBE,
 };
+
+#[cfg(test)]
+use rch_protocol::ErrorCode;
 
 use crate::config::WorkerConfig;
 use crate::handlers;
