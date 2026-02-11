@@ -102,6 +102,10 @@ enum Commands {
         /// Output JSON summary at the end
         #[arg(long)]
         json: bool,
+
+        /// Dry-run mode: print plan without executing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Stream logs from a running or completed job
@@ -120,6 +124,20 @@ enum Commands {
         /// Verbose output
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+
+    /// Show artifact paths for a run or job
+    Artifacts {
+        /// Run ID or Job ID to inspect
+        id: String,
+
+        /// Path to artifacts directory (default: .rch/artifacts)
+        #[arg(long, short = 'o', default_value = ".rch/artifacts")]
+        artifacts_dir: PathBuf,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -195,6 +213,7 @@ fn main() {
             idle_timeout,
             verbose,
             json,
+            dry_run,
         } => {
             run_pipeline(
                 config,
@@ -204,6 +223,7 @@ fn main() {
                 continue_on_failure,
                 timeout,
                 idle_timeout,
+                dry_run,
                 verbose,
                 json,
             );
@@ -215,6 +235,13 @@ fn main() {
             verbose,
         } => {
             run_tail(&id, inventory, follow, verbose);
+        }
+        Commands::Artifacts {
+            id,
+            artifacts_dir,
+            json,
+        } => {
+            run_artifacts(&id, &artifacts_dir, json);
         }
     }
 }
@@ -638,6 +665,7 @@ fn run_pipeline(
     continue_on_failure: bool,
     timeout_secs: u64,
     idle_timeout_secs: u64,
+    dry_run: bool,
     verbose: bool,
     json_output: bool,
 ) {
@@ -664,9 +692,38 @@ fn run_pipeline(
         continue_on_failure,
         tail_poll_interval: Duration::from_secs(1),
         verbose,
+        dry_run,
     };
 
     let mut pipeline = Pipeline::new(pipeline_config);
+
+    // Dry-run mode: print plan without executing
+    if dry_run {
+        match pipeline.dry_run(action) {
+            Ok(plan) => {
+                if json_output {
+                    match serde_json::to_string_pretty(&plan) {
+                        Ok(json) => println!("{}", json),
+                        Err(e) => {
+                            eprintln!("Error serializing plan: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", plan);
+                }
+                process::exit(0);
+            }
+            Err(e) => {
+                if json_output {
+                    eprintln!("{{\"error\": \"{}\"}}", e);
+                } else {
+                    eprintln!("Dry-run error: {}", e);
+                }
+                process::exit(e.exit_code());
+            }
+        }
+    }
 
     let result = match action {
         Some(a) => pipeline.execute_action(a),
@@ -722,5 +779,223 @@ fn run_tail(id: &str, inventory_path: Option<PathBuf>, follow: bool, verbose: bo
             eprintln!("Error tailing {}: {}", id, e);
             process::exit(e.exit_code());
         }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ArtifactInfo {
+    id: String,
+    id_type: String,
+    path: PathBuf,
+    files: Vec<ArtifactFile>,
+}
+
+#[derive(serde::Serialize)]
+struct ArtifactFile {
+    name: String,
+    path: PathBuf,
+    size_bytes: u64,
+    file_type: String,
+}
+
+fn run_artifacts(id: &str, artifacts_dir: &PathBuf, json_output: bool) {
+    let run_path = artifacts_dir.join(id);
+
+    if run_path.exists() && run_path.is_dir() {
+        let files = collect_artifact_files(&run_path);
+        let info = ArtifactInfo {
+            id: id.to_string(),
+            id_type: "run".to_string(),
+            path: run_path.clone(),
+            files,
+        };
+        output_artifact_info(&info, json_output);
+        return;
+    }
+
+    if let Some(job_path) = find_job_path(artifacts_dir, id) {
+        let files = collect_artifact_files(&job_path);
+        let info = ArtifactInfo {
+            id: id.to_string(),
+            id_type: "job".to_string(),
+            path: job_path,
+            files,
+        };
+        output_artifact_info(&info, json_output);
+        return;
+    }
+
+    eprintln!("No artifacts found for ID: {}", id);
+    eprintln!("Searched in: {}", artifacts_dir.display());
+    process::exit(1);
+}
+
+fn find_job_path(artifacts_dir: &PathBuf, job_id: &str) -> Option<PathBuf> {
+    let entries = match std::fs::read_dir(artifacts_dir) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+
+        let steps_dir = run_dir.join("steps");
+        if !steps_dir.exists() {
+            continue;
+        }
+
+        if let Ok(step_entries) = std::fs::read_dir(&steps_dir) {
+            for step_entry in step_entries.flatten() {
+                let step_dir = step_entry.path();
+                if !step_dir.is_dir() {
+                    continue;
+                }
+
+                let job_dir = step_dir.join(job_id);
+                if job_dir.exists() && job_dir.is_dir() {
+                    return Some(job_dir);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn collect_artifact_files(path: &PathBuf) -> Vec<ArtifactFile> {
+    let mut files = Vec::new();
+
+    let key_files = [
+        ("run_summary.json", "summary"),
+        ("run_state.json", "state"),
+        ("job_state.json", "state"),
+        ("job_summary.json", "summary"),
+        ("build.log", "log"),
+        ("test.log", "log"),
+        ("stdout.log", "log"),
+        ("stderr.log", "log"),
+    ];
+
+    for (name, file_type) in &key_files {
+        let file_path = path.join(name);
+        if file_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&file_path) {
+                files.push(ArtifactFile {
+                    name: name.to_string(),
+                    path: file_path,
+                    size_bytes: metadata.len(),
+                    file_type: file_type.to_string(),
+                });
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if let Some(ext) = entry_path.extension() {
+                if ext == "xcresult" {
+                    let name = entry_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if let Ok(metadata) = std::fs::metadata(&entry_path) {
+                        files.push(ArtifactFile {
+                            name,
+                            path: entry_path,
+                            size_bytes: if metadata.is_dir() {
+                                dir_size(&entry.path()).unwrap_or(0)
+                            } else {
+                                metadata.len()
+                            },
+                            file_type: "xcresult".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let steps_dir = path.join("steps");
+    if steps_dir.exists() && steps_dir.is_dir() {
+        if let Ok(step_entries) = std::fs::read_dir(&steps_dir) {
+            for step_entry in step_entries.flatten() {
+                let step_path = step_entry.path();
+                if step_path.is_dir() {
+                    if let Ok(job_entries) = std::fs::read_dir(&step_path) {
+                        for job_entry in job_entries.flatten() {
+                            let job_path = job_entry.path();
+                            if job_path.is_dir() {
+                                let mut job_files = collect_artifact_files(&job_path);
+                                for file in &mut job_files {
+                                    let rel_path = file.path.strip_prefix(path).unwrap_or(&file.path);
+                                    file.name = rel_path.to_string_lossy().to_string();
+                                }
+                                files.extend(job_files);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    files
+}
+
+fn dir_size(path: &PathBuf) -> std::io::Result<u64> {
+    let mut total = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size(&path)?;
+            } else {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn output_artifact_info(info: &ArtifactInfo, json_output: bool) {
+    if json_output {
+        match serde_json::to_string_pretty(info) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing output: {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        println!("Artifacts for {} ({})", info.id, info.id_type);
+        println!("  Path: {}", info.path.display());
+        println!();
+
+        if info.files.is_empty() {
+            println!("  No key files found.");
+        } else {
+            println!("  Files:");
+            for file in &info.files {
+                let size = format_size(file.size_bytes);
+                println!("    {} ({}) - {}", file.name, file.file_type, size);
+            }
+        }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }

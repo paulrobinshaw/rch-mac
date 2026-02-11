@@ -140,6 +140,9 @@ pub struct PipelineConfig {
 
     /// Verbose output
     pub verbose: bool,
+
+    /// Dry-run mode - print plan without executing
+    pub dry_run: bool,
 }
 
 impl Default for PipelineConfig {
@@ -154,6 +157,7 @@ impl Default for PipelineConfig {
             continue_on_failure: false,
             tail_poll_interval: Duration::from_secs(1),
             verbose: false,
+            dry_run: false,
         }
     }
 }
@@ -187,6 +191,61 @@ impl Pipeline {
             bundle_path: None,
             rpc_client: None,
         }
+    }
+
+    /// Dry-run mode: classify actions, select worker, build plan without executing
+    ///
+    /// This performs all the setup steps (load config, classify, select worker,
+    /// build run plan) but does not bundle sources or submit to the worker.
+    pub fn dry_run(&mut self, action: Option<Action>) -> PipelineResult<RunPlan> {
+        // Load config
+        self.load_config()?;
+
+        let repo_config = self.repo_config.as_ref().unwrap();
+
+        // Get actions to run
+        let actions: Vec<Action> = if let Some(a) = action {
+            vec![a]
+        } else {
+            // Get verify actions from config
+            repo_config.verify.iter()
+                .filter_map(|v| v.action.parse::<Action>().ok())
+                .collect()
+        };
+
+        if actions.is_empty() {
+            return Err(PipelineError::Config("No actions specified".to_string()));
+        }
+
+        if self.config.verbose {
+            eprintln!("Dry-run: classifying {} action(s)...", actions.len());
+        }
+
+        // 1. Classify actions
+        let classifier_results = self.classify_actions(&actions)?;
+
+        // Check if all rejected
+        if classifier_results.iter().all(|(accepted, _)| !*accepted) {
+            return Err(PipelineError::AllRejected);
+        }
+
+        if self.config.verbose {
+            eprintln!("Dry-run: selecting worker...");
+        }
+
+        // 2. Select worker
+        self.select_worker()?;
+
+        if self.config.verbose {
+            eprintln!("Dry-run: building run plan...");
+        }
+
+        // 3. Build run plan
+        let run_plan = RunPlanBuilder::new(actions)
+            .continue_on_failure(self.config.continue_on_failure)
+            .build_with_classifier_results(classifier_results, self.worker_selection.as_ref().unwrap())?;
+
+        Ok(run_plan)
     }
 
     /// Execute verify (multiple actions from config)

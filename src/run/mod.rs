@@ -98,6 +98,37 @@ impl RunPlan {
     }
 }
 
+impl std::fmt::Display for RunPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "=== Run Plan ===")?;
+        writeln!(f)?;
+        writeln!(f, "Run ID: {}", self.run_id)?;
+        writeln!(f, "Worker: {} ({})", self.selected_worker, self.selected_worker_host)?;
+        writeln!(f, "Protocol: v{}", self.protocol_version)?;
+        writeln!(f)?;
+        writeln!(f, "Steps ({}):", self.steps.len())?;
+        for step in &self.steps {
+            let status = if step.rejected { "REJECTED" } else { "OK" };
+            writeln!(f, "  [{}] {} - {} (job: {})",
+                step.index,
+                step.action,
+                status,
+                step.job_id
+            )?;
+            if step.rejected && !step.rejection_reasons.is_empty() {
+                for reason in &step.rejection_reasons {
+                    writeln!(f, "        Reason: {}", reason)?;
+                }
+            }
+        }
+        if self.continue_on_failure {
+            writeln!(f)?;
+            writeln!(f, "(continue-on-failure enabled)")?;
+        }
+        Ok(())
+    }
+}
+
 /// Errors during run building
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
