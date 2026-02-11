@@ -651,9 +651,11 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "tempfile",
  "thiserror",
+ "walkdir",
 ]
 
 [[package]]
