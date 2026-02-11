@@ -13,6 +13,7 @@ pub mod host;
 pub mod inventory;
 pub mod mock;
 pub mod protocol;
+pub mod selection;
 pub mod state;
 pub mod summary;
 pub mod toolchain;
@@ -49,4 +50,9 @@ pub use toolchain::{
 };
 pub use destination::{
     resolve_destination, DestinationConstraint, DestinationError, Provisioning, ResolvedDestination,
+};
+pub use selection::{
+    is_snapshot_valid, select_worker, ProbeFailure, ProtocolRange, SelectionConstraints,
+    SelectionError, SelectionMode, SelectionResult, SnapshotSource, WorkerCandidate,
+    WorkerSelection,
 };

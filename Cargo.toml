@@ -53,6 +53,8 @@ hex = { workspace = true }
 tar = "0.4"
 walkdir = "2.5"
 globset = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+ulid = "1.2"
 
 [dev-dependencies]
 tempfile = "3.16"
