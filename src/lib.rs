@@ -5,9 +5,11 @@
 //! to macOS workers.
 
 pub mod classifier;
+pub mod mock;
 pub mod protocol;
 pub mod worker;
 
 pub use classifier::{Classifier, ClassifierConfig, ClassifierResult};
+pub use mock::{MockWorker, MockState, Job, JobState, Lease, FailureConfig, FailureInjector};
 pub use protocol::{RpcRequest, RpcResponse, Operation, ErrorCode, RpcError};
 pub use worker::RpcHandler;

@@ -278,7 +278,7 @@ pub struct MacOSInfo {
 }
 
 /// Xcode version information
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XcodeVersion {
     pub version: String,
     pub build: String,
@@ -287,7 +287,7 @@ pub struct XcodeVersion {
 }
 
 /// Simulator runtime information
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulatorRuntime {
     pub name: String,
     pub identifier: String,
