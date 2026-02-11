@@ -22,6 +22,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::artifact::verify_artifacts;
 use crate::bundle::{Bundler, BundleMode, BundleError, BundleResult, SourceManifest};
 use crate::classifier::{Classifier, ClassifierConfig, ClassifierResult, RepoConfig};
 use crate::config::{EffectiveConfig, ConfigSource};
@@ -86,6 +87,9 @@ pub enum PipelineError {
 
     #[error("state error: {0}")]
     State(#[from] crate::state::RunStateError),
+
+    #[error("artifact integrity error: {0}")]
+    ArtifactIntegrity(String),
 }
 
 impl PipelineError {
@@ -107,6 +111,7 @@ impl PipelineError {
             PipelineError::NoWorkers => 91,
             PipelineError::JobFailed(_) => 50,
             PipelineError::State(_) => 40,
+            PipelineError::ArtifactIntegrity(_) => 70,
         }
     }
 }
@@ -737,25 +742,25 @@ impl Pipeline {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let job_key = format!("key-{}", step.job_id);
 
-                let summary = match status.state.as_str() {
+                let mut summary = match status.state.as_str() {
                     "SUCCEEDED" => JobSummary::success(
                         run_id.to_string(),
                         step.job_id.clone(),
-                        job_key,
+                        job_key.clone(),
                         Backend::Xcodebuild,
                         duration_ms,
                     ),
                     "CANCELLED" => JobSummary::cancelled(
                         run_id.to_string(),
                         step.job_id.clone(),
-                        job_key,
+                        job_key.clone(),
                         Backend::Xcodebuild,
                         duration_ms,
                     ),
                     _ => JobSummary::failure(
                         run_id.to_string(),
                         step.job_id.clone(),
-                        job_key,
+                        job_key.clone(),
                         Backend::Xcodebuild,
                         FailureKind::Xcodebuild,
                         None,
@@ -764,9 +769,22 @@ impl Pipeline {
                     ),
                 };
 
-                // Fetch artifacts if available
+                // Fetch artifacts if available and verify integrity
                 if status.artifacts_available {
-                    self.fetch_artifacts(&step.job_id, step_dir)?;
+                    if let Some(integrity_errors) = self.fetch_artifacts(&step.job_id, step_dir)? {
+                        // Artifact integrity verification failed per rch-mac-y6s.2
+                        // Override summary with ARTIFACTS/INTEGRITY_MISMATCH failure
+                        summary = JobSummary::failure(
+                            run_id.to_string(),
+                            step.job_id.clone(),
+                            job_key,
+                            Backend::Xcodebuild,
+                            FailureKind::Artifacts,
+                            Some(FailureSubkind::IntegrityMismatch),
+                            "Artifact integrity verification failed".to_string(),
+                            duration_ms,
+                        ).with_integrity_errors(integrity_errors);
+                    }
                 }
 
                 return Ok(summary);
@@ -817,8 +835,14 @@ impl Pipeline {
         }
     }
 
-    /// Fetch artifacts for a job
-    fn fetch_artifacts(&self, job_id: &str, step_dir: &Path) -> PipelineResult<()> {
+    /// Fetch artifacts for a job and verify integrity
+    ///
+    /// Returns Ok(None) if no errors, Ok(Some(errors)) if integrity errors found.
+    /// Per rch-mac-y6s.2: After fetching job artifacts, host MUST:
+    /// 1) Recompute artifact_root_sha256 from fetched manifest.json entries and verify match
+    /// 2) Verify sha256 and size for every entry against fetched files
+    /// 3) Verify no extra files exist beyond manifest entries plus the excluded triple
+    fn fetch_artifacts(&self, job_id: &str, step_dir: &Path) -> PipelineResult<Option<Vec<String>>> {
         let client = self.rpc_client.as_ref()
             .ok_or_else(|| PipelineError::Transport(TransportError::ConnectionFailed("No connection".to_string())))?;
 
@@ -838,9 +862,30 @@ impl Pipeline {
             if status.success() {
                 fs::remove_file(&artifacts_path)?;
             }
+
+            // Verify artifact integrity per rch-mac-y6s.2
+            // Uses the verify_artifacts function which performs:
+            // 1) Recompute artifact_root_sha256 and verify match
+            // 2) Verify sha256 and size for every entry
+            // 3) Check for extra files beyond manifest + excluded triple
+            let manifest_path = step_dir.join("manifest.json");
+            if manifest_path.exists() {
+                match verify_artifacts(step_dir) {
+                    Ok(result) => {
+                        if !result.passed {
+                            if let Some((_, _, errors)) = result.failure_info() {
+                                return Ok(Some(errors));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(Some(vec![format!("Failed to verify artifacts: {}", e)]));
+                    }
+                }
+            }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Write run_state.json

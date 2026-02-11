@@ -20,6 +20,7 @@ thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
+regex-lite = "0.1"
 
 [package]
 name = "rch-xcode-lane"
@@ -55,7 +56,7 @@ walkdir = "2.5"
 globset = "0.4"
 uuid = { version = "1.0", features = ["v4"] }
 ulid = "1.2"
-regex-lite = "0.1"
+regex-lite = { workspace = true }
 ctrlc = "3.4"
 
 [dev-dependencies]

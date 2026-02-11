@@ -1129,3 +1129,185 @@ fn test_probe_limits_null_when_no_limit() {
     let limits = &payload["limits"];
     assert!(limits["max_upload_bytes"].is_null(), "max_upload_bytes should be null when no limit");
 }
+
+// =============================================================================
+// Test 19: Artifact Integrity Verification (rch-mac-y6s.2)
+// =============================================================================
+
+#[test]
+fn test_integrity_error_in_summary() {
+    use rch_xcode_lane::summary::FailureSubkind;
+
+    // Test that a job summary can contain integrity errors
+    let summary = JobSummary::failure(
+        "run-integrity-001".to_string(),
+        "job-integrity-001".to_string(),
+        "key-integrity-001".to_string(),
+        Backend::Xcodebuild,
+        FailureKind::Artifacts,
+        Some(FailureSubkind::IntegrityMismatch),
+        "Artifact integrity verification failed".to_string(),
+        1000,
+    )
+    .with_integrity_errors(vec![
+        "Hash mismatch at build.log: expected abc123, got def456".to_string(),
+        "Missing file: results.xml".to_string(),
+    ]);
+
+    // Verify summary fields
+    assert_eq!(summary.status, Status::Failed);
+    assert_eq!(summary.failure_kind, Some(FailureKind::Artifacts));
+    assert_eq!(summary.failure_subkind, Some(FailureSubkind::IntegrityMismatch));
+    assert_eq!(summary.exit_code, 70); // ArtifactsFailed exit code
+
+    // Verify integrity errors are present
+    let errors = summary.integrity_errors.as_ref().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert!(errors[0].contains("Hash mismatch"));
+    assert!(errors[1].contains("Missing file"));
+
+    // Verify JSON serialization
+    let json = summary.to_json().unwrap();
+    assert!(json.contains(r#""failure_kind": "ARTIFACTS""#));
+    assert!(json.contains(r#""failure_subkind": "INTEGRITY_MISMATCH""#));
+    assert!(json.contains(r#""integrity_errors""#));
+    assert!(json.contains("Hash mismatch"));
+}
+
+#[test]
+fn test_artifact_manifest_verification_api() {
+    use rch_xcode_lane::artifact::{ArtifactManifest, IntegrityError};
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Create a temp directory with test artifacts
+    let dir = TempDir::new().unwrap();
+    let artifact_dir = dir.path();
+
+    // Create a file
+    fs::write(artifact_dir.join("build.log"), "Build output here").unwrap();
+
+    // Create manifest with correct entry (using "type" field as per serde rename)
+    let manifest_json = r#"{
+        "schema_version": 1,
+        "schema_id": "rch-xcode/manifest@1",
+        "created_at": "2024-01-01T00:00:00Z",
+        "run_id": "test-run",
+        "job_id": "test-job",
+        "job_key": "test-key",
+        "artifact_root_sha256": "computed-hash",
+        "entries": [
+            {
+                "path": "build.log",
+                "type": "file",
+                "size": 17,
+                "sha256": "wrong-hash"
+            }
+        ]
+    }"#;
+
+    let manifest: ArtifactManifest = serde_json::from_str(manifest_json).unwrap();
+
+    // verify_entries should detect hash mismatch
+    let errors = manifest.verify_entries(artifact_dir).unwrap();
+    assert_eq!(errors.len(), 1);
+    match &errors[0] {
+        IntegrityError::HashMismatch { path, expected, .. } => {
+            assert_eq!(path, "build.log");
+            assert_eq!(expected, "wrong-hash");
+        }
+        _ => panic!("Expected HashMismatch error"),
+    }
+}
+
+#[test]
+fn test_artifact_manifest_extra_files() {
+    use rch_xcode_lane::artifact::ArtifactManifest;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Create temp directory with files
+    let dir = TempDir::new().unwrap();
+    let artifact_dir = dir.path();
+
+    // Create known file and extra file
+    fs::write(artifact_dir.join("known.txt"), "known").unwrap();
+    fs::write(artifact_dir.join("extra.txt"), "unexpected").unwrap();
+
+    // Manifest only lists known.txt (using "type" field as per serde rename)
+    let manifest_json = r#"{
+        "schema_version": 1,
+        "schema_id": "rch-xcode/manifest@1",
+        "created_at": "2024-01-01T00:00:00Z",
+        "run_id": "test-run",
+        "job_id": "test-job",
+        "job_key": "test-key",
+        "artifact_root_sha256": "hash",
+        "entries": [
+            {
+                "path": "known.txt",
+                "type": "file",
+                "size": 5,
+                "sha256": "hash"
+            }
+        ]
+    }"#;
+
+    let manifest: ArtifactManifest = serde_json::from_str(manifest_json).unwrap();
+
+    // find_extra_files should detect extra.txt
+    let extra = manifest.find_extra_files(artifact_dir).unwrap();
+    assert_eq!(extra.len(), 1);
+    assert!(extra.contains(&"extra.txt".to_string()));
+}
+
+#[test]
+fn test_artifact_manifest_missing_file() {
+    use rch_xcode_lane::artifact::{ArtifactManifest, IntegrityError};
+    use tempfile::TempDir;
+
+    // Create empty temp directory
+    let dir = TempDir::new().unwrap();
+    let artifact_dir = dir.path();
+
+    // Manifest references file that doesn't exist (using "type" field as per serde rename)
+    let manifest_json = r#"{
+        "schema_version": 1,
+        "schema_id": "rch-xcode/manifest@1",
+        "created_at": "2024-01-01T00:00:00Z",
+        "run_id": "test-run",
+        "job_id": "test-job",
+        "job_key": "test-key",
+        "artifact_root_sha256": "hash",
+        "entries": [
+            {
+                "path": "missing.txt",
+                "type": "file",
+                "size": 100,
+                "sha256": "hash"
+            }
+        ]
+    }"#;
+
+    let manifest: ArtifactManifest = serde_json::from_str(manifest_json).unwrap();
+
+    // verify_entries should detect missing file
+    let errors = manifest.verify_entries(artifact_dir).unwrap();
+    assert_eq!(errors.len(), 1);
+    match &errors[0] {
+        IntegrityError::MissingFile { path } => {
+            assert_eq!(path, "missing.txt");
+        }
+        _ => panic!("Expected MissingFile error"),
+    }
+}
+
+#[test]
+fn test_artifact_verification_exit_code() {
+    use rch_xcode_lane::summary::ExitCode;
+
+    // Verify that ARTIFACTS failure has the correct exit code
+    let exit_code = FailureKind::Artifacts.exit_code();
+    assert_eq!(exit_code, ExitCode::ArtifactsFailed);
+    assert_eq!(exit_code.as_i32(), 70);
+}

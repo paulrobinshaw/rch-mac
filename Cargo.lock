@@ -648,6 +648,7 @@ dependencies = [
  "hex",
  "nix 0.29.0",
  "rch-protocol",
+ "regex-lite",
  "serde",
  "serde_json",
  "sha2",
