@@ -39,6 +39,15 @@ pub struct VerifyAction {
     pub configuration: Option<String>,
 }
 
+/// Bundle configuration
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundleConfig {
+    /// Maximum bundle size in bytes (0 = no limit)
+    /// If set, bundles exceeding this size will be rejected before upload
+    #[serde(default)]
+    pub max_bytes: u64,
+}
+
 /// Repository configuration from .rch/xcode.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
@@ -68,6 +77,10 @@ pub struct RepoConfig {
     /// Ordered array of actions to run for verification
     #[serde(default)]
     pub verify: Vec<VerifyAction>,
+
+    /// Bundle configuration
+    #[serde(default)]
+    pub bundle: BundleConfig,
 }
 
 impl Default for RepoConfig {
@@ -79,6 +92,7 @@ impl Default for RepoConfig {
             destinations: vec![],
             configurations: vec![],
             verify: vec![],
+            bundle: BundleConfig::default(),
         }
     }
 }
@@ -404,5 +418,30 @@ mod tests {
 
         let config = RepoConfig::from_str(toml).unwrap();
         assert!(config.is_destination_allowed("platform=iOS Simulator,name=iPhone 16 Pro,OS=18.0"));
+    }
+
+    #[test]
+    fn test_bundle_config_default() {
+        let toml = r#"
+            workspace = "MyApp.xcworkspace"
+            schemes = ["MyApp"]
+        "#;
+
+        let config = RepoConfig::from_str(toml).unwrap();
+        assert_eq!(config.bundle.max_bytes, 0); // Default is no limit
+    }
+
+    #[test]
+    fn test_bundle_config_with_max_bytes() {
+        let toml = r#"
+            workspace = "MyApp.xcworkspace"
+            schemes = ["MyApp"]
+
+            [bundle]
+            max_bytes = 104857600
+        "#;
+
+        let config = RepoConfig::from_str(toml).unwrap();
+        assert_eq!(config.bundle.max_bytes, 104857600); // 100 MB
     }
 }

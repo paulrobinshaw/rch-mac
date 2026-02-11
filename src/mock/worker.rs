@@ -41,6 +41,8 @@ pub struct MockCapabilities {
     pub max_concurrent_jobs: u32,
     pub disk_free_bytes: u64,
     pub disk_total_bytes: u64,
+    /// Maximum upload size in bytes (0 = no limit)
+    pub max_upload_bytes: u64,
 }
 
 impl Default for MockCapabilities {
@@ -64,7 +66,16 @@ impl Default for MockCapabilities {
             max_concurrent_jobs: 2,
             disk_free_bytes: 100 * 1024 * 1024 * 1024, // 100 GB
             disk_total_bytes: 500 * 1024 * 1024 * 1024, // 500 GB
+            max_upload_bytes: 0, // 0 = no limit
         }
+    }
+}
+
+impl MockCapabilities {
+    /// Set the maximum upload size in bytes (0 = no limit)
+    pub fn with_max_upload_bytes(mut self, bytes: u64) -> Self {
+        self.max_upload_bytes = bytes;
+        self
     }
 }
 
@@ -92,6 +103,15 @@ impl MockWorker {
     pub fn set_capacity(&self, max_jobs: u32) {
         let mut caps = self.capabilities.lock().unwrap();
         caps.max_concurrent_jobs = max_jobs;
+    }
+
+    /// Set the maximum upload size in bytes (0 = no limit)
+    ///
+    /// When set, upload_source will reject payloads exceeding this limit
+    /// with PAYLOAD_TOO_LARGE error.
+    pub fn set_max_upload_bytes(&self, max_bytes: u64) {
+        let mut caps = self.capabilities.lock().unwrap();
+        caps.max_upload_bytes = max_bytes;
     }
 
     /// Inject an error for the next call to an operation
@@ -291,6 +311,9 @@ impl MockWorker {
                 "current_jobs": state.jobs.values().filter(|j| !j.state.is_terminal()).count(),
                 "disk_free_bytes": caps.disk_free_bytes,
                 "disk_total_bytes": caps.disk_total_bytes,
+            },
+            "limits": {
+                "max_upload_bytes": if caps.max_upload_bytes > 0 { json!(caps.max_upload_bytes) } else { json!(null) },
             }
         });
 
@@ -659,6 +682,7 @@ impl MockWorker {
 
     fn handle_upload_source(&self, request: &RpcRequest) -> RpcResponse {
         let mut state = self.state.lock().unwrap();
+        let caps = self.capabilities.lock().unwrap();
 
         let source_sha256 = match request.payload.get("source_sha256").and_then(|v| v.as_str()) {
             Some(sha) => sha.to_string(),
@@ -668,6 +692,22 @@ impl MockWorker {
                 RpcErrorPayload::new("INVALID_REQUEST", "Missing required field: source_sha256"),
             ),
         };
+
+        // Get content_length from payload (for size checking)
+        let content_length = request.payload.get("content_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        // Check max_upload_bytes limit
+        if caps.max_upload_bytes > 0 && content_length > caps.max_upload_bytes {
+            return RpcResponse::error(
+                request.protocol_version,
+                request.request_id.clone(),
+                RpcErrorPayload::new("PAYLOAD_TOO_LARGE", "Upload exceeds maximum allowed size")
+                    .with_data("max_bytes", json!(caps.max_upload_bytes))
+                    .with_data("content_length", json!(content_length)),
+            );
+        }
 
         // In a real implementation, this would read the binary-framed stream
         // For the mock, we just store a placeholder

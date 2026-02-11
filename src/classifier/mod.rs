@@ -11,7 +11,7 @@ mod parser;
 mod policy;
 mod result;
 
-pub use config::{ConfigError, RepoConfig, VerifyAction};
+pub use config::{BundleConfig, ConfigError, RepoConfig, VerifyAction};
 pub use explain::{ConfigConstraints, EffectivePolicy, ExplainOutput, MatchedConstraintsOutput};
 pub use invocation::Invocation;
 pub use parser::parse_xcodebuild_argv;

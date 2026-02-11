@@ -22,7 +22,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::bundle::{Bundler, BundleMode, BundleError, SourceManifest};
+use crate::bundle::{Bundler, BundleMode, BundleError, BundleResult, SourceManifest};
 use crate::classifier::{Classifier, ClassifierConfig, ClassifierResult, RepoConfig};
 use crate::config::{EffectiveConfig, ConfigSource};
 use crate::destination::{resolve_destination, DestinationConstraint, ResolvedDestination};
@@ -454,15 +454,35 @@ impl Pipeline {
         // Determine source directory (current directory by default)
         let source_dir = std::env::current_dir()?;
 
-        // Create bundler
-        let bundler = Bundler::new(source_dir.clone())
+        // Get config bundle.max_bytes (0 = no limit from config)
+        let config_max_bytes = self.repo_config
+            .as_ref()
+            .map(|c| c.bundle.max_bytes)
+            .unwrap_or(0);
+
+        // Get worker capabilities.max_upload_bytes if available (0 = no limit from worker)
+        let worker_max_upload_bytes = self.capabilities
+            .as_ref()
+            .and_then(|c| c.get("max_upload_bytes"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        // Compute effective limit: min of both where 0 means no limit
+        let effective_limit = BundleResult::effective_limit(config_max_bytes, worker_max_upload_bytes);
+
+        // Create bundler with size limit
+        let mut bundler = Bundler::new(source_dir.clone())
             .with_mode(BundleMode::Worktree);
+
+        if effective_limit > 0 {
+            bundler = bundler.with_max_bytes(effective_limit);
+        }
 
         // Get run_id from the plan
         let run_plan = self.run_plan.as_ref()
             .ok_or_else(|| PipelineError::Run(crate::run::RunError::NoActions))?;
 
-        // Create bundle
+        // Create bundle (will fail with SizeExceeded if over limit)
         let result = bundler.create_bundle(&run_plan.run_id)?;
 
         // Write tar to file
