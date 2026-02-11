@@ -9,6 +9,7 @@
 //! - **In-process library**: for unit and integration testing with mock state
 
 pub mod artifact_commit;
+pub mod cache;
 pub mod config;
 pub mod executor;
 pub mod handlers;
@@ -30,3 +31,7 @@ pub use executor::mcp::{McpExecutor, McpEvent, McpEventType, McpExecutionSummary
 pub use mock_state::MockState;
 pub use rpc::RpcHandler;
 pub use source_store::{SourceStore, SourceMetadata, StoreError};
+pub use cache::{
+    DerivedDataCache, DerivedDataMode, CacheConfig, CacheError, CacheResult, CacheStats,
+    CacheLock, LockError, LockResult, ToolchainKey,
+};
