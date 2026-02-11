@@ -17,6 +17,7 @@
 //! - Different major version: reject with diagnostic
 
 mod attestation;
+mod gc;
 mod indices;
 mod manifest;
 pub mod schema;
@@ -42,3 +43,4 @@ pub use schema::{
     validate_schema_compatibility, ArtifactHeader, JobScopedHeader, LoadError, RunScopedHeader,
     SchemaError, SchemaId,
 };
+pub use gc::{ArtifactGc, ArtifactGcResult, ArtifactStats, RetentionPolicy};
