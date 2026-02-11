@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/job@1",
+  "title": "Job Specification",
+  "description": "Job specification for build/test execution.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "job_id", "run_id", "action", "scheme", "source_sha256"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/job@1",
+      "description": "Schema identifier"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "job_key": {
+      "type": "string",
+      "description": "Deterministic job key for caching"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["build", "test"],
+      "description": "Action to perform"
+    },
+    "scheme": {
+      "type": "string",
+      "description": "Xcode scheme"
+    },
+    "configuration": {
+      "type": "string",
+      "description": "Build configuration"
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 of source bundle"
+    },
+    "toolchain": {
+      "type": "object",
+      "properties": {
+        "xcode_version": {
+          "type": "string"
+        },
+        "xcode_build": {
+          "type": "string"
+        },
+        "macos_version": {
+          "type": "string"
+        },
+        "arch": {
+          "type": "string"
+        }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        }
+      }
+    },
+    "extra_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Additional xcodebuild arguments"
+    },
+    "artifact_profile": {
+      "type": "string",
+      "enum": ["minimal", "rich"],
+      "description": "Requested artifact profile"
+    },
+    "lease_id": {
+      "type": "string",
+      "description": "Worker lease ID if using leases"
+    }
+  }
+}

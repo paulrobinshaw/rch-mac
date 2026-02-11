@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/effective_config@1",
+  "title": "Effective Configuration",
+  "description": "Merged configuration from all layers.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/effective_config@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "overall_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Overall timeout in seconds"
+    },
+    "idle_log_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Idle log timeout in seconds"
+    },
+    "connect_timeout_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Connection timeout in seconds"
+    },
+    "bundle": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["worktree", "archive"]
+        }
+      }
+    },
+    "artifact_profile": {
+      "type": "string",
+      "enum": ["minimal", "rich"]
+    },
+    "continue_on_failure": {
+      "type": "boolean"
+    },
+    "worker_selection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["deterministic", "round_robin", "adaptive"]
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "properties": {
+        "derived_data": {
+          "type": "string",
+          "enum": ["off", "per_job", "shared"]
+        },
+        "spm": {
+          "type": "string",
+          "enum": ["off", "shared"]
+        }
+      }
+    },
+    "layers": {
+      "type": "array",
+      "description": "Configuration layers in precedence order",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

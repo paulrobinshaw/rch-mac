@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/run_plan@1",
+  "title": "Run Plan",
+  "description": "Execution plan for a run.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "run_id", "steps"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/run_plan@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "steps": {
+      "type": "array",
+      "description": "Planned execution steps",
+      "items": {
+        "type": "object",
+        "required": ["index", "action", "scheme"],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Step index (0-based)"
+          },
+          "action": {
+            "type": "string",
+            "enum": ["build", "test"],
+            "description": "Action to perform"
+          },
+          "scheme": {
+            "type": "string",
+            "description": "Xcode scheme"
+          },
+          "configuration": {
+            "type": "string",
+            "description": "Build configuration"
+          },
+          "destination": {
+            "type": "object",
+            "properties": {
+              "platform": {
+                "type": "string"
+              },
+              "os": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "continue_on_failure": {
+      "type": "boolean",
+      "description": "Whether to continue on step failure"
+    },
+    "toolchain": {
+      "type": "object",
+      "properties": {
+        "xcode_version": {
+          "type": "string"
+        },
+        "xcode_build": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

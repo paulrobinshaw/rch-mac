@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/run_state@1",
+  "title": "Run State",
+  "description": "Current state of a run execution.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "run_id", "state", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/run_state@1",
+      "description": "Schema identifier"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"],
+      "description": "Current run state"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the run was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the state was last updated"
+    },
+    "current_step": {
+      "type": "object",
+      "description": "Current step being executed",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["build", "test"]
+        }
+      }
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequence number for ordering updates"
+    }
+  }
+}

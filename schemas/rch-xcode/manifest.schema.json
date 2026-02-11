@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/manifest@1",
+  "title": "Artifact Manifest",
+  "description": "Manifest of all artifacts in a job's output directory with integrity hashes.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "job_id", "artifact_root_sha256", "entries"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/manifest@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp when manifest was created"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "artifact_root_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 hash of the artifact directory (deterministic)"
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of artifacts in the manifest",
+      "items": {
+        "$ref": "#/$defs/ArtifactEntry"
+      }
+    }
+  },
+  "$defs": {
+    "ArtifactEntry": {
+      "type": "object",
+      "required": ["path", "type", "sha256", "size"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative path from artifact root"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["file", "directory", "symlink"],
+          "description": "Entry type"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA256 hash of file contents"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File size in bytes"
+        }
+      }
+    }
+  }
+}

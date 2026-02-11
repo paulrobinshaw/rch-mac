@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/summary@1",
+  "title": "Job Summary",
+  "description": "Summary of a job execution result.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "job_id", "run_id", "status", "created_at"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/summary@1",
+      "description": "Schema identifier"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED", "CANCELLED"],
+      "description": "Job execution status"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Process exit code"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["build", "test"],
+      "description": "Action performed"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Execution duration in milliseconds"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["xcodebuild", "mcp"],
+      "description": "Build backend used"
+    },
+    "artifact_profile": {
+      "type": "string",
+      "enum": ["minimal", "rich"],
+      "description": "Artifact profile"
+    },
+    "failure": {
+      "type": "object",
+      "description": "Failure details if status is FAILED",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["BUILD_FAILED", "TEST_FAILED", "TIMEOUT", "CANCELLED", "EXECUTOR_ERROR", "TRANSFER_FAILED", "MCP_FAILED"]
+        },
+        "subkind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "test_results": {
+      "type": "object",
+      "description": "Test results summary",
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "cached_from_job_id": {
+      "type": "string",
+      "description": "Original job_id if this result was from cache"
+    }
+  }
+}

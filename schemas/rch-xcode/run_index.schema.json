@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/run_index@1",
+  "title": "Run Index",
+  "description": "Index of all jobs in a run with their artifact locations.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "run_id", "steps"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/run_index@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "steps": {
+      "type": "array",
+      "description": "List of steps in the run",
+      "items": {
+        "$ref": "#/$defs/StepPointer"
+      }
+    }
+  },
+  "$defs": {
+    "StepPointer": {
+      "type": "object",
+      "required": ["index", "job_id", "action", "artifact_path"],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Step index (0-based)"
+        },
+        "job_id": {
+          "type": "string",
+          "description": "Job identifier for this step"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["build", "test"],
+          "description": "Action performed"
+        },
+        "artifact_path": {
+          "type": "string",
+          "description": "Relative path to job artifacts"
+        }
+      }
+    }
+  }
+}

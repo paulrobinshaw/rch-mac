@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/invocation@1",
+  "title": "Invocation",
+  "description": "Record of a CLI invocation.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "run_id", "command"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/invocation@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "command": {
+      "type": "string",
+      "description": "Command that was invoked"
+    },
+    "args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Command arguments"
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory"
+    },
+    "git_ref": {
+      "type": "string",
+      "description": "Git reference (branch/tag/commit)"
+    },
+    "git_sha": {
+      "type": "string",
+      "description": "Git commit SHA"
+    },
+    "cli_version": {
+      "type": "string",
+      "description": "CLI version"
+    }
+  }
+}

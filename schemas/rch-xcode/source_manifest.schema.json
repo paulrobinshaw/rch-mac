@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/source_manifest@1",
+  "title": "Source Manifest",
+  "description": "Manifest of source files in a source bundle.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "source_sha256", "entries"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/source_manifest@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 hash of the source bundle"
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of source files",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "size"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative path"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "total_size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total size in bytes"
+    },
+    "file_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of files"
+    }
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/job_index@1",
+  "title": "Job Index",
+  "description": "Index of required artifacts for a job, serving as the commit marker.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "job_id", "run_id", "artifacts"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/job_index@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/RequiredJobArtifacts"
+    }
+  },
+  "$defs": {
+    "RequiredJobArtifacts": {
+      "type": "object",
+      "required": ["manifest", "attestation", "summary"],
+      "properties": {
+        "manifest": {
+          "$ref": "#/$defs/ArtifactPointer"
+        },
+        "attestation": {
+          "$ref": "#/$defs/ArtifactPointer"
+        },
+        "summary": {
+          "$ref": "#/$defs/ArtifactPointer"
+        }
+      }
+    },
+    "ArtifactPointer": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative path from job artifact root"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA256 hash of the artifact"
+        }
+      }
+    }
+  }
+}

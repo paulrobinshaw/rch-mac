@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/job_key_inputs@1",
+  "title": "Job Key Inputs",
+  "description": "Inputs used to compute the deterministic job_key.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "job_key", "toolchain", "destination", "inputs"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/job_key_inputs@1",
+      "description": "Schema identifier"
+    },
+    "job_key": {
+      "type": "string",
+      "description": "Computed job key (SHA256)"
+    },
+    "toolchain": {
+      "type": "object",
+      "required": ["xcode_build", "macos_major", "arch"],
+      "properties": {
+        "xcode_build": {
+          "type": "string"
+        },
+        "macos_major": {
+          "type": "string"
+        },
+        "arch": {
+          "type": "string"
+        }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "required": ["platform", "os"],
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "variant": {
+          "type": "string"
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["source_sha256", "action", "scheme"],
+      "properties": {
+        "source_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["build", "test"]
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "configuration": {
+          "type": "string"
+        },
+        "extra_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

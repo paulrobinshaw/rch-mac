@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/capabilities@1",
+  "title": "Worker Capabilities",
+  "description": "Worker capabilities and feature advertisement.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "worker_id", "hostname", "protocol_version", "features"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/capabilities@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp"
+    },
+    "worker_id": {
+      "type": "string",
+      "description": "Unique worker identifier"
+    },
+    "hostname": {
+      "type": "string",
+      "description": "Worker hostname"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Protocol version supported"
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of supported features"
+    },
+    "xcode": {
+      "type": "object",
+      "description": "Xcode installation information",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "build": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "macos": {
+      "type": "object",
+      "description": "macOS information",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "build": {
+          "type": "string"
+        }
+      }
+    },
+    "arch": {
+      "type": "string",
+      "enum": ["arm64", "x86_64"],
+      "description": "CPU architecture"
+    },
+    "max_concurrent_jobs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum concurrent jobs"
+    },
+    "max_upload_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Maximum upload size in bytes"
+    }
+  }
+}

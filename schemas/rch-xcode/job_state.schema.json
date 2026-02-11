@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/job_state@1",
+  "title": "Job State",
+  "description": "Current state of a job execution.",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "job_id", "run_id", "state", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/job_state@1",
+      "description": "Schema identifier"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"],
+      "description": "Current job state"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the job was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the state was last updated"
+    },
+    "action": {
+      "type": "string",
+      "enum": ["build", "test"],
+      "description": "Action being performed"
+    },
+    "worker": {
+      "type": "object",
+      "properties": {
+        "hostname": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string"
+        }
+      }
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequence number for ordering updates"
+    }
+  }
+}
