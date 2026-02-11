@@ -7,6 +7,13 @@
 //! - Executing xcodebuild with streaming log capture
 //! - Writing normative artifacts (summary.json, toolchain.json, etc.)
 //! - Handling cancellation via SIGTERM
+//!
+//! Agent-friendly summaries (per bead t7z):
+//! - test_summary.json: test counts, failing tests, duration
+//! - build_summary.json: targets, warnings/errors, first error
+//! - junit.xml: JUnit XML report for CI integration
+
+pub mod summary;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -499,6 +506,16 @@ impl Executor {
         if let Some(ref config) = job.effective_config {
             self.write_effective_config_json(&artifact_dir, job, config)?;
         }
+
+        // Generate agent-friendly summaries (t7z)
+        // These are best-effort - don't fail the job if summary generation fails
+        let _ = summary::generate_summaries(
+            &artifact_dir,
+            &job.run_id,
+            &job.job_id,
+            &job.job_key,
+            &job.action,
+        );
 
         // Emit completion event
         let completion_kind = match result.status {
