@@ -34,4 +34,5 @@ pub use source_store::{SourceStore, SourceMetadata, StoreError};
 pub use cache::{
     DerivedDataCache, DerivedDataMode, CacheConfig, CacheError, CacheResult, CacheStats,
     CacheLock, LockError, LockResult, ToolchainKey,
+    SpmCache, SpmCacheMode, SpmCacheKey, SpmCacheStats,
 };
