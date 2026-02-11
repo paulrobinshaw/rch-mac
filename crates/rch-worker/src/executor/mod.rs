@@ -218,6 +218,29 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Artifact profile determines which optional artifacts are generated
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactProfile {
+    /// Minimal profile: only required artifacts (summary.json, manifest.json, attestation.json)
+    #[default]
+    Minimal,
+    /// Rich profile: adds optional artifacts (build_summary.json, test_summary.json, junit.xml, events.jsonl)
+    Rich,
+}
+
+impl ArtifactProfile {
+    /// Returns true if this profile satisfies the requested profile
+    /// (i.e., provides at least as many artifacts)
+    pub fn satisfies(&self, requested: ArtifactProfile) -> bool {
+        match (self, requested) {
+            (ArtifactProfile::Rich, _) => true,
+            (ArtifactProfile::Minimal, ArtifactProfile::Minimal) => true,
+            (ArtifactProfile::Minimal, ArtifactProfile::Rich) => false,
+        }
+    }
+}
+
 /// Job specification from the host (subset of fields needed for execution).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInput {
@@ -237,6 +260,9 @@ pub struct JobInput {
     /// Original destination constraint string
     #[serde(default)]
     pub original_constraint: Option<String>,
+    /// Requested artifact profile
+    #[serde(default)]
+    pub artifact_profile: ArtifactProfile,
 }
 
 /// Job key inputs structure.
@@ -533,15 +559,17 @@ impl Executor {
             self.write_effective_config_json(&artifact_dir, job, config)?;
         }
 
-        // Generate agent-friendly summaries (t7z)
+        // Generate agent-friendly summaries (t7z) only for rich profile
         // These are best-effort - don't fail the job if summary generation fails
-        let _ = summary::generate_summaries(
-            &artifact_dir,
-            &job.run_id,
-            &job.job_id,
-            &job.job_key,
-            &job.action,
-        );
+        if job.artifact_profile == ArtifactProfile::Rich {
+            let _ = summary::generate_summaries(
+                &artifact_dir,
+                &job.run_id,
+                &job.job_id,
+                &job.job_key,
+                &job.action,
+            );
+        }
 
         // Generate manifest.json (y6s.1)
         // This must succeed for artifact integrity
@@ -919,6 +947,11 @@ impl Executor {
         job: &JobInput,
         duration_ms: u64,
     ) -> ExecutorResult<()> {
+        let profile_str = match job.artifact_profile {
+            ArtifactProfile::Minimal => "minimal",
+            ArtifactProfile::Rich => "rich",
+        };
+
         let summary = serde_json::json!({
             "schema_version": 1,
             "schema_id": "rch-xcode/summary@1",
@@ -932,7 +965,7 @@ impl Executor {
             "backend": "xcodebuild",
             "human_summary": format!("{} succeeded", job.action),
             "duration_ms": duration_ms,
-            "artifact_profile": "minimal"
+            "artifact_profile": profile_str
         });
 
         self.write_json_artifact(artifact_dir, "summary.json", &summary)
@@ -966,6 +999,11 @@ impl Executor {
             _ => 40,
         };
 
+        let profile_str = match job.artifact_profile {
+            ArtifactProfile::Minimal => "minimal",
+            ArtifactProfile::Rich => "rich",
+        };
+
         let mut summary = serde_json::json!({
             "schema_version": 1,
             "schema_id": "rch-xcode/summary@1",
@@ -979,7 +1017,7 @@ impl Executor {
             "backend": "xcodebuild",
             "human_summary": human_summary,
             "duration_ms": duration_ms,
-            "artifact_profile": "minimal"
+            "artifact_profile": profile_str
         });
 
         if let Some(subkind) = failure_subkind {
@@ -1002,6 +1040,11 @@ impl Executor {
         job: &JobInput,
         duration_ms: u64,
     ) -> ExecutorResult<()> {
+        let profile_str = match job.artifact_profile {
+            ArtifactProfile::Minimal => "minimal",
+            ArtifactProfile::Rich => "rich",
+        };
+
         let summary = serde_json::json!({
             "schema_version": 1,
             "schema_id": "rch-xcode/summary@1",
@@ -1015,7 +1058,7 @@ impl Executor {
             "backend": "xcodebuild",
             "human_summary": "Job cancelled",
             "duration_ms": duration_ms,
-            "artifact_profile": "minimal"
+            "artifact_profile": profile_str
         });
 
         self.write_json_artifact(artifact_dir, "summary.json", &summary)
@@ -1196,6 +1239,7 @@ mod tests {
             },
             effective_config: None,
             original_constraint: Some("platform=iOS Simulator,name=iPhone 16,OS=18.2".to_string()),
+            artifact_profile: ArtifactProfile::Minimal,
         }
     }
 
@@ -1907,5 +1951,146 @@ mod tests {
         assert!(json.contains("\"kind\":\"success\""));
         // data should be absent when None (skip_serializing_if)
         assert!(!json.contains("\"data\":null"));
+    }
+
+    // =============================================================================
+    // Artifact Profile Tests (b7s.3)
+    // =============================================================================
+
+    // Test 33: ArtifactProfile satisfies - rich satisfies everything
+    #[test]
+    fn test_artifact_profile_rich_satisfies_all() {
+        assert!(ArtifactProfile::Rich.satisfies(ArtifactProfile::Minimal));
+        assert!(ArtifactProfile::Rich.satisfies(ArtifactProfile::Rich));
+    }
+
+    // Test 34: ArtifactProfile satisfies - minimal satisfies only minimal
+    #[test]
+    fn test_artifact_profile_minimal_satisfies_minimal() {
+        assert!(ArtifactProfile::Minimal.satisfies(ArtifactProfile::Minimal));
+        assert!(!ArtifactProfile::Minimal.satisfies(ArtifactProfile::Rich));
+    }
+
+    // Test 35: ArtifactProfile default is minimal
+    #[test]
+    fn test_artifact_profile_default() {
+        let profile: ArtifactProfile = Default::default();
+        assert_eq!(profile, ArtifactProfile::Minimal);
+    }
+
+    // Test 36: ArtifactProfile serialization
+    #[test]
+    fn test_artifact_profile_serialization() {
+        let minimal = ArtifactProfile::Minimal;
+        let rich = ArtifactProfile::Rich;
+
+        assert_eq!(serde_json::to_string(&minimal).unwrap(), "\"minimal\"");
+        assert_eq!(serde_json::to_string(&rich).unwrap(), "\"rich\"");
+
+        let parsed_min: ArtifactProfile = serde_json::from_str("\"minimal\"").unwrap();
+        let parsed_rich: ArtifactProfile = serde_json::from_str("\"rich\"").unwrap();
+
+        assert_eq!(parsed_min, ArtifactProfile::Minimal);
+        assert_eq!(parsed_rich, ArtifactProfile::Rich);
+    }
+
+    // Test 37: Summary includes correct artifact_profile for minimal
+    #[test]
+    fn test_summary_artifact_profile_minimal() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-profile-min", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_success_summary(&artifact_dir, &job, 1000).unwrap();
+
+        let summary: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(artifact_dir.join("summary.json")).unwrap()
+        ).unwrap();
+
+        assert_eq!(summary["artifact_profile"], "minimal");
+    }
+
+    // Test 38: Summary includes correct artifact_profile for rich
+    #[test]
+    fn test_summary_artifact_profile_rich() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let mut job = make_test_job("job-profile-rich", "test");
+        job.artifact_profile = ArtifactProfile::Rich;
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_success_summary(&artifact_dir, &job, 1000).unwrap();
+
+        let summary: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(artifact_dir.join("summary.json")).unwrap()
+        ).unwrap();
+
+        assert_eq!(summary["artifact_profile"], "rich");
+    }
+
+    // Test 39: JobInput deserialization with artifact_profile
+    #[test]
+    fn test_job_input_artifact_profile_deserialization() {
+        let json = r#"{
+            "run_id": "run-001",
+            "job_id": "job-001",
+            "action": "build",
+            "job_key": "abc123",
+            "job_key_inputs": {
+                "source_sha256": "def456",
+                "sanitized_argv": ["build"],
+                "toolchain": {
+                    "xcode_build": "16C5032a",
+                    "developer_dir": "/Xcode",
+                    "macos_version": "15.3",
+                    "macos_build": "24D60",
+                    "arch": "arm64"
+                },
+                "destination": {
+                    "platform": "iOS",
+                    "name": "iPhone",
+                    "os_version": "18.0",
+                    "provisioning": "existing"
+                }
+            },
+            "artifact_profile": "rich"
+        }"#;
+
+        let job: JobInput = serde_json::from_str(json).unwrap();
+        assert_eq!(job.artifact_profile, ArtifactProfile::Rich);
+    }
+
+    // Test 40: JobInput deserialization defaults to minimal when absent
+    #[test]
+    fn test_job_input_artifact_profile_default_when_absent() {
+        let json = r#"{
+            "run_id": "run-001",
+            "job_id": "job-001",
+            "action": "build",
+            "job_key": "abc123",
+            "job_key_inputs": {
+                "source_sha256": "def456",
+                "sanitized_argv": ["build"],
+                "toolchain": {
+                    "xcode_build": "16C5032a",
+                    "developer_dir": "/Xcode",
+                    "macos_version": "15.3",
+                    "macos_build": "24D60",
+                    "arch": "arm64"
+                },
+                "destination": {
+                    "platform": "iOS",
+                    "name": "iPhone",
+                    "os_version": "18.0",
+                    "provisioning": "existing"
+                }
+            }
+        }"#;
+
+        let job: JobInput = serde_json::from_str(json).unwrap();
+        assert_eq!(job.artifact_profile, ArtifactProfile::Minimal);
     }
 }
