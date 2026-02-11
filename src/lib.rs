@@ -20,7 +20,6 @@ pub mod selection;
 pub mod signal;
 pub mod state;
 pub mod summary;
-pub mod timeout;
 pub mod toolchain;
 pub mod worker;
 
@@ -75,7 +74,4 @@ pub use signal::{
 pub use cancel::{
     CancellationManager, JobCancellation, RunCancellation, update_job_state_cancelled,
     update_run_state_cancelled,
-};
-pub use timeout::{
-    TimeoutConfig, TimeoutEnforcer, TimeoutStatus, TimeoutValidationError,
 };
