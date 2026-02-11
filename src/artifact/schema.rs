@@ -224,6 +224,111 @@ pub fn extract_and_validate_header(
     Ok(header)
 }
 
+/// Error type for artifact loading with schema validation.
+#[derive(Debug)]
+pub enum LoadError {
+    /// IO error reading the file.
+    Io(std::io::Error),
+    /// JSON parsing error.
+    Parse(serde_json::Error),
+    /// Schema validation error.
+    Schema(SchemaError),
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadError::Io(e) => write!(f, "failed to read artifact: {}", e),
+            LoadError::Parse(e) => write!(f, "failed to parse artifact JSON: {}", e),
+            LoadError::Schema(e) => write!(f, "schema validation failed: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoadError::Io(e) => Some(e),
+            LoadError::Parse(e) => Some(e),
+            LoadError::Schema(e) => Some(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for LoadError {
+    fn from(e: std::io::Error) -> Self {
+        LoadError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for LoadError {
+    fn from(e: serde_json::Error) -> Self {
+        LoadError::Parse(e)
+    }
+}
+
+impl From<SchemaError> for LoadError {
+    fn from(e: SchemaError) -> Self {
+        LoadError::Schema(e)
+    }
+}
+
+/// Load and validate an artifact from JSON string.
+///
+/// This function:
+/// 1. First extracts and validates the schema header
+/// 2. Then deserializes the full artifact if schema is compatible
+///
+/// Per PLAN.md, if the schema_id major version matches, unknown fields are
+/// ignored (forward-compatible). If major version differs, loading fails
+/// with a diagnostic.
+///
+/// # Type Parameters
+/// * `T` - The artifact type to deserialize into (must implement Deserialize)
+///
+/// # Arguments
+/// * `json` - The JSON string to parse
+/// * `expected_schema_id` - The schema_id this consumer expects
+///
+/// # Example
+/// ```ignore
+/// let summary: JobSummary = load_artifact(json_str, "rch-xcode/summary@1")?;
+/// ```
+pub fn load_artifact<'de, T>(json: &'de str, expected_schema_id: &str) -> Result<T, LoadError>
+where
+    T: Deserialize<'de>,
+{
+    // First validate the schema header
+    extract_and_validate_header(json, expected_schema_id)?;
+
+    // Then deserialize the full artifact
+    // Note: serde will ignore unknown fields by default (forward-compatible)
+    let artifact: T = serde_json::from_str(json)?;
+    Ok(artifact)
+}
+
+/// Load and validate an artifact from a file.
+///
+/// This is a convenience wrapper around `load_artifact` that reads the file first.
+///
+/// # Arguments
+/// * `path` - Path to the JSON artifact file
+/// * `expected_schema_id` - The schema_id this consumer expects
+pub fn load_artifact_from_file<T>(
+    path: &std::path::Path,
+    expected_schema_id: &str,
+) -> Result<T, LoadError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let json = std::fs::read_to_string(path)?;
+    // First validate the schema header
+    extract_and_validate_header(&json, expected_schema_id)?;
+    // Then deserialize the full artifact
+    let artifact: T = serde_json::from_str(&json)?;
+    Ok(artifact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +437,114 @@ mod tests {
             result,
             Err(SchemaError::MajorVersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_load_artifact_success() {
+        // A minimal artifact with required fields
+        let json = r#"{
+            "schema_version": 1,
+            "schema_id": "rch-xcode/test@1",
+            "created_at": "2026-02-11T00:00:00Z"
+        }"#;
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact(json, "rch-xcode/test@1");
+        assert!(result.is_ok());
+        let header = result.unwrap();
+        assert_eq!(header.schema_version, 1);
+        assert_eq!(header.schema_id, "rch-xcode/test@1");
+    }
+
+    #[test]
+    fn test_load_artifact_ignores_unknown_fields() {
+        // Artifact with unknown extra fields (should be ignored - forward-compatible)
+        let json = r#"{
+            "schema_version": 1,
+            "schema_id": "rch-xcode/test@1",
+            "created_at": "2026-02-11T00:00:00Z",
+            "unknown_field": "should be ignored",
+            "another_unknown": 42
+        }"#;
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact(json, "rch-xcode/test@1");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_load_artifact_rejects_different_major_version() {
+        let json = r#"{
+            "schema_version": 2,
+            "schema_id": "rch-xcode/test@2",
+            "created_at": "2026-02-11T00:00:00Z"
+        }"#;
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact(json, "rch-xcode/test@1");
+        assert!(matches!(result, Err(LoadError::Schema(_))));
+    }
+
+    #[test]
+    fn test_load_artifact_rejects_type_mismatch() {
+        let json = r#"{
+            "schema_version": 1,
+            "schema_id": "rch-xcode/job@1",
+            "created_at": "2026-02-11T00:00:00Z"
+        }"#;
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact(json, "rch-xcode/summary@1");
+        assert!(matches!(result, Err(LoadError::Schema(_))));
+    }
+
+    #[test]
+    fn test_load_artifact_from_file() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.json");
+
+        let json = r#"{
+            "schema_version": 1,
+            "schema_id": "rch-xcode/test@1",
+            "created_at": "2026-02-11T00:00:00Z"
+        }"#;
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(json.as_bytes()).unwrap();
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact_from_file(&path, "rch-xcode/test@1");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_load_error_display() {
+        let err = LoadError::Schema(SchemaError::MajorVersionMismatch {
+            expected: 1,
+            actual: 2,
+            expected_schema_id: "rch-xcode/test@1".to_string(),
+            actual_schema_id: "rch-xcode/test@2".to_string(),
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("schema validation failed"));
+    }
+
+    #[test]
+    fn test_accepts_higher_schema_version_same_major() {
+        // Per PLAN.md: if schema_id major matches, accept even if schema_version differs
+        // schema_version=2 with schema_id=@1 is valid (consumer knows @1 but
+        // artifact was written by a newer producer that added optional fields)
+        let json = r#"{
+            "schema_version": 2,
+            "schema_id": "rch-xcode/test@1",
+            "created_at": "2026-02-11T00:00:00Z",
+            "new_optional_field": "added in schema_version 2"
+        }"#;
+
+        let result: Result<ArtifactHeader, LoadError> =
+            load_artifact(json, "rch-xcode/test@1");
+        // Should succeed because schema_id major version @1 matches
+        assert!(result.is_ok());
     }
 }

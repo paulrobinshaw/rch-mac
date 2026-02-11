@@ -38,6 +38,7 @@ pub use verify::{
     verify_artifacts, verify_manifest_consistency, VerificationError, VerificationResult,
 };
 pub use schema::{
-    extract_and_validate_header, is_forward_compatible, validate_schema_compatibility,
-    ArtifactHeader, JobScopedHeader, RunScopedHeader, SchemaError, SchemaId,
+    extract_and_validate_header, is_forward_compatible, load_artifact, load_artifact_from_file,
+    validate_schema_compatibility, ArtifactHeader, JobScopedHeader, LoadError, RunScopedHeader,
+    SchemaError, SchemaId,
 };

@@ -46,6 +46,8 @@ pub use host::{RpcClient, RpcClientConfig, RpcResult, RpcError as HostRpcError, 
 pub use worker::RpcHandler;
 pub use artifact::{
     ArtifactEntry, ArtifactEntryType, ArtifactManifest, IntegrityError, ManifestError,
+    SchemaError, SchemaId, LoadError as SchemaLoadError, validate_schema_compatibility,
+    is_forward_compatible, load_artifact, load_artifact_from_file,
 };
 pub use inventory::{InventoryError, WorkerEntry, WorkerInventory};
 pub use summary::{
