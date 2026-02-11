@@ -297,7 +297,7 @@ impl SourceStore {
         }
 
         let mut cleaned = 0;
-        let now = Instant::now();
+        let _now = Instant::now();
 
         for entry in fs::read_dir(&temp_dir)? {
             let entry = entry?;
