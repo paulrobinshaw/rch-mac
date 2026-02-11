@@ -9,6 +9,8 @@
 //! - Rejected steps still appear in plan with rejected=true
 //! - Sequential execution, abort on failure unless continue_on_failure=true
 
+pub mod streaming;
+
 use crate::job::{generate_job_id, generate_run_id, Action};
 use crate::selection::WorkerSelection;
 use crate::summary::Status;

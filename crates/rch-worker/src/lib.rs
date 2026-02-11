@@ -9,12 +9,14 @@
 //! - **In-process library**: for unit and integration testing with mock state
 
 pub mod config;
+pub mod executor;
 pub mod handlers;
 pub mod mock_state;
 pub mod rpc;
 pub mod source_store;
 
 pub use config::WorkerConfig;
+pub use executor::{Executor, ExecutorConfig, ExecutorError, ExecutorResult, ExecutionResult, ExecutionStatus, JobInput};
 pub use mock_state::MockState;
 pub use rpc::RpcHandler;
 pub use source_store::{SourceStore, SourceMetadata, StoreError};

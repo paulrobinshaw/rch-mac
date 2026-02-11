@@ -250,7 +250,7 @@ impl LogStreamer {
     ///
     /// Returns a StreamUpdate based on job state.
     /// In fallback mode, we only know when the job finishes, not the logs.
-    pub fn process_status_response(&mut self, job_state: &str, is_terminal: bool) -> StreamUpdate {
+    pub fn process_status_response(&mut self, _job_state: &str, is_terminal: bool) -> StreamUpdate {
         if is_terminal {
             self.complete = true;
             StreamUpdate::completed()
