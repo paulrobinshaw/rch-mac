@@ -28,12 +28,14 @@
 //! Lock contention is logged as a warning.
 
 mod derived_data;
+mod gc;
 mod lock;
 mod result;
 mod spm;
 mod toolchain_key;
 
 pub use derived_data::{DerivedDataCache, DerivedDataMode, CacheConfig, CacheError, CacheResult, CacheStats};
+pub use gc::{CacheGc, EvictionPolicy, GcResult};
 pub use lock::{CacheLock, LockError, LockResult};
 pub use result::{ResultCache, ResultCacheEntry, ResultCacheStats};
 pub use spm::{SpmCache, SpmCacheMode, SpmCacheKey, SpmCacheStats};

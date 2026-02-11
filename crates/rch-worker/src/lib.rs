@@ -36,4 +36,5 @@ pub use cache::{
     CacheLock, LockError, LockResult, ToolchainKey,
     SpmCache, SpmCacheMode, SpmCacheKey, SpmCacheStats,
     ResultCache, ResultCacheEntry, ResultCacheStats,
+    CacheGc, EvictionPolicy, GcResult,
 };
