@@ -21,16 +21,27 @@ use rch_protocol::ErrorCode;
 
 use crate::config::WorkerConfig;
 use crate::handlers;
+use crate::mock_state::MockState;
 
 /// Main RPC handler for the worker.
 pub struct RpcHandler {
     config: WorkerConfig,
+    /// Mock state for testing (also used for real worker state).
+    pub state: MockState,
 }
 
 impl RpcHandler {
     /// Create a new RPC handler with the given configuration.
     pub fn new(config: WorkerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            state: MockState::new(),
+        }
+    }
+
+    /// Create a new RPC handler with a pre-configured state (for testing).
+    pub fn with_state(config: WorkerConfig, state: MockState) -> Self {
+        Self { config, state }
     }
 
     /// Run the RPC handler, reading from stdin and writing to stdout.
@@ -137,16 +148,16 @@ impl RpcHandler {
         };
 
         let result = match request.op.as_str() {
-            names::PROBE => handlers::probe::handle(&self.config),
-            names::RESERVE => handlers::reserve::handle(request, &self.config),
-            names::RELEASE => handlers::release::handle(request, &self.config),
-            names::SUBMIT => handlers::submit::handle(request, &self.config),
-            names::STATUS => handlers::status::handle(request, &self.config),
-            names::TAIL => handlers::tail::handle(request, &self.config),
-            names::CANCEL => handlers::cancel::handle(request, &self.config),
-            names::HAS_SOURCE => handlers::has_source::handle(request, &self.config),
-            names::UPLOAD_SOURCE => handlers::upload_source::handle(request, &self.config),
-            names::FETCH => handlers::fetch::handle(request, &self.config),
+            names::PROBE => handlers::probe::handle(&self.config, &self.state),
+            names::RESERVE => handlers::reserve::handle(request, &self.config, &self.state),
+            names::RELEASE => handlers::release::handle(request, &self.config, &self.state),
+            names::SUBMIT => handlers::submit::handle(request, &self.config, &self.state),
+            names::STATUS => handlers::status::handle(request, &self.config, &self.state),
+            names::TAIL => handlers::tail::handle(request, &self.config, &self.state),
+            names::CANCEL => handlers::cancel::handle(request, &self.config, &self.state),
+            names::HAS_SOURCE => handlers::has_source::handle(request, &self.config, &self.state),
+            names::UPLOAD_SOURCE => handlers::upload_source::handle(request, &self.config, &self.state),
+            names::FETCH => handlers::fetch::handle(request, &self.config, &self.state),
             _ => Err(RpcError::unknown_operation(&request.op)),
         };
 

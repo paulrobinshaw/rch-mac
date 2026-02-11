@@ -1,8 +1,22 @@
 //! Operation-specific types.
 
 pub mod probe;
+pub mod reserve;
+pub mod submit;
+pub mod status;
+pub mod tail;
+pub mod cancel;
+pub mod source;
+pub mod fetch;
 
 pub use probe::{ProbeRequest, ProbeResponse, Capabilities, XcodeInfo, SimulatorRuntime, Capacity};
+pub use reserve::{ReserveRequest, ReserveResponse, ReleaseRequest, ReleaseResponse};
+pub use submit::{SubmitRequest, SubmitResponse, JobSpec, JobState};
+pub use status::{StatusRequest, StatusResponse};
+pub use tail::{TailRequest, TailResponse};
+pub use cancel::{CancelRequest, CancelResponse};
+pub use source::{HasSourceRequest, HasSourceResponse, UploadSourceRequest, UploadSourceResponse, UploadStream};
+pub use fetch::{FetchRequest, FetchResponseHeader, FetchStream};
 
 /// Known operation names.
 pub mod names {

@@ -493,6 +493,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "rch-classifier"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "rch-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "rch-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rch-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rch-xcode-lane"
 version = "0.1.0"
 dependencies = [
@@ -500,6 +532,8 @@ dependencies = [
  "clap",
  "globset",
  "hex",
+ "rch-classifier",
+ "rch-protocol",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

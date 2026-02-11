@@ -11,9 +11,10 @@ use rch_protocol::{
 };
 
 use crate::config::WorkerConfig;
+use crate::mock_state::MockState;
 
 /// Handle the probe operation.
-pub fn handle(config: &WorkerConfig) -> Result<serde_json::Value, RpcError> {
+pub fn handle(config: &WorkerConfig, state: &MockState) -> Result<serde_json::Value, RpcError> {
     let now = Utc::now();
 
     // Collect system information
@@ -21,7 +22,7 @@ pub fn handle(config: &WorkerConfig) -> Result<serde_json::Value, RpcError> {
     let arch = get_architecture();
     let xcode_versions = get_xcode_versions();
     let simulator_runtimes = get_simulator_runtimes();
-    let capacity = get_capacity(config);
+    let capacity = get_capacity(config, state);
 
     // Build capabilities
     let capabilities = Capabilities {
@@ -151,10 +152,10 @@ fn get_simulator_runtimes() -> Vec<SimulatorRuntime> {
 }
 
 /// Get worker capacity information.
-fn get_capacity(config: &WorkerConfig) -> Capacity {
+fn get_capacity(config: &WorkerConfig, state: &MockState) -> Capacity {
     let mut capacity = Capacity {
         max_concurrent_jobs: config.max_concurrent_jobs,
-        current_jobs: 0, // TODO: track actual job count
+        current_jobs: state.running_job_count() as u32,
         max_upload_bytes: config.max_upload_bytes,
         disk_available_bytes: 0,
         disk_total_bytes: 0,
@@ -201,7 +202,8 @@ mod tests {
     #[test]
     fn test_probe_returns_valid_response() {
         let config = WorkerConfig::default();
-        let result = handle(&config);
+        let state = MockState::new();
+        let result = handle(&config, &state);
         assert!(result.is_ok());
 
         let value = result.unwrap();
