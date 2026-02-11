@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod bundle;
 pub mod classifier;
 pub mod config;
+pub mod destination;
 pub mod host;
 pub mod inventory;
 pub mod mock;
@@ -45,4 +46,7 @@ pub use summary::{
 };
 pub use toolchain::{
     resolve_toolchain, ToolchainError, ToolchainIdentity, ToolchainResolution, XcodeConstraint,
+};
+pub use destination::{
+    resolve_destination, DestinationConstraint, DestinationError, Provisioning, ResolvedDestination,
 };
