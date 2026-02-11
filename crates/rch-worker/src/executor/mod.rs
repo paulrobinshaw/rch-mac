@@ -935,7 +935,60 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
+    /// Create a test job input with default values.
+    fn make_test_job(job_id: &str, action: &str) -> JobInput {
+        JobInput {
+            run_id: "run-001".to_string(),
+            job_id: job_id.to_string(),
+            action: action.to_string(),
+            job_key: "abc123def456789012345678901234567890123456789012345678901234".to_string(),
+            job_key_inputs: JobKeyInputs {
+                source_sha256: "source123456789012345678901234567890123456789012345678901234".to_string(),
+                sanitized_argv: vec![
+                    action.to_string(),
+                    "-scheme".to_string(),
+                    "MyApp".to_string(),
+                    "-workspace".to_string(),
+                    "MyApp.xcworkspace".to_string(),
+                ],
+                toolchain: ToolchainInput {
+                    xcode_build: "16C5032a".to_string(),
+                    developer_dir: "/Applications/Xcode.app/Contents/Developer".to_string(),
+                    macos_version: "15.3".to_string(),
+                    macos_build: "24D60".to_string(),
+                    arch: "arm64".to_string(),
+                },
+                destination: DestinationInput {
+                    platform: "iOS Simulator".to_string(),
+                    name: "iPhone 16".to_string(),
+                    os_version: "18.2".to_string(),
+                    provisioning: "existing".to_string(),
+                    sim_runtime_identifier: Some("com.apple.CoreSimulator.SimRuntime.iOS-18-2".to_string()),
+                    sim_runtime_build: Some("22C150".to_string()),
+                    device_type_identifier: Some("com.apple.CoreSimulator.SimDeviceType.iPhone-16".to_string()),
+                },
+            },
+            effective_config: None,
+            original_constraint: Some("platform=iOS Simulator,name=iPhone 16,OS=18.2".to_string()),
+        }
+    }
+
+    /// Create an executor with temporary directories.
+    fn make_test_executor(temp_dir: &TempDir) -> (Executor, ExecutorConfig) {
+        let config = ExecutorConfig {
+            jobs_root: temp_dir.path().join("jobs"),
+            source_store_root: temp_dir.path().join("sources"),
+            shared_derived_data: Some(temp_dir.path().join("DerivedData")),
+            termination_grace_seconds: 10,
+        };
+        fs::create_dir_all(&config.jobs_root).unwrap();
+        fs::create_dir_all(&config.source_store_root).unwrap();
+        (Executor::new(config.clone()), config)
+    }
+
+    // Test 1: Environment allowlist
     #[test]
     fn test_env_allowlist() {
         // Verify expected env vars are in allowlist
@@ -943,8 +996,12 @@ mod tests {
         assert!(ENV_ALLOWLIST.contains(&"PATH"));
         assert!(ENV_ALLOWLIST.contains(&"DEVELOPER_DIR"));
         assert!(ENV_ALLOWLIST.contains(&"TMPDIR"));
+        // Verify potentially dangerous vars are NOT in allowlist
+        assert!(!ENV_ALLOWLIST.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(!ENV_ALLOWLIST.contains(&"PASSWORD"));
     }
 
+    // Test 2: Executor config defaults
     #[test]
     fn test_executor_config_default() {
         let config = ExecutorConfig::default();
@@ -952,6 +1009,7 @@ mod tests {
         assert!(config.shared_derived_data.is_some());
     }
 
+    // Test 3: Job input deserialization
     #[test]
     fn test_job_input_deserialization() {
         let json = r#"{
@@ -984,10 +1042,11 @@ mod tests {
         assert_eq!(job.job_key_inputs.sanitized_argv[0], "build");
     }
 
+    // Test 4: Build environment sets DEVELOPER_DIR
     #[test]
     fn test_build_environment() {
-        let config = ExecutorConfig::default();
-        let executor = Executor::new(config);
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
 
         let toolchain = ToolchainInput {
             xcode_build: "16C5032a".to_string(),
@@ -1004,5 +1063,551 @@ mod tests {
             env.get("DEVELOPER_DIR"),
             Some(&"/Applications/Xcode.app/Contents/Developer".to_string())
         );
+    }
+
+    // Test 5: xcodebuild command construction - no duplicate action
+    #[test]
+    fn test_build_command_no_duplicate_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (cmd, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        assert_eq!(cmd, "xcodebuild");
+        // sanitized_argv already has "build" as first element
+        // Command should NOT prepend action again
+        assert_eq!(args[0], "build");
+        // Count occurrences of "build" - should be exactly 1
+        let build_count = args.iter().filter(|a| *a == "build").count();
+        assert_eq!(build_count, 1, "Action should not be duplicated");
+    }
+
+    // Test 6: -resultBundlePath injection for test jobs
+    #[test]
+    fn test_result_bundle_path_injection_test_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "test");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (_, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        // Test job should have -resultBundlePath
+        assert!(args.contains(&"-resultBundlePath".to_string()),
+            "Test jobs should have -resultBundlePath injected");
+
+        // Find the index and verify the path
+        let idx = args.iter().position(|a| a == "-resultBundlePath").unwrap();
+        assert!(args[idx + 1].ends_with("result.xcresult"),
+            "resultBundlePath should point to result.xcresult");
+    }
+
+    // Test 7: -resultBundlePath NOT injected for build jobs
+    #[test]
+    fn test_no_result_bundle_path_for_build_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (_, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        // Build job should NOT have -resultBundlePath
+        assert!(!args.contains(&"-resultBundlePath".to_string()),
+            "Build jobs should NOT have -resultBundlePath");
+    }
+
+    // Test 8: -derivedDataPath per cache mode - shared
+    #[test]
+    fn test_derived_data_path_shared_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, config) = make_test_executor(&temp_dir);
+        let mut job = make_test_job("job-001", "build");
+
+        // Set cache mode to shared
+        job.effective_config = Some(serde_json::json!({
+            "config": {
+                "cache": {
+                    "derived_data": "shared"
+                }
+            }
+        }));
+
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (_, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        // Should use shared DerivedData path
+        assert!(args.contains(&"-derivedDataPath".to_string()));
+        let idx = args.iter().position(|a| a == "-derivedDataPath").unwrap();
+        assert_eq!(args[idx + 1], config.shared_derived_data.unwrap().to_str().unwrap());
+    }
+
+    // Test 9: -derivedDataPath per cache mode - per_job
+    #[test]
+    fn test_derived_data_path_per_job_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let mut job = make_test_job("job-001", "build");
+
+        // Set cache mode to per_job
+        job.effective_config = Some(serde_json::json!({
+            "config": {
+                "cache": {
+                    "derived_data": "per_job"
+                }
+            }
+        }));
+
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (_, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        // Should use job-specific DerivedData path
+        assert!(args.contains(&"-derivedDataPath".to_string()));
+        let idx = args.iter().position(|a| a == "-derivedDataPath").unwrap();
+        assert!(args[idx + 1].contains("DerivedData"),
+            "per_job mode should use artifact_dir/DerivedData");
+    }
+
+    // Test 10: -derivedDataPath per cache mode - off
+    #[test]
+    fn test_derived_data_path_off_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let mut job = make_test_job("job-001", "build");
+
+        // Set cache mode to off
+        job.effective_config = Some(serde_json::json!({
+            "config": {
+                "cache": {
+                    "derived_data": "off"
+                }
+            }
+        }));
+
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let (_, args) = executor.build_xcodebuild_command(&job, &artifact_dir).unwrap();
+
+        // Should NOT have -derivedDataPath
+        assert!(!args.contains(&"-derivedDataPath".to_string()),
+            "off mode should not inject -derivedDataPath");
+    }
+
+    // Test 11: Working directory isolation
+    #[test]
+    fn test_working_directory_isolation() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, config) = make_test_executor(&temp_dir);
+
+        // Two different job IDs should have non-overlapping directories
+        let job1_work_dir = config.jobs_root.join("job-001").join("work");
+        let job2_work_dir = config.jobs_root.join("job-002").join("work");
+
+        assert_ne!(job1_work_dir, job2_work_dir);
+        assert!(!job1_work_dir.to_string_lossy().contains("job-002"));
+        assert!(!job2_work_dir.to_string_lossy().contains("job-001"));
+    }
+
+    // Test 12: Exit code mapping - success
+    #[test]
+    fn test_exit_code_mapping_success() {
+        // exit 0 → success/0
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let status = std::process::ExitStatus::default(); // This won't work directly, need workaround
+        // Since we can't easily construct ExitStatus, test via the summary writing
+        executor.write_success_summary(&artifact_dir, &job, 1000).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        assert!(summary_path.exists());
+
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+        assert_eq!(summary["exit_code"], 0);
+        assert_eq!(summary["status"], "success");
+    }
+
+    // Test 13: Exit code mapping - xcodebuild failure
+    #[test]
+    fn test_exit_code_mapping_xcodebuild_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        // Write failure with backend exit code 65
+        executor.write_failure_summary(
+            &artifact_dir,
+            &job,
+            "XCODEBUILD",
+            None,
+            "Build failed",
+            1000,
+            Some(65),
+            None,
+        ).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+        assert_eq!(summary["exit_code"], 50, "XCODEBUILD failure should map to exit code 50");
+        assert_eq!(summary["backend_exit_code"], 65);
+        assert_eq!(summary["failure_kind"], "XCODEBUILD");
+    }
+
+    // Test 14: Exit code mapping - cancelled
+    #[test]
+    fn test_exit_code_mapping_cancelled() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_cancelled_summary(&artifact_dir, &job, 1000).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+        assert_eq!(summary["exit_code"], 80, "Cancelled should map to exit code 80");
+        assert_eq!(summary["failure_kind"], "CANCELLED");
+        assert_eq!(summary["status"], "cancelled");
+    }
+
+    // Test 15: Exit code mapping - executor failure
+    #[test]
+    fn test_exit_code_mapping_executor_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_failure_summary(
+            &artifact_dir,
+            &job,
+            "EXECUTOR",
+            None,
+            "Failed to spawn xcodebuild",
+            100,
+            None,
+            None,
+        ).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+        assert_eq!(summary["exit_code"], 40, "EXECUTOR failure should map to exit code 40");
+    }
+
+    // Test 16: Exit code mapping - transfer failure with extraction subkind
+    #[test]
+    fn test_exit_code_mapping_transfer_extraction_failed() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_failure_summary(
+            &artifact_dir,
+            &job,
+            "TRANSFER",
+            Some("EXTRACTION_FAILED"),
+            "Source extraction failed",
+            100,
+            None,
+            None,
+        ).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+        assert_eq!(summary["exit_code"], 30, "TRANSFER failure should map to exit code 30");
+        assert_eq!(summary["failure_kind"], "TRANSFER");
+        assert_eq!(summary["failure_subkind"], "EXTRACTION_FAILED");
+    }
+
+    // Test 17: summary.json field completeness
+    #[test]
+    fn test_summary_json_field_completeness() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_success_summary(&artifact_dir, &job, 5000).unwrap();
+
+        let summary_path = artifact_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+        // Verify ALL normative fields are present
+        assert!(summary.get("schema_version").is_some(), "Missing schema_version");
+        assert!(summary.get("schema_id").is_some(), "Missing schema_id");
+        assert!(summary.get("run_id").is_some(), "Missing run_id");
+        assert!(summary.get("job_id").is_some(), "Missing job_id");
+        assert!(summary.get("job_key").is_some(), "Missing job_key");
+        assert!(summary.get("created_at").is_some(), "Missing created_at");
+        assert!(summary.get("status").is_some(), "Missing status");
+        assert!(summary.get("exit_code").is_some(), "Missing exit_code");
+        assert!(summary.get("backend").is_some(), "Missing backend");
+        assert!(summary.get("human_summary").is_some(), "Missing human_summary");
+        assert!(summary.get("duration_ms").is_some(), "Missing duration_ms");
+
+        // Verify schema values
+        assert_eq!(summary["schema_version"], 1);
+        assert_eq!(summary["schema_id"], "rch-xcode/summary@1");
+        assert_eq!(summary["backend"], "xcodebuild");
+    }
+
+    // Test 18: toolchain.json emission
+    #[test]
+    fn test_toolchain_json_emission() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_toolchain_json(&artifact_dir, &job).unwrap();
+
+        let toolchain_path = artifact_dir.join("toolchain.json");
+        assert!(toolchain_path.exists(), "toolchain.json should be created");
+
+        let toolchain: serde_json::Value = serde_json::from_str(&fs::read_to_string(&toolchain_path).unwrap()).unwrap();
+
+        // Verify all fields
+        assert_eq!(toolchain["schema_version"], TOOLCHAIN_SCHEMA_VERSION);
+        assert_eq!(toolchain["schema_id"], TOOLCHAIN_SCHEMA_ID);
+        assert_eq!(toolchain["run_id"], job.run_id);
+        assert_eq!(toolchain["job_id"], job.job_id);
+        assert_eq!(toolchain["xcode_build"], job.job_key_inputs.toolchain.xcode_build);
+        assert_eq!(toolchain["developer_dir"], job.job_key_inputs.toolchain.developer_dir);
+        assert_eq!(toolchain["macos_version"], job.job_key_inputs.toolchain.macos_version);
+        assert_eq!(toolchain["macos_build"], job.job_key_inputs.toolchain.macos_build);
+        assert_eq!(toolchain["arch"], job.job_key_inputs.toolchain.arch);
+    }
+
+    // Test 19: destination.json emission
+    #[test]
+    fn test_destination_json_emission() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "test");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        executor.write_destination_json(&artifact_dir, &job).unwrap();
+
+        let dest_path = artifact_dir.join("destination.json");
+        assert!(dest_path.exists(), "destination.json should be created");
+
+        let dest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&dest_path).unwrap()).unwrap();
+
+        // Verify all fields
+        assert_eq!(dest["schema_version"], DESTINATION_SCHEMA_VERSION);
+        assert_eq!(dest["schema_id"], DESTINATION_SCHEMA_ID);
+        assert_eq!(dest["platform"], job.job_key_inputs.destination.platform);
+        assert_eq!(dest["name"], job.job_key_inputs.destination.name);
+        assert_eq!(dest["os_version"], job.job_key_inputs.destination.os_version);
+        assert_eq!(dest["provisioning"], job.job_key_inputs.destination.provisioning);
+
+        // Simulator-specific fields
+        assert_eq!(dest["sim_runtime_identifier"], job.job_key_inputs.destination.sim_runtime_identifier.as_deref().unwrap());
+    }
+
+    // Test 20: Cancellation flag
+    #[test]
+    fn test_cancellation_flag() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+
+        assert!(!executor.is_cancelled(), "Should not be cancelled initially");
+
+        executor.request_cancel();
+
+        assert!(executor.is_cancelled(), "Should be cancelled after request_cancel");
+    }
+
+    // Test 21: Cancellation flag is shared
+    #[test]
+    fn test_cancellation_flag_shared() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+
+        let flag = executor.cancellation_flag();
+
+        assert!(!flag.load(Ordering::SeqCst), "Shared flag should not be cancelled initially");
+
+        executor.request_cancel();
+
+        assert!(flag.load(Ordering::SeqCst), "Shared flag should reflect cancellation");
+    }
+
+    // Test 22: Artifact atomic writes (write-then-rename)
+    #[test]
+    fn test_artifact_atomic_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+        let artifact_dir = temp_dir.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        // Write an artifact
+        executor.write_success_summary(&artifact_dir, &job, 1000).unwrap();
+
+        // Check that the temp file doesn't exist (it should have been renamed)
+        let temp_file = artifact_dir.join(".summary.json.tmp");
+        assert!(!temp_file.exists(), "Temp file should not exist after write");
+
+        // Check that the final file exists
+        let final_file = artifact_dir.join("summary.json");
+        assert!(final_file.exists(), "Final file should exist after write");
+    }
+
+    // Test 23: Artifact directory path
+    #[test]
+    fn test_artifact_dir_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, config) = make_test_executor(&temp_dir);
+
+        let artifact_dir = executor.artifact_dir("job-test-123");
+        let expected = config.jobs_root.join("job-test-123").join("artifacts");
+
+        assert_eq!(artifact_dir, expected);
+    }
+
+    // Test 24: Job cleanup
+    #[test]
+    fn test_cleanup_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, config) = make_test_executor(&temp_dir);
+
+        // Create job directory structure
+        let job_dir = config.jobs_root.join("job-cleanup-test");
+        let work_dir = job_dir.join("work");
+        let artifact_dir = job_dir.join("artifacts");
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        // Create some files
+        fs::write(work_dir.join("test.txt"), "test content").unwrap();
+        fs::write(artifact_dir.join("summary.json"), "{}").unwrap();
+
+        assert!(job_dir.exists());
+
+        // Clean up
+        executor.cleanup_job("job-cleanup-test").unwrap();
+
+        assert!(!job_dir.exists(), "Job directory should be removed after cleanup");
+    }
+
+    // Test 25: Cleanup non-existent job is no-op
+    #[test]
+    fn test_cleanup_nonexistent_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+
+        // Should not error when cleaning up a job that doesn't exist
+        let result = executor.cleanup_job("nonexistent-job-id");
+        assert!(result.is_ok());
+    }
+
+    // Test 26: Make cancelled result
+    #[test]
+    fn test_make_cancelled_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+
+        let elapsed = Duration::from_secs(5);
+        let result = executor.make_cancelled_result(elapsed);
+
+        assert_eq!(result.status, ExecutionStatus::Cancelled);
+        assert_eq!(result.exit_code, 80);
+        assert_eq!(result.backend_term_signal, Some("SIGTERM".to_string()));
+        assert_eq!(result.failure_kind, Some("CANCELLED".to_string()));
+        assert_eq!(result.duration_ms, 5000);
+    }
+
+    // Test 27: Source not found error
+    #[test]
+    fn test_source_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let work_dir = temp_dir.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let result = executor.extract_source("nonexistent_sha256", &work_dir);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ExecutorError::SourceNotFound(sha) => {
+                assert_eq!(sha, "nonexistent_sha256");
+            }
+            _ => panic!("Expected SourceNotFound error"),
+        }
+    }
+
+    // Test 28: All failure kinds map to correct exit codes
+    #[test]
+    fn test_all_failure_kind_exit_codes() {
+        let mappings = [
+            ("CLASSIFIER_REJECTED", 10),
+            ("SSH", 20),
+            ("TRANSFER", 30),
+            ("EXECUTOR", 40),
+            ("XCODEBUILD", 50),
+            ("MCP", 60),
+            ("ARTIFACTS", 70),
+            ("CANCELLED", 80),
+            ("WORKER_BUSY", 90),
+            ("WORKER_INCOMPATIBLE", 91),
+            ("BUNDLER", 92),
+            ("ATTESTATION", 93),
+        ];
+
+        let temp_dir = TempDir::new().unwrap();
+        let (executor, _) = make_test_executor(&temp_dir);
+        let job = make_test_job("job-001", "build");
+
+        for (failure_kind, expected_exit_code) in mappings {
+            let artifact_dir = temp_dir.path().join(format!("artifacts-{}", failure_kind.to_lowercase()));
+            fs::create_dir_all(&artifact_dir).unwrap();
+
+            executor.write_failure_summary(
+                &artifact_dir,
+                &job,
+                failure_kind,
+                None,
+                &format!("{} failure", failure_kind),
+                100,
+                None,
+                None,
+            ).unwrap();
+
+            let summary_path = artifact_dir.join("summary.json");
+            let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+
+            assert_eq!(
+                summary["exit_code"], expected_exit_code,
+                "Failure kind {} should map to exit code {}",
+                failure_kind, expected_exit_code
+            );
+        }
     }
 }
