@@ -91,7 +91,7 @@ pub struct MatchedConstraints {
 }
 
 /// Result of classifying an xcodebuild invocation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClassifierResult {
     /// Whether the invocation was accepted
     pub accepted: bool,

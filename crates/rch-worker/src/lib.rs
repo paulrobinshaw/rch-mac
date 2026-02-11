@@ -12,7 +12,9 @@ pub mod config;
 pub mod handlers;
 pub mod mock_state;
 pub mod rpc;
+pub mod source_store;
 
 pub use config::WorkerConfig;
 pub use mock_state::MockState;
 pub use rpc::RpcHandler;
+pub use source_store::{SourceStore, SourceMetadata, StoreError};
