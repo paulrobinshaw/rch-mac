@@ -4,7 +4,9 @@
 
 use clap::{Parser, Subcommand};
 use rch_xcode_lane::worker::Capabilities;
-use rch_xcode_lane::{Classifier, ClassifierConfig, RpcRequest, RepoConfig, WorkerInventory};
+use rch_xcode_lane::{
+    Classifier, ClassifierConfig, RpcRequest, RepoConfig, WorkerInventory,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
@@ -59,6 +61,63 @@ enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+
+    /// Execute verify actions from config (build + test)
+    Run {
+        /// Path to repo config file (default: .rch/xcode.toml)
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+
+        /// Path to workers inventory file
+        #[arg(long, short = 'i')]
+        inventory: Option<PathBuf>,
+
+        /// Output directory for artifacts and state
+        #[arg(long, short = 'o', default_value = ".rch/artifacts")]
+        output: PathBuf,
+
+        /// Execute specific action (build or test) instead of full verify
+        #[arg(long)]
+        action: Option<String>,
+
+        /// Continue on failure (process all steps even if one fails)
+        #[arg(long)]
+        continue_on_failure: bool,
+
+        /// Overall timeout in seconds (default: 1800)
+        #[arg(long, default_value = "1800")]
+        timeout: u64,
+
+        /// Idle timeout in seconds - no output for this long triggers timeout (default: 300)
+        #[arg(long, default_value = "300")]
+        idle_timeout: u64,
+
+        /// Verbose output
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Output JSON summary at the end
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stream logs from a running or completed job
+    Tail {
+        /// Job ID or Run ID to tail
+        id: String,
+
+        /// Path to artifacts directory (to find state files)
+        #[arg(long, short = 'o', default_value = ".rch/artifacts")]
+        artifacts_dir: PathBuf,
+
+        /// Follow mode - keep streaming until job completes
+        #[arg(long, short = 'f')]
+        follow: bool,
+
+        /// Start from beginning of log instead of current position
+        #[arg(long)]
+        from_start: bool,
     },
 }
 
@@ -123,6 +182,27 @@ fn main() {
         },
         Commands::Cancel { id, reason, json } => {
             run_cancel(&id, &reason, json);
+        }
+        Commands::Run {
+            config,
+            inventory,
+            output,
+            action,
+            continue_on_failure,
+            timeout,
+            idle_timeout,
+            verbose,
+            json,
+        } => {
+            run_pipeline(config, inventory, output, action, continue_on_failure, timeout, idle_timeout, verbose, json);
+        }
+        Commands::Tail {
+            id,
+            artifacts_dir,
+            follow,
+            from_start,
+        } => {
+            run_tail(&id, artifacts_dir, follow, from_start);
         }
     }
 }
