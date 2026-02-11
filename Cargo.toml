@@ -63,3 +63,4 @@ ctrlc = "3.4"
 
 [dev-dependencies]
 tempfile = "3.16"
+rch-worker = { path = "crates/rch-worker" }

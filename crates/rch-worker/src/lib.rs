@@ -21,7 +21,12 @@ pub use artifact_commit::{
     cleanup_orphaned_jobs, find_orphaned_jobs, is_job_complete,
 };
 pub use config::WorkerConfig;
-pub use executor::{Executor, ExecutorConfig, ExecutorError, ExecutorResult, ExecutionResult, ExecutionStatus, JobInput};
+pub use executor::{
+    Executor, ExecutorConfig, ExecutorError, ExecutorResult, ExecutionResult, ExecutionStatus,
+    JobInput, JobKeyInputs, ToolchainInput, DestinationInput, ArtifactProfile,
+    TOOLCHAIN_SCHEMA_ID, TOOLCHAIN_SCHEMA_VERSION, DESTINATION_SCHEMA_ID, DESTINATION_SCHEMA_VERSION,
+};
+pub use executor::mcp::{McpExecutor, McpEvent, McpEventType, McpExecutionSummary};
 pub use mock_state::MockState;
 pub use rpc::RpcHandler;
 pub use source_store::{SourceStore, SourceMetadata, StoreError};

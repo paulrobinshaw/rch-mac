@@ -669,6 +669,7 @@ dependencies = [
  "hex",
  "rch-classifier",
  "rch-protocol",
+ "rch-worker",
  "regex-lite",
  "serde",
  "serde_json",
