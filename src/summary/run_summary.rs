@@ -248,8 +248,7 @@ mod tests {
         JobSummary::rejected(
             "run-123".to_string(),
             job_id.to_string(),
-            format!("key-{}", job_id),
-            "Rejected".to_string(),
+            "Rejected by classifier".to_string(),
         )
     }
 

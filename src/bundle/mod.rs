@@ -57,6 +57,14 @@ pub enum BundleError {
 
     #[error("Path is not within repo root: {0}")]
     PathNotInRepo(PathBuf),
+
+    #[error("Bundle size {actual_bytes} exceeds limit {limit_bytes}")]
+    SizeExceeded {
+        /// The actual bundle size in bytes
+        actual_bytes: u64,
+        /// The configured limit in bytes
+        limit_bytes: u64,
+    },
 }
 
 /// Source bundler for creating deterministic tar archives
@@ -69,6 +77,8 @@ pub struct Bundler {
     mode: BundleMode,
     /// Whether to dereference symlinks within root
     dereference_symlinks: bool,
+    /// Maximum bundle size in bytes (0 or None = no limit)
+    max_bytes: Option<u64>,
 }
 
 impl Bundler {
@@ -79,6 +89,7 @@ impl Bundler {
             exclude: ExcludeRules::default(),
             mode: BundleMode::default(),
             dereference_symlinks: false,
+            max_bytes: None,
         }
     }
 
@@ -91,6 +102,15 @@ impl Bundler {
     /// Set symlink dereferencing behavior
     pub fn with_dereference_symlinks(mut self, dereference: bool) -> Self {
         self.dereference_symlinks = dereference;
+        self
+    }
+
+    /// Set maximum bundle size in bytes
+    ///
+    /// If the bundle exceeds this limit, `create_bundle()` will return
+    /// `BundleError::SizeExceeded`. A value of 0 or None means no limit.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = if max_bytes > 0 { Some(max_bytes) } else { None };
         self
     }
 
@@ -304,6 +324,17 @@ impl Bundler {
             hex::encode(hasher.finalize())
         };
 
+        // Check bundle size limit
+        let actual_size = tar_buffer.len() as u64;
+        if let Some(limit) = self.max_bytes {
+            if actual_size > limit {
+                return Err(BundleError::SizeExceeded {
+                    actual_bytes: actual_size,
+                    limit_bytes: limit,
+                });
+            }
+        }
+
         // Create manifest
         let manifest = SourceManifest {
             schema_version: SCHEMA_VERSION,
@@ -323,6 +354,7 @@ impl Bundler {
 }
 
 /// Result of creating a bundle
+#[derive(Debug)]
 pub struct BundleResult {
     /// The canonical tar bytes (uncompressed)
     pub tar_bytes: Vec<u8>,
@@ -343,6 +375,42 @@ impl BundleResult {
         let json = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(path, json)
+    }
+
+    /// Get the bundle size in bytes
+    pub fn size(&self) -> u64 {
+        self.tar_bytes.len() as u64
+    }
+
+    /// Check if bundle size exceeds a given limit
+    ///
+    /// Returns `Ok(())` if within limit, or `Err(BundleError::SizeExceeded)` if exceeded.
+    /// A limit of 0 means no limit (always returns `Ok`).
+    pub fn check_size_limit(&self, limit_bytes: u64) -> Result<(), BundleError> {
+        if limit_bytes == 0 {
+            return Ok(());
+        }
+        let actual = self.size();
+        if actual > limit_bytes {
+            return Err(BundleError::SizeExceeded {
+                actual_bytes: actual,
+                limit_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compute effective size limit from config and worker capability
+    ///
+    /// Returns the minimum of the two limits, where 0 means no limit.
+    /// If both are 0, returns 0 (no limit).
+    pub fn effective_limit(config_max_bytes: u64, worker_max_upload_bytes: u64) -> u64 {
+        match (config_max_bytes, worker_max_upload_bytes) {
+            (0, 0) => 0,
+            (0, w) => w,
+            (c, 0) => c,
+            (c, w) => c.min(w),
+        }
     }
 }
 
@@ -474,5 +542,89 @@ mod tests {
         let mut sorted_paths = paths.clone();
         sorted_paths.sort();
         assert_eq!(paths, sorted_paths);
+    }
+
+    #[test]
+    fn test_size_limit_enforced() {
+        let dir = create_test_dir();
+
+        // Create a bundle first to know its size
+        let bundler = Bundler::new(dir.path().to_path_buf());
+        let result = bundler.create_bundle("test-run").unwrap();
+        let actual_size = result.size();
+
+        // Now create a bundler with a limit smaller than actual size
+        let bundler_with_limit = Bundler::new(dir.path().to_path_buf())
+            .with_max_bytes(actual_size - 1);
+
+        let err = bundler_with_limit.create_bundle("test-run").unwrap_err();
+        match err {
+            BundleError::SizeExceeded { actual_bytes, limit_bytes } => {
+                assert_eq!(actual_bytes, actual_size);
+                assert_eq!(limit_bytes, actual_size - 1);
+            }
+            _ => panic!("Expected SizeExceeded error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_size_limit_allows_exact() {
+        let dir = create_test_dir();
+
+        // Create a bundle to know its size
+        let bundler = Bundler::new(dir.path().to_path_buf());
+        let result = bundler.create_bundle("test-run").unwrap();
+        let actual_size = result.size();
+
+        // Limit equal to actual size should succeed
+        let bundler_exact = Bundler::new(dir.path().to_path_buf())
+            .with_max_bytes(actual_size);
+        assert!(bundler_exact.create_bundle("test-run").is_ok());
+    }
+
+    #[test]
+    fn test_size_limit_zero_means_no_limit() {
+        let dir = create_test_dir();
+
+        // Limit of 0 means no limit
+        let bundler = Bundler::new(dir.path().to_path_buf())
+            .with_max_bytes(0);
+        assert!(bundler.create_bundle("test-run").is_ok());
+    }
+
+    #[test]
+    fn test_check_size_limit_method() {
+        let dir = create_test_dir();
+        let bundler = Bundler::new(dir.path().to_path_buf());
+        let result = bundler.create_bundle("test-run").unwrap();
+        let actual_size = result.size();
+
+        // Check with larger limit - should succeed
+        assert!(result.check_size_limit(actual_size + 100).is_ok());
+
+        // Check with exact limit - should succeed
+        assert!(result.check_size_limit(actual_size).is_ok());
+
+        // Check with smaller limit - should fail
+        let err = result.check_size_limit(actual_size - 1).unwrap_err();
+        assert!(matches!(err, BundleError::SizeExceeded { .. }));
+
+        // Check with 0 (no limit) - should succeed
+        assert!(result.check_size_limit(0).is_ok());
+    }
+
+    #[test]
+    fn test_effective_limit_calculation() {
+        // Both zero = no limit
+        assert_eq!(BundleResult::effective_limit(0, 0), 0);
+
+        // One zero = use the other
+        assert_eq!(BundleResult::effective_limit(100, 0), 100);
+        assert_eq!(BundleResult::effective_limit(0, 200), 200);
+
+        // Both non-zero = use minimum
+        assert_eq!(BundleResult::effective_limit(100, 200), 100);
+        assert_eq!(BundleResult::effective_limit(300, 150), 150);
+        assert_eq!(BundleResult::effective_limit(50, 50), 50);
     }
 }

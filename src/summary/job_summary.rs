@@ -46,7 +46,9 @@ pub struct JobSummary {
     pub job_id: String,
 
     /// Job key (deterministic hash)
-    pub job_key: String,
+    /// Per PLAN.md: MUST be null for rejected steps (classifier rejection, no job execution)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_key: Option<String>,
 
     /// When the summary was created
     pub created_at: DateTime<Utc>,
@@ -73,8 +75,9 @@ pub struct JobSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_term_signal: Option<String>,
 
-    /// Backend identity
-    pub backend: Backend,
+    /// Backend identity (None for rejected steps that were never executed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<Backend>,
 
     /// Human-readable summary
     pub human_summary: String,
@@ -109,7 +112,7 @@ impl JobSummary {
             schema_id: SUMMARY_SCHEMA_ID.to_string(),
             run_id,
             job_id,
-            job_key,
+            job_key: Some(job_key),
             created_at: Utc::now(),
             status: Status::Success,
             failure_kind: None,
@@ -117,7 +120,7 @@ impl JobSummary {
             exit_code: ExitCode::Success.as_i32(),
             backend_exit_code: Some(0),
             backend_term_signal: None,
-            backend,
+            backend: Some(backend),
             human_summary: "Build succeeded".to_string(),
             duration_ms,
             artifact_profile: None,
@@ -143,7 +146,7 @@ impl JobSummary {
             schema_id: SUMMARY_SCHEMA_ID.to_string(),
             run_id,
             job_id,
-            job_key,
+            job_key: Some(job_key),
             created_at: Utc::now(),
             status: Status::Failed,
             failure_kind: Some(failure_kind),
@@ -151,7 +154,7 @@ impl JobSummary {
             exit_code: exit_code.as_i32(),
             backend_exit_code: None,
             backend_term_signal: None,
-            backend,
+            backend: Some(backend),
             human_summary,
             duration_ms,
             artifact_profile: None,
@@ -161,13 +164,15 @@ impl JobSummary {
     }
 
     /// Create a rejection summary (classifier rejected)
-    pub fn rejected(run_id: String, job_id: String, job_key: String, reason: String) -> Self {
+    ///
+    /// Per PLAN.md: Rejected steps MUST have job_key: null (no job execution occurred)
+    pub fn rejected(run_id: String, job_id: String, reason: String) -> Self {
         Self {
             schema_version: SUMMARY_SCHEMA_VERSION,
             schema_id: SUMMARY_SCHEMA_ID.to_string(),
             run_id,
             job_id,
-            job_key,
+            job_key: None, // MUST be null for rejected steps per PLAN.md
             created_at: Utc::now(),
             status: Status::Rejected,
             failure_kind: Some(FailureKind::ClassifierRejected),
@@ -175,7 +180,7 @@ impl JobSummary {
             exit_code: ExitCode::ClassifierRejected.as_i32(),
             backend_exit_code: None,
             backend_term_signal: None,
-            backend: Backend::Xcodebuild, // Not actually used for rejected
+            backend: None, // No backend used for rejected steps
             human_summary: reason,
             duration_ms: 0,
             artifact_profile: None,
@@ -197,7 +202,7 @@ impl JobSummary {
             schema_id: SUMMARY_SCHEMA_ID.to_string(),
             run_id,
             job_id,
-            job_key,
+            job_key: Some(job_key),
             created_at: Utc::now(),
             status: Status::Cancelled,
             failure_kind: Some(FailureKind::Cancelled),
@@ -205,7 +210,7 @@ impl JobSummary {
             exit_code: ExitCode::Cancelled.as_i32(),
             backend_exit_code: None,
             backend_term_signal: None,
-            backend,
+            backend: Some(backend),
             human_summary: "Job cancelled".to_string(),
             duration_ms,
             artifact_profile: None,
@@ -292,7 +297,7 @@ mod tests {
         assert_eq!(summary.status, Status::Success);
         assert_eq!(summary.exit_code, 0);
         assert!(summary.failure_kind.is_none());
-        assert_eq!(summary.backend, Backend::Xcodebuild);
+        assert_eq!(summary.backend, Some(Backend::Xcodebuild));
     }
 
     #[test]
@@ -319,13 +324,13 @@ mod tests {
         let summary = JobSummary::rejected(
             "run-123".to_string(),
             "job-456".to_string(),
-            "key-789".to_string(),
             "Unknown flag: --evil".to_string(),
         );
 
         assert_eq!(summary.status, Status::Rejected);
         assert_eq!(summary.exit_code, 10);
         assert_eq!(summary.failure_kind, Some(FailureKind::ClassifierRejected));
+        assert!(summary.job_key.is_none()); // Per PLAN.md: rejected steps MUST have job_key: null
     }
 
     #[test]

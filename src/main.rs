@@ -46,6 +46,20 @@ enum Commands {
         #[command(subcommand)]
         action: WorkersCommands,
     },
+
+    /// Cancel a running job or run
+    Cancel {
+        /// Run ID or Job ID to cancel
+        id: String,
+
+        /// Cancel reason (user, signal, timeout)
+        #[arg(long, default_value = "user")]
+        reason: String,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,6 +121,9 @@ fn main() {
                 run_workers_probe(&worker, inventory, json, save);
             }
         },
+        Commands::Cancel { id, reason, json } => {
+            run_cancel(&id, &reason, json);
+        }
     }
 }
 
@@ -487,4 +504,47 @@ fn uuid_simple() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{:016x}{:08x}", now.as_nanos(), std::process::id())
+}
+
+fn run_cancel(id: &str, reason_str: &str, json_output: bool) {
+    use rch_xcode_lane::host::rpc::CancelReason;
+
+    // Parse reason
+    let reason = match reason_str.to_lowercase().as_str() {
+        "user" => CancelReason::User,
+        "signal" => CancelReason::Signal,
+        "timeout" | "timeout_overall" => CancelReason::TimeoutOverall,
+        "timeout_idle" => CancelReason::TimeoutIdle,
+        _ => {
+            eprintln!("Invalid reason '{}'. Valid: user, signal, timeout, timeout_idle", reason_str);
+            process::exit(1);
+        }
+    };
+
+    // Determine if this is a run_id or job_id
+    // For now, we treat it as a job_id and would need worker connection for actual cancel
+    // In a full implementation, this would:
+    // 1. Check if it's a run_id (look for run_plan.json in artifacts)
+    // 2. If run_id, get all job_ids from the run and cancel each
+    // 3. If job_id, cancel just that job
+    // 4. Connect to worker and send cancel RPC
+
+    if json_output {
+        println!("{{");
+        println!("  \"id\": \"{}\",", id);
+        println!("  \"reason\": \"{}\",", reason.as_str());
+        println!("  \"status\": \"cancel_requested\",");
+        println!("  \"message\": \"Cancel command received. Full implementation requires worker connection.\"");
+        println!("}}");
+    } else {
+        println!("Cancel requested for: {}", id);
+        println!("  Reason: {}", reason.as_str());
+        println!();
+        println!("Note: Full cancellation requires active worker connection.");
+        println!("      This command will be fully functional when integrated with run execution.");
+    }
+
+    // Exit with success - the cancel request was acknowledged
+    // In full implementation, exit code depends on cancel result
+    process::exit(0);
 }

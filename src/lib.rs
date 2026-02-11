@@ -6,14 +6,18 @@
 
 pub mod artifact;
 pub mod bundle;
+pub mod cancel;
 pub mod classifier;
 pub mod config;
 pub mod destination;
 pub mod host;
 pub mod inventory;
+pub mod job;
 pub mod mock;
 pub mod protocol;
+pub mod run;
 pub mod selection;
+pub mod signal;
 pub mod state;
 pub mod summary;
 pub mod toolchain;
@@ -55,4 +59,19 @@ pub use selection::{
     is_snapshot_valid, select_worker, ProbeFailure, ProtocolRange, SelectionConstraints,
     SelectionError, SelectionMode, SelectionResult, SnapshotSource, WorkerCandidate,
     WorkerSelection,
+};
+pub use job::{
+    generate_job_id, generate_run_id, validate_identifier, Action, ArtifactProfile,
+    JobKeyDestination, JobKeyInputs, JobKeyToolchain, JobSpec, JobSpecBuilder, JobSpecError,
+};
+pub use run::{
+    ExecutionState, PlanStep, RunError, RunExecution, RunPlan, RunPlanBuilder, StepResult,
+};
+pub use signal::{
+    CancellationCoordinator, SignalAction, SignalHandler, SignalState, DEFAULT_GRACE_PERIOD_SECONDS,
+    EXIT_CODE_CANCELLED,
+};
+pub use cancel::{
+    CancellationManager, JobCancellation, RunCancellation, update_job_state_cancelled,
+    update_run_state_cancelled,
 };
