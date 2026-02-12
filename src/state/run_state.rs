@@ -124,6 +124,10 @@ pub struct RunStateData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseInfo>,
 
+    /// When the run was resumed (if resumed after host restart)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
+
     /// Monotonic sequence counter for ordering
     pub seq: u64,
 }
@@ -157,6 +161,7 @@ impl RunStateData {
             updated_at: now,
             current_step: None,
             lease: None,
+            resumed_at: None,
             seq: next_seq(),
         }
     }
@@ -250,6 +255,18 @@ impl RunStateData {
     /// Get the lease ID if one is active
     pub fn lease_id(&self) -> Option<&str> {
         self.lease.as_ref().map(|l| l.lease_id.as_str())
+    }
+
+    /// Mark the run as resumed after a host restart
+    pub fn mark_resumed(&mut self) {
+        self.resumed_at = Some(now_rfc3339());
+        self.updated_at = now_rfc3339();
+        self.seq = next_seq();
+    }
+
+    /// Check if this run was resumed
+    pub fn is_resumed(&self) -> bool {
+        self.resumed_at.is_some()
     }
 
     /// Serialize to JSON

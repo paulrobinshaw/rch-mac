@@ -9,6 +9,7 @@
 //! - Rejected steps still appear in plan with rejected=true
 //! - Sequential execution, abort on failure unless continue_on_failure=true
 
+pub mod resumption;
 pub mod streaming;
 
 use crate::job::{generate_job_id, generate_run_id, Action};
@@ -147,6 +148,37 @@ pub enum RunError {
     /// Invalid action string
     #[error("invalid action: {0}")]
     InvalidAction(String),
+
+    /// Protocol version drift during resumption (M6 feature)
+    #[error("protocol drift: run was planned with v{planned} but worker now supports [{min}, {max}]")]
+    ProtocolDrift {
+        planned: u32,
+        min: u32,
+        max: u32,
+    },
+
+    /// Toolchain changed during resumption (M6 feature)
+    #[error("toolchain changed: run requires Xcode {required} but worker now has {available:?}")]
+    ToolchainChanged {
+        required: String,
+        available: Vec<String>,
+    },
+
+    /// Cannot resume: worker unreachable
+    #[error("cannot resume: worker {worker} is unreachable")]
+    WorkerUnreachable { worker: String },
+
+    /// Cannot resume: lease cannot be reacquired
+    #[error("cannot resume: lease cannot be reacquired on worker {worker}")]
+    LeaseUnavailable { worker: String },
+
+    /// Run plan not found
+    #[error("run plan not found at {path}")]
+    PlanNotFound { path: String },
+
+    /// Run state not found
+    #[error("run state not found at {path}")]
+    StateNotFound { path: String },
 
     /// All steps were rejected
     #[error("all steps were rejected by classifier")]

@@ -360,6 +360,7 @@ mod tests {
             updated_at: Utc::now(),
             current_step: None,
             lease: None,
+            resumed_at: None,
             seq: 0,
         }
     }
