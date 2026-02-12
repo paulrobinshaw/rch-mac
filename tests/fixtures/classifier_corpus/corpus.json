@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "description": "Classifier test corpus for golden-file assertions (rch-mac-b7s.7). Documents ACTUAL classifier behavior for regression testing.",
+  "test_cases": [
+    {
+      "id": "accept_build_workspace_scheme",
+      "description": "Basic build with workspace and scheme",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": true,
+        "action": "build"
+      }
+    },
+    {
+      "id": "accept_test_full",
+      "description": "Test with workspace, scheme, and destination",
+      "argv": ["test", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-destination", "platform=iOS Simulator,name=iPhone 16,OS=18.0"],
+      "expected": {
+        "accepted": true,
+        "action": "test"
+      }
+    },
+    {
+      "id": "accept_build_debug_config",
+      "description": "Build with Debug configuration",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-configuration", "Debug"],
+      "expected": {
+        "accepted": true,
+        "action": "build",
+        "configuration": "Debug"
+      }
+    },
+    {
+      "id": "accept_build_release_config",
+      "description": "Build with Release configuration",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-configuration", "Release"],
+      "expected": {
+        "accepted": true,
+        "action": "build",
+        "configuration": "Release"
+      }
+    },
+    {
+      "id": "reject_build_project",
+      "description": "Build with project instead of workspace - REJECTED (classifier requires -workspace when config has workspace)",
+      "argv": ["build", "-project", "MyApp.xcodeproj", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "missing_workspace"
+      }
+    },
+    {
+      "id": "reject_clean",
+      "description": "Clean action is denied by classifier",
+      "argv": ["clean", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "action_denied"
+      }
+    },
+    {
+      "id": "reject_analyze",
+      "description": "Analyze action is unknown to classifier",
+      "argv": ["analyze", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "unknown_action"
+      }
+    },
+    {
+      "id": "reject_build_for_testing",
+      "description": "Build-for-testing action is unknown to classifier",
+      "argv": ["build-for-testing", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "unknown_action"
+      }
+    },
+    {
+      "id": "reject_test_without_building",
+      "description": "Test-without-building action is unknown to classifier",
+      "argv": ["test-without-building", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "unknown_action"
+      }
+    },
+    {
+      "id": "reject_archive",
+      "description": "Archive action is forbidden (produces signed artifacts)",
+      "argv": ["archive", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "action_forbidden"
+      }
+    },
+    {
+      "id": "reject_install",
+      "description": "Install action is forbidden",
+      "argv": ["install", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "action_forbidden"
+      }
+    },
+    {
+      "id": "reject_signing_flags",
+      "description": "Signing flags are forbidden",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "CODE_SIGN_IDENTITY=Apple Distribution"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "signing_forbidden"
+      }
+    },
+    {
+      "id": "reject_wrong_scheme",
+      "description": "Scheme mismatch from config",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "OtherScheme"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "scheme_mismatch"
+      }
+    },
+    {
+      "id": "reject_wrong_workspace",
+      "description": "Workspace mismatch from config",
+      "argv": ["build", "-workspace", "OtherApp.xcworkspace", "-scheme", "MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "workspace_mismatch"
+      }
+    },
+    {
+      "id": "accept_different_destination",
+      "description": "Destination mismatch is currently ACCEPTED (classifier does not enforce destination pinning)",
+      "argv": ["test", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-destination", "platform=iOS Simulator,name=iPhone 15,OS=17.0"],
+      "expected": {
+        "accepted": true,
+        "action": "test"
+      }
+    },
+    {
+      "id": "reject_unknown_config",
+      "description": "Configuration not in allowlist",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-configuration", "Staging"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "configuration_forbidden"
+      }
+    },
+    {
+      "id": "reject_deriveddata_override",
+      "description": "Derived data path override is forbidden",
+      "argv": ["build", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-derivedDataPath", "/tmp/custom"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "path_override_forbidden"
+      }
+    },
+    {
+      "id": "reject_xctestrun",
+      "description": "xctestrun file override is forbidden",
+      "argv": ["test-without-building", "-xctestrun", "/path/to/custom.xctestrun"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "xctestrun_forbidden"
+      }
+    },
+    {
+      "id": "reject_equals_style",
+      "description": "Equals-style arguments not supported by classifier",
+      "argv": ["build", "-workspace=MyApp.xcworkspace", "-scheme=MyApp"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "unknown_flags"
+      }
+    },
+    {
+      "id": "accept_multiple_destinations",
+      "description": "Multiple destinations currently ACCEPTED (classifier does not reject multiple destinations)",
+      "argv": ["test", "-workspace", "MyApp.xcworkspace", "-scheme", "MyApp", "-destination", "platform=iOS Simulator,name=iPhone 16,OS=18.0", "-destination", "platform=iOS Simulator,name=iPad Pro,OS=18.0"],
+      "expected": {
+        "accepted": true,
+        "action": "test"
+      }
+    },
+    {
+      "id": "reject_empty_argv",
+      "description": "Empty argument list",
+      "argv": [],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "no_action"
+      }
+    },
+    {
+      "id": "reject_only_action",
+      "description": "Only action, no workspace/scheme",
+      "argv": ["build"],
+      "expected": {
+        "accepted": false,
+        "rejection_reason": "missing_workspace_or_project"
+      }
+    }
+  ],
+  "config": {
+    "workspace": "MyApp.xcworkspace",
+    "project": null,
+    "scheme": "MyApp",
+    "destination": "platform=iOS Simulator,name=iPhone 16,OS=18.0",
+    "allowed_configurations": ["Debug", "Release"]
+  }
+}

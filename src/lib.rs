@@ -9,6 +9,7 @@ pub mod bundle;
 pub mod cancel;
 pub mod classifier;
 pub mod config;
+pub mod conformance;
 pub mod destination;
 pub mod host;
 pub mod inventory;
@@ -83,3 +84,7 @@ pub use timeout::{
     TimeoutConfig, TimeoutEnforcer, TimeoutStatus, TimeoutValidationError,
 };
 pub use pipeline::{Pipeline, PipelineConfig, PipelineError, PipelineResult, execute_tail};
+pub use conformance::{
+    CategoryReport, ConformanceReport, ConformanceRunner, TestResult as ConformanceTestResult,
+    CONFORMANCE_SCHEMA_ID, CONFORMANCE_SCHEMA_VERSION,
+};
