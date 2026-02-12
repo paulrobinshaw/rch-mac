@@ -52,8 +52,8 @@ pub fn handle(request: &RpcRequest, config: &WorkerConfig, state: &MockState) ->
         return Err(RpcError::busy(30));
     }
 
-    // Create job
-    let job = state.create_job(req.job.clone());
+    // Create job with optional lease association (M6 feature)
+    let job = state.create_job_with_lease(req.job.clone(), req.lease_id.clone());
 
     // Schedule mock state transitions (QUEUED -> RUNNING -> SUCCEEDED)
     // For the mock worker, we simulate quick transitions

@@ -74,6 +74,27 @@ pub struct CurrentStep {
     pub action: String,
 }
 
+/// Lease information for the run (M6 feature)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseInfo {
+    /// The lease ID from the worker
+    pub lease_id: String,
+
+    /// When the lease was acquired
+    pub acquired_at: DateTime<Utc>,
+
+    /// Lease TTL in seconds
+    pub ttl_seconds: u32,
+
+    /// Whether the lease was renewed during the run
+    #[serde(default)]
+    pub renewed: bool,
+
+    /// Number of times the lease was renewed
+    #[serde(default)]
+    pub renewal_count: u32,
+}
+
 /// Run state artifact data (run_state.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStateData {
@@ -98,6 +119,10 @@ pub struct RunStateData {
     /// Current step being executed (None if not running)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_step: Option<CurrentStep>,
+
+    /// Lease information for this run (M6 feature)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<LeaseInfo>,
 
     /// Monotonic sequence counter for ordering
     pub seq: u64,
@@ -131,6 +156,7 @@ impl RunStateData {
             created_at: now,
             updated_at: now,
             current_step: None,
+            lease: None,
             seq: next_seq(),
         }
     }
@@ -188,6 +214,42 @@ impl RunStateData {
         self.current_step = None;
         self.updated_at = now_rfc3339();
         self.seq = next_seq();
+    }
+
+    /// Set the lease for this run (M6 feature)
+    pub fn set_lease(&mut self, lease_id: String, ttl_seconds: u32) {
+        self.lease = Some(LeaseInfo {
+            lease_id,
+            acquired_at: now_rfc3339(),
+            ttl_seconds,
+            renewed: false,
+            renewal_count: 0,
+        });
+        self.updated_at = now_rfc3339();
+        self.seq = next_seq();
+    }
+
+    /// Mark the lease as renewed (M6 feature)
+    pub fn mark_lease_renewed(&mut self) {
+        if let Some(ref mut lease) = self.lease {
+            lease.renewed = true;
+            lease.renewal_count += 1;
+            lease.acquired_at = now_rfc3339();
+        }
+        self.updated_at = now_rfc3339();
+        self.seq = next_seq();
+    }
+
+    /// Clear the lease (called after release)
+    pub fn clear_lease(&mut self) {
+        self.lease = None;
+        self.updated_at = now_rfc3339();
+        self.seq = next_seq();
+    }
+
+    /// Get the lease ID if one is active
+    pub fn lease_id(&self) -> Option<&str> {
+        self.lease.as_ref().map(|l| l.lease_id.as_str())
     }
 
     /// Serialize to JSON

@@ -57,6 +57,8 @@ pub struct MockJob {
     pub created_at: Instant,
     /// Scheduled state transitions (for simulating async execution).
     pub transitions: Vec<ScheduledTransition>,
+    /// Associated lease ID (M6 feature: lease-based backstop).
+    pub lease_id: Option<String>,
 }
 
 /// A scheduled state transition for mock jobs.
@@ -176,6 +178,11 @@ impl MockState {
 
     /// Create a new job from a JobSpec.
     pub fn create_job(&self, spec: JobSpec) -> MockJob {
+        self.create_job_with_lease(spec, None)
+    }
+
+    /// Create a new job with an optional lease association (M6 feature).
+    pub fn create_job_with_lease(&self, spec: JobSpec, lease_id: Option<String>) -> MockJob {
         let job = MockJob {
             job_id: spec.job_id.clone(),
             job_key: spec.job_key.clone(),
@@ -186,6 +193,7 @@ impl MockState {
             log_cursor: 0,
             created_at: Instant::now(),
             transitions: Vec::new(),
+            lease_id,
         };
         let mut inner = self.inner.write().unwrap();
         inner.jobs.insert(job.job_id.clone(), job.clone());
@@ -313,6 +321,54 @@ impl MockState {
             inner.leases.remove(&id);
         }
         count
+    }
+
+    /// Cancel RUNNING jobs whose lease has expired (M6 lease-based backstop).
+    ///
+    /// This is a safety net for host crashes: if the host dies without releasing
+    /// the lease or cancelling jobs, the worker will eventually auto-cancel them.
+    pub fn cancel_orphaned_jobs(&self) -> Vec<String> {
+        let mut cancelled = Vec::new();
+        let mut inner = self.inner.write().unwrap();
+
+        // Find jobs that are running and have an expired or missing lease
+        let jobs_to_cancel: Vec<String> = inner
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                // Only cancel running or queued jobs
+                matches!(job.state, JobState::Running | JobState::Queued | JobState::CancelRequested) &&
+                // Only if they have a lease
+                job.lease_id.is_some()
+            })
+            .filter(|(_, job)| {
+                // Check if the associated lease is expired or missing
+                if let Some(ref lease_id) = job.lease_id {
+                    !inner
+                        .leases
+                        .get(lease_id)
+                        .map(|l| !l.is_expired())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Cancel the jobs
+        for job_id in jobs_to_cancel {
+            if let Some(job) = inner.jobs.get_mut(&job_id) {
+                job.state = JobState::Cancelled;
+                job.log_buffer.push_str(&format!(
+                    "\n=== Job {} cancelled: lease expired (backstop) ===\n",
+                    job_id
+                ));
+                cancelled.push(job_id);
+            }
+        }
+
+        cancelled
     }
 }
 

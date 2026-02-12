@@ -27,6 +27,7 @@ impl Default for WorkerConfig {
                 "has_source".to_string(),
                 "upload_source".to_string(),
                 "tail".to_string(),
+                "lease".to_string(), // M6: Worker leases (reserve/release)
             ],
         }
     }

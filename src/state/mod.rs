@@ -9,7 +9,7 @@ mod job_state;
 mod run_state;
 
 pub use job_state::{JobState, JobStateData, JobStateError};
-pub use run_state::{CurrentStep, RunState, RunStateData, RunStateError};
+pub use run_state::{CurrentStep, LeaseInfo, RunState, RunStateData, RunStateError};
 
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
