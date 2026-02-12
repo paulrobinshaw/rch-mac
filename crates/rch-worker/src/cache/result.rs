@@ -330,6 +330,7 @@ pub struct ResultCacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn make_test_config(temp_dir: &TempDir) -> CacheConfig {
