@@ -139,6 +139,29 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Diagnose configuration and connectivity issues
+    Doctor {
+        /// Path to repo config file (default: .rch/xcode.toml)
+        #[arg(long, short = 'c')]
+        config: Option<PathBuf>,
+
+        /// Path to workers inventory file
+        #[arg(long, short = 'i')]
+        inventory: Option<PathBuf>,
+
+        /// Check specific worker only (by name)
+        #[arg(long)]
+        worker: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Verbose output (show all checks, not just failures)
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -242,6 +265,15 @@ fn main() {
             json,
         } => {
             run_artifacts(&id, &artifacts_dir, json);
+        }
+        Commands::Doctor {
+            config,
+            inventory,
+            worker,
+            json,
+            verbose,
+        } => {
+            run_doctor(config, inventory, worker, json, verbose);
         }
     }
 }
@@ -998,4 +1030,16 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+/// Run the doctor command (stub - to be implemented in rch-mac-b7s.8)
+fn run_doctor(
+    _config: Option<PathBuf>,
+    _inventory: Option<PathBuf>,
+    _worker: Option<String>,
+    _json: bool,
+    _verbose: bool,
+) {
+    eprintln!("rch xcode doctor: not yet implemented (see bead rch-mac-b7s.8)");
+    process::exit(1);
 }
