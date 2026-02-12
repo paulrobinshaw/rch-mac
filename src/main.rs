@@ -9,7 +9,7 @@ use rch_xcode_lane::{
     WorkerInventory, execute_tail,
 };
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::time::Duration;
 
@@ -516,9 +516,9 @@ fn run_workers_probe(
     ];
 
     if let Some(ref key_path) = worker.ssh_key_path {
-        let expanded = if key_path.starts_with("~/") {
+        let expanded = if let Some(suffix) = key_path.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {
-                format!("{}/{}", home, &key_path[2..])
+                format!("{}/{}", home, suffix)
             } else {
                 key_path.clone()
             }
@@ -1140,14 +1140,16 @@ fn run_doctor(
             inv.workers.iter().collect()
         };
 
-        if workers_to_check.is_empty() && worker_filter.is_some() {
-            checks.push(DoctorCheck {
-                category: "worker".to_string(),
-                name: format!("Worker '{}'", worker_filter.as_ref().unwrap()),
-                status: CheckStatus::Fail,
-                message: "Worker not found in inventory".to_string(),
-                details: None,
-            });
+        if workers_to_check.is_empty() {
+            if let Some(filter) = &worker_filter {
+                checks.push(DoctorCheck {
+                    category: "worker".to_string(),
+                    name: format!("Worker '{}'", filter),
+                    status: CheckStatus::Fail,
+                    message: "Worker not found in inventory".to_string(),
+                    details: None,
+                });
+            }
         }
 
         for worker in workers_to_check {
@@ -1242,7 +1244,7 @@ fn run_doctor(
     }
 }
 
-fn check_repo_config(path: &PathBuf, checks: &mut Vec<DoctorCheck>) -> Option<RepoConfig> {
+fn check_repo_config(path: &Path, checks: &mut Vec<DoctorCheck>) -> Option<RepoConfig> {
     if !path.exists() {
         checks.push(DoctorCheck {
             category: "config".to_string(),
@@ -1382,9 +1384,9 @@ fn check_worker_reachability(
     ];
 
     if let Some(ref key_path) = worker.ssh_key_path {
-        let expanded = if key_path.starts_with("~/") {
+        let expanded = if let Some(suffix) = key_path.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {
-                format!("{}/{}", home, &key_path[2..])
+                format!("{}/{}", home, suffix)
             } else {
                 key_path.clone()
             }
@@ -1703,9 +1705,9 @@ fn run_fetch(
     ];
 
     if let Some(ref key_path) = worker.ssh_key_path {
-        let expanded = if key_path.starts_with("~/") {
+        let expanded = if let Some(suffix) = key_path.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {
-                format!("{}/{}", home, &key_path[2..])
+                format!("{}/{}", home, suffix)
             } else {
                 key_path.clone()
             }

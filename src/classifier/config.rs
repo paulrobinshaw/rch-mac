@@ -50,6 +50,7 @@ pub struct BundleConfig {
 
 /// Repository configuration from .rch/xcode.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct RepoConfig {
     /// Workspace path (e.g., "MyApp.xcworkspace")
     /// Mutually exclusive with project
@@ -83,19 +84,6 @@ pub struct RepoConfig {
     pub bundle: BundleConfig,
 }
 
-impl Default for RepoConfig {
-    fn default() -> Self {
-        Self {
-            workspace: None,
-            project: None,
-            schemes: vec![],
-            destinations: vec![],
-            configurations: vec![],
-            verify: vec![],
-            bundle: BundleConfig::default(),
-        }
-    }
-}
 
 impl RepoConfig {
     /// Load and parse config from a TOML file

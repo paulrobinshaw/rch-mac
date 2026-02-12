@@ -78,7 +78,7 @@ pub fn check_resumption_state(run_dir: &Path) -> Result<ResumptionState, RunErro
     }
 
     let plan_json = fs::read_to_string(&plan_path)
-        .map_err(|e| RunError::Io(e))?;
+        .map_err(RunError::Io)?;
 
     let plan: RunPlan = serde_json::from_str(&plan_json)
         .map_err(|e| RunError::Serialization(e.to_string()))?;

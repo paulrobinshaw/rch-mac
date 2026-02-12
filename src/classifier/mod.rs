@@ -230,7 +230,7 @@ impl Classifier {
 
         // Collect and sort flags
         let mut sorted_flags: Vec<_> = parsed.flags.iter().collect();
-        sorted_flags.sort_by(|(a, _), (b, _)| a.cmp(b));
+        sorted_flags.sort_by_key(|(a, _)| *a);
 
         for (flag, value) in sorted_flags {
             result.push(flag.clone());

@@ -84,6 +84,7 @@ impl Default for MockCapabilities {
 
 impl MockCapabilities {
     /// Set the maximum upload size in bytes (0 = no limit)
+    #[allow(dead_code)] // Builder API for test configuration
     pub fn with_max_upload_bytes(mut self, bytes: u64) -> Self {
         self.max_upload_bytes = bytes;
         self

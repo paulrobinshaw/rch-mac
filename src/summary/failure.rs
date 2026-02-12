@@ -142,8 +142,10 @@ impl FailureSubkind {
 /// Stable exit codes per PLAN.md normative spec
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(i32)]
+#[derive(Default)]
 pub enum ExitCode {
     /// Successful execution
+    #[default]
     Success = 0,
     /// Classifier rejected the command
     ClassifierRejected = 10,
@@ -203,11 +205,6 @@ impl ExitCode {
     }
 }
 
-impl Default for ExitCode {
-    fn default() -> Self {
-        ExitCode::Success
-    }
-}
 
 /// Helper for aggregating exit codes across multiple steps
 pub struct ExitCodeAggregator {

@@ -28,18 +28,15 @@ pub enum DestinationError {
 /// Provisioning mode for simulators
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Provisioning {
     /// Use an existing simulator
+    #[default]
     Existing,
     /// Create an ephemeral simulator for the job
     Ephemeral,
 }
 
-impl Default for Provisioning {
-    fn default() -> Self {
-        Provisioning::Existing
-    }
-}
 
 /// Parsed destination constraint from config
 #[derive(Debug, Clone)]

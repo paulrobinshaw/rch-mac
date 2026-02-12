@@ -435,7 +435,7 @@ impl Pipeline {
     /// Write run_plan.json
     fn write_run_plan(&self, run_dir: &Path) -> PipelineResult<()> {
         let run_plan = self.run_plan.as_ref()
-            .ok_or_else(|| PipelineError::Run(crate::run::RunError::NoActions))?;
+            .ok_or(PipelineError::Run(crate::run::RunError::NoActions))?;
 
         let json = serde_json::to_string_pretty(run_plan)?;
         let path = run_dir.join("run_plan.json");
@@ -479,7 +479,7 @@ impl Pipeline {
 
         // Get run_id from the plan
         let run_plan = self.run_plan.as_ref()
-            .ok_or_else(|| PipelineError::Run(crate::run::RunError::NoActions))?;
+            .ok_or(PipelineError::Run(crate::run::RunError::NoActions))?;
 
         // Create bundle (will fail with SizeExceeded if over limit)
         let result = bundler.create_bundle(&run_plan.run_id)?;
@@ -510,7 +510,7 @@ impl Pipeline {
     /// Connect to worker
     fn connect_to_worker(&mut self) -> PipelineResult<()> {
         let selection = self.worker_selection.as_ref()
-            .ok_or_else(|| PipelineError::NoWorkers)?;
+            .ok_or(PipelineError::NoWorkers)?;
 
         // Load inventory to get full worker details
         let inventory = match &self.config.inventory_path {
@@ -519,7 +519,7 @@ impl Pipeline {
         }.map_err(|_e| PipelineError::NoWorkers)?;
 
         let worker = inventory.get(&selection.selected_worker)
-            .ok_or_else(|| PipelineError::NoWorkers)?;
+            .ok_or(PipelineError::NoWorkers)?;
 
         // Create SSH transport
         let ssh_config = SshConfig {
@@ -546,7 +546,7 @@ impl Pipeline {
     /// Execute the run
     fn execute_run(&mut self, run_dir: &Path, start_time: Instant) -> PipelineResult<RunSummary> {
         let run_plan = self.run_plan.take()
-            .ok_or_else(|| PipelineError::Run(crate::run::RunError::NoActions))?;
+            .ok_or(PipelineError::Run(crate::run::RunError::NoActions))?;
         let source_sha256 = self.source_sha256.as_ref()
             .ok_or_else(|| PipelineError::Bundling(BundleError::IoError(
                 std::io::Error::new(std::io::ErrorKind::NotFound, "No source bundle")
@@ -711,7 +711,7 @@ impl Pipeline {
 
         // Stream logs while job runs
         let capabilities = self.capabilities.as_ref();
-        let has_tail = capabilities.map(|c| has_tail_feature(c)).unwrap_or(false);
+        let has_tail = capabilities.map(has_tail_feature).unwrap_or(false);
 
         let streamer_config = LogStreamerConfig {
             poll_interval: self.config.tail_poll_interval,

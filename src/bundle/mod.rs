@@ -27,18 +27,15 @@ pub const SCHEMA_ID: &str = "rch-xcode/source_manifest@1";
 
 /// Bundle mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum BundleMode {
     /// Include tracked and untracked files (minus excludes)
+    #[default]
     Worktree,
     /// Only git-index tracked files
     GitIndex,
 }
 
-impl Default for BundleMode {
-    fn default() -> Self {
-        BundleMode::Worktree
-    }
-}
 
 /// Errors for bundling operations
 #[derive(Debug, thiserror::Error)]
