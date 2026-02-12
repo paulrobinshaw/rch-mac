@@ -1032,8 +1032,12 @@ fn test_payload_too_large_rejection() {
         1,
         json!({
             "source_sha256": "sha-large-test",
-            "content_length": 5000,  // Exceeds 1000 byte limit
-            "content": "base64-content",
+            "stream": {
+                "content_length": 5000,  // Exceeds 1000 byte limit
+                "content_sha256": "deadbeef",
+                "compression": "none",
+                "format": "tar"
+            }
         }),
     );
 
@@ -1064,8 +1068,12 @@ fn test_payload_within_limit_succeeds() {
         1,
         json!({
             "source_sha256": "sha-ok-test",
-            "content_length": 1000,  // Within 5000 byte limit
-            "content": "base64-content",
+            "stream": {
+                "content_length": 1000,  // Within 5000 byte limit
+                "content_sha256": "deadbeef",
+                "compression": "none",
+                "format": "tar"
+            }
         }),
     );
 
@@ -1088,8 +1096,12 @@ fn test_no_upload_limit_when_zero() {
         1,
         json!({
             "source_sha256": "sha-nolimit-test",
-            "content_length": 1_000_000_000,  // 1 GB
-            "content": "base64-content",
+            "stream": {
+                "content_length": 1_000_000_000,  // 1 GB
+                "content_sha256": "deadbeef",
+                "compression": "none",
+                "format": "tar"
+            }
         }),
     );
 
