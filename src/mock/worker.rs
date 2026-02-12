@@ -14,6 +14,15 @@ use crate::worker::rpc::WorkerConfig;
 use super::failure::{FailureConfig, FailureInjector};
 use super::state::{Job, JobState, Lease, MockState};
 
+/// Upload session for tracking resumable uploads
+#[derive(Debug, Clone)]
+pub struct MockUploadSession {
+    pub upload_id: String,
+    pub source_sha256: String,
+    pub content_length: u64,
+    pub received_bytes: Vec<u8>,
+}
+
 /// Configurable mock worker for testing
 pub struct MockWorker {
     /// Worker configuration
@@ -28,6 +37,8 @@ pub struct MockWorker {
     job_progressions: Arc<Mutex<HashMap<String, Vec<JobState>>>>,
     /// Jobs held in a state (won't advance until released)
     held_jobs: Arc<Mutex<HashMap<String, JobState>>>,
+    /// Upload sessions for resumable uploads
+    upload_sessions: Arc<Mutex<HashMap<String, MockUploadSession>>>,
 }
 
 /// Configurable capabilities for the mock worker
@@ -94,6 +105,7 @@ impl MockWorker {
             capabilities: Arc::new(Mutex::new(MockCapabilities::default())),
             job_progressions: Arc::new(Mutex::new(HashMap::new())),
             held_jobs: Arc::new(Mutex::new(HashMap::new())),
+            upload_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -683,6 +695,7 @@ impl MockWorker {
     fn handle_upload_source(&self, request: &RpcRequest) -> RpcResponse {
         let mut state = self.state.lock().unwrap();
         let caps = self.capabilities.lock().unwrap();
+        let mut sessions = self.upload_sessions.lock().unwrap();
 
         let source_sha256 = match request.payload.get("source_sha256").and_then(|v| v.as_str()) {
             Some(sha) => sha.to_string(),
@@ -693,8 +706,9 @@ impl MockWorker {
             ),
         };
 
-        // Get content_length from payload (for size checking)
-        let content_length = request.payload.get("content_length")
+        // Get content_length from stream metadata
+        let content_length = request.payload.get("stream")
+            .and_then(|s| s.get("content_length"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
@@ -709,23 +723,70 @@ impl MockWorker {
             );
         }
 
+        // Check for resumable upload
+        let (upload_id, offset) = if let Some(resume) = request.payload.get("resume") {
+            let id = resume.get("upload_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let off = resume.get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            (id, off)
+        } else {
+            // Generate new upload_id
+            let id = format!("upload-{}", state.next_id("upload"));
+            (id, 0)
+        };
+
+        // Get or create upload session
+        let session = sessions.entry(upload_id.clone()).or_insert_with(|| {
+            MockUploadSession {
+                upload_id: upload_id.clone(),
+                source_sha256: source_sha256.clone(),
+                content_length,
+                received_bytes: Vec::with_capacity(content_length as usize),
+            }
+        });
+
         // In a real implementation, this would read the binary-framed stream
-        // For the mock, we just store a placeholder
+        // For the mock, we simulate receiving content
         let content = request.payload.get("content")
             .and_then(|v| v.as_str())
             .map(|s| s.as_bytes().to_vec())
-            .unwrap_or_else(|| vec![0u8; 100]); // Placeholder content
+            .unwrap_or_else(|| vec![0u8; (content_length - offset) as usize]);
 
-        state.store_source(source_sha256.clone(), content);
+        // Append content from offset
+        if offset as usize == session.received_bytes.len() {
+            session.received_bytes.extend_from_slice(&content);
+        }
+
+        let next_offset = session.received_bytes.len() as u64;
+        let complete = next_offset >= content_length;
+
+        // If complete, store the source
+        if complete {
+            state.store_source(source_sha256.clone(), session.received_bytes.clone());
+            sessions.remove(&upload_id);
+        }
 
         RpcResponse::success(
             request.protocol_version,
             request.request_id.clone(),
             json!({
                 "source_sha256": source_sha256,
-                "stored": true,
+                "upload_id": upload_id,
+                "next_offset": next_offset,
+                "complete": complete,
+                "stored": complete,
             }),
         )
+    }
+
+    /// Get an upload session (for testing)
+    pub fn get_upload_session(&self, upload_id: &str) -> Option<MockUploadSession> {
+        let sessions = self.upload_sessions.lock().unwrap();
+        sessions.get(upload_id).cloned()
     }
 }
 

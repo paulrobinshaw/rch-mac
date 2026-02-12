@@ -349,30 +349,72 @@ impl RpcClient {
 
     /// Upload a source bundle to the worker
     pub fn upload_source(&self, source_sha256: &str, content: &[u8]) -> RpcResult<()> {
+        self.upload_source_resumable(source_sha256, content, None)
+            .map(|_| ())
+    }
+
+    /// Upload a source bundle to the worker with optional resume support
+    ///
+    /// If the worker supports `upload_resumable` feature and a resume request is provided,
+    /// the upload will resume from the specified offset.
+    pub fn upload_source_resumable(
+        &self,
+        source_sha256: &str,
+        content: &[u8],
+        resume: Option<super::resumable::ResumeRequest>,
+    ) -> RpcResult<UploadSourceResponse> {
         let version = self.get_protocol_version()?;
+
+        let mut payload = json!({
+            "source_sha256": source_sha256,
+            "stream": {
+                "content_length": content.len(),
+                "content_sha256": format!("sha256-{}", source_sha256),
+                "compression": "none",
+                "format": "tar"
+            }
+        });
+
+        // Add resume info if provided
+        let (upload_content, offset) = if let Some(ref r) = resume {
+            payload["resume"] = json!({
+                "upload_id": r.upload_id,
+                "offset": r.offset
+            });
+            // Only send content from the offset onwards
+            let start = r.offset as usize;
+            if start >= content.len() {
+                // Already complete
+                return Ok(UploadSourceResponse {
+                    upload_id: Some(r.upload_id.clone()),
+                    next_offset: content.len() as u64,
+                    complete: true,
+                });
+            }
+            (&content[start..], r.offset)
+        } else {
+            (content, 0)
+        };
 
         let request = RpcRequest {
             protocol_version: version,
             op: Operation::UploadSource,
             request_id: self.next_request_id(),
-            payload: json!({
-                "source_sha256": source_sha256,
-                "stream": {
-                    "content_length": content.len(),
-                    "content_sha256": format!("sha256-{}", source_sha256), // Placeholder
-                    "compression": "none",
-                    "format": "tar"
-                }
-            }),
+            payload,
         };
 
         // Retry upload on transient failures
         let mut retries = 0;
         loop {
-            match self.transport.execute_framed(&request, content) {
+            match self.transport.execute_framed(&request, upload_content) {
                 Ok(response) => {
                     if response.ok {
-                        return Ok(());
+                        let payload = response.payload.unwrap_or(json!({}));
+                        return Ok(UploadSourceResponse {
+                            upload_id: payload.get("upload_id").and_then(|v| v.as_str()).map(String::from),
+                            next_offset: payload.get("next_offset").and_then(|v| v.as_u64()).unwrap_or(offset + upload_content.len() as u64),
+                            complete: payload.get("complete").and_then(|v| v.as_bool()).unwrap_or(true),
+                        });
                     }
                     let error = response.error.unwrap_or_else(|| {
                         RpcErrorPayload::new("UNKNOWN", "Upload failed")
@@ -677,6 +719,17 @@ pub struct FetchResponse {
     pub job_id: String,
     pub content: Option<Vec<u8>>,
     pub stream_metadata: Option<Value>,
+}
+
+/// Upload source response (for resumable uploads)
+#[derive(Debug, Clone)]
+pub struct UploadSourceResponse {
+    /// Upload session ID (for resumable uploads)
+    pub upload_id: Option<String>,
+    /// Next offset to resume from
+    pub next_offset: u64,
+    /// Whether upload is complete
+    pub complete: bool,
 }
 
 /// Cancel reason

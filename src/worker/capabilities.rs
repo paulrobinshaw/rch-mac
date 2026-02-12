@@ -210,6 +210,7 @@ pub mod features {
     pub const EVENTS: &str = "events";
     pub const HAS_SOURCE: &str = "has_source";
     pub const UPLOAD_SOURCE: &str = "upload_source";
+    pub const UPLOAD_RESUMABLE: &str = "upload_resumable";
     pub const ATTESTATION_SIGNING: &str = "attestation_signing";
     pub const CANCEL: &str = "cancel";
 }

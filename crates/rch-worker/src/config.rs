@@ -26,6 +26,7 @@ impl Default for WorkerConfig {
                 "probe".to_string(),
                 "has_source".to_string(),
                 "upload_source".to_string(),
+                "upload_resumable".to_string(), // M7: Resumable uploads
                 "tail".to_string(),
                 "lease".to_string(), // M6: Worker leases (reserve/release)
             ],

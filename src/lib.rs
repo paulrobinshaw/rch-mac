@@ -43,7 +43,11 @@ pub use bundle::{
     BundleError, BundleMode, BundleResult, Bundler, EntryType, ExcludeError, ExcludeRules,
     ManifestEntry, SourceManifest,
 };
-pub use host::{RpcClient, RpcClientConfig, RpcResult, RpcError as HostRpcError, Transport, MockTransport, SshTransport};
+pub use host::{
+    generate_upload_id, new_upload_store, ResumeRequest, ResumeResponse, RpcClient, RpcClientConfig,
+    RpcError as HostRpcError, RpcResult, SharedUploadStore, SshTransport, Transport, MockTransport,
+    UploadSession, UploadSessionStore,
+};
 pub use worker::RpcHandler;
 pub use artifact::{
     ArtifactEntry, ArtifactEntryType, ArtifactManifest, IntegrityError, ManifestError,

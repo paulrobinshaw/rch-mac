@@ -15,7 +15,7 @@ pub use submit::{SubmitRequest, SubmitResponse, JobSpec, JobState};
 pub use status::{StatusRequest, StatusResponse};
 pub use tail::{TailRequest, TailResponse};
 pub use cancel::{CancelRequest, CancelResponse};
-pub use source::{HasSourceRequest, HasSourceResponse, UploadSourceRequest, UploadSourceResponse, UploadStream};
+pub use source::{HasSourceRequest, HasSourceResponse, UploadSourceRequest, UploadSourceResponse, UploadStream, ResumeInfo};
 pub use fetch::{FetchRequest, FetchResponseHeader, FetchStream};
 
 /// Known operation names.
