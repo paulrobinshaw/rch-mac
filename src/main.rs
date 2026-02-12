@@ -162,6 +162,32 @@ enum Commands {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
+
+    /// Fetch remote artifacts from a worker
+    Fetch {
+        /// Job ID to fetch artifacts for
+        job_id: String,
+
+        /// Worker to fetch from (required if not cached in run state)
+        #[arg(long, short = 'w')]
+        worker: Option<String>,
+
+        /// Path to workers inventory file
+        #[arg(long, short = 'i')]
+        inventory: Option<PathBuf>,
+
+        /// Output directory for fetched artifacts (default: .rch/artifacts)
+        #[arg(long, short = 'o', default_value = ".rch/artifacts")]
+        output: PathBuf,
+
+        /// Verify manifest integrity after fetch
+        #[arg(long, default_value = "true")]
+        verify: bool,
+
+        /// Verbose output
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -274,6 +300,16 @@ fn main() {
             verbose,
         } => {
             run_doctor(config, inventory, worker, json, verbose);
+        }
+        Commands::Fetch {
+            job_id,
+            worker,
+            inventory,
+            output,
+            verify,
+            verbose,
+        } => {
+            run_fetch(&job_id, worker, inventory, output, verify, verbose);
         }
     }
 }
@@ -1592,5 +1628,323 @@ fn check_destinations(cfg: &RepoConfig, checks: &mut Vec<DoctorCheck>) {
                 "destinations": cfg.destinations,
             })),
         });
+    }
+}
+
+// === Fetch command implementation ===
+
+fn run_fetch(
+    job_id: &str,
+    worker_name: Option<String>,
+    inventory_path: Option<PathBuf>,
+    output_dir: PathBuf,
+    verify: bool,
+    verbose: bool,
+) {
+    use sha2::{Sha256, Digest};
+    use std::io::Read;
+
+    // Load inventory
+    let inventory = match inventory_path {
+        Some(ref path) => WorkerInventory::load(path),
+        None => WorkerInventory::load_default(),
+    };
+
+    let inventory = match inventory {
+        Ok(inv) => inv,
+        Err(e) => {
+            eprintln!("Error loading worker inventory: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Determine which worker to use
+    let worker_name = match worker_name {
+        Some(name) => name,
+        None => {
+            // Try to find worker from cached run state
+            // For now, require explicit worker specification
+            eprintln!("Error: Worker must be specified with --worker <name>");
+            eprintln!("Available workers: {}",
+                inventory.workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", "));
+            process::exit(1);
+        }
+    };
+
+    let worker = match inventory.get(&worker_name) {
+        Some(w) => w,
+        None => {
+            eprintln!("Worker '{}' not found in inventory.", worker_name);
+            eprintln!(
+                "Available workers: {}",
+                inventory
+                    .workers
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            process::exit(1);
+        }
+    };
+
+    if verbose {
+        eprintln!("Fetching artifacts for job '{}' from worker '{}'...", job_id, worker_name);
+    }
+
+    // Build SSH command
+    let mut ssh_args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=30".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+
+    if let Some(ref key_path) = worker.ssh_key_path {
+        let expanded = if key_path.starts_with("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                format!("{}/{}", home, &key_path[2..])
+            } else {
+                key_path.clone()
+            }
+        } else {
+            key_path.clone()
+        };
+        ssh_args.push("-i".to_string());
+        ssh_args.push(expanded);
+    }
+
+    if worker.port != 22 {
+        ssh_args.push("-p".to_string());
+        ssh_args.push(worker.port.to_string());
+    }
+
+    ssh_args.push(format!("{}@{}", worker.user, worker.host));
+
+    // Send fetch request
+    let fetch_request = RpcRequest {
+        protocol_version: 1,
+        request_id: format!("fetch-{}", uuid_simple()),
+        op: rch_xcode_lane::Operation::Fetch,
+        payload: serde_json::json!({
+            "job_id": job_id,
+        }),
+    };
+
+    let request_json = match serde_json::to_string(&fetch_request) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("Error serializing fetch request: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let mut child = match Command::new("ssh")
+        .args(&ssh_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to spawn SSH process: {}", e);
+            process::exit(20);
+        }
+    };
+
+    if let Some(ref mut stdin) = child.stdin {
+        if let Err(e) = writeln!(stdin, "{}", request_json) {
+            eprintln!("Failed to write to SSH stdin: {}", e);
+            process::exit(20);
+        }
+    }
+    drop(child.stdin.take());
+
+    // Read JSON header line
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = BufReader::new(stdout);
+    let mut response_line = String::new();
+
+    match reader.read_line(&mut response_line) {
+        Ok(0) => {
+            eprintln!("No response from worker");
+            if let Some(mut stderr) = child.stderr.take() {
+                let mut err_output = String::new();
+                if std::io::Read::read_to_string(&mut stderr, &mut err_output).is_ok()
+                    && !err_output.is_empty()
+                {
+                    eprintln!("SSH stderr: {}", err_output.trim());
+                }
+            }
+            process::exit(20);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Failed to read from SSH stdout: {}", e);
+            process::exit(20);
+        }
+    }
+
+    // Parse response header
+    let response: serde_json::Value = match serde_json::from_str(&response_line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse fetch response: {}", e);
+            eprintln!("Raw response: {}", response_line);
+            process::exit(1);
+        }
+    };
+
+    // Check for error
+    if !response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let error_msg = response
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error");
+        eprintln!("Fetch failed: {}", error_msg);
+        process::exit(1);
+    }
+
+    // Get stream info from payload
+    let payload = match response.get("payload") {
+        Some(p) => p,
+        None => {
+            eprintln!("Fetch response missing payload");
+            process::exit(1);
+        }
+    };
+
+    let content_length = payload
+        .get("stream")
+        .and_then(|s| s.get("content_length"))
+        .and_then(|l| l.as_u64())
+        .unwrap_or(0);
+
+    let expected_sha256 = payload
+        .get("stream")
+        .and_then(|s| s.get("content_sha256"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+
+    if verbose {
+        eprintln!("Receiving {} bytes...", content_length);
+    }
+
+    // Create output directory
+    let job_output_dir = output_dir.join(job_id);
+    if let Err(e) = std::fs::create_dir_all(&job_output_dir) {
+        eprintln!("Failed to create output directory: {}", e);
+        process::exit(1);
+    }
+
+    // Read binary content
+    let mut buffer = Vec::with_capacity(content_length as usize);
+    let mut hasher = Sha256::new();
+    let mut total_read = 0u64;
+
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buffer.extend_from_slice(&chunk[..n]);
+                hasher.update(&chunk[..n]);
+                total_read += n as u64;
+
+                if verbose && total_read % (1024 * 1024) == 0 {
+                    eprintln!("  {} MB received...", total_read / (1024 * 1024));
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read artifact data: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    let _ = child.wait();
+
+    // Verify checksum
+    if verify {
+        if let Some(ref expected) = expected_sha256 {
+            let actual = format!("{:x}", hasher.finalize());
+            if actual != *expected {
+                eprintln!("Checksum mismatch!");
+                eprintln!("  Expected: {}", expected);
+                eprintln!("  Actual:   {}", actual);
+                process::exit(1);
+            }
+            if verbose {
+                eprintln!("Checksum verified: {}", actual);
+            }
+        }
+    }
+
+    // Write to temp file and extract tar
+    let temp_tar = job_output_dir.join(".fetch.tar.tmp");
+    if let Err(e) = std::fs::write(&temp_tar, &buffer) {
+        eprintln!("Failed to write temporary tar file: {}", e);
+        process::exit(1);
+    }
+
+    // Extract tar archive
+    if verbose {
+        eprintln!("Extracting artifacts to {}...", job_output_dir.display());
+    }
+
+    let tar_status = Command::new("tar")
+        .args(["-xf", temp_tar.to_str().unwrap()])
+        .current_dir(&job_output_dir)
+        .status();
+
+    match tar_status {
+        Ok(status) if status.success() => {
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_tar);
+
+            if verify {
+                // Verify manifest integrity
+                let manifest_path = job_output_dir.join("manifest.json");
+                if manifest_path.exists() {
+                    match rch_xcode_lane::artifact::verify_artifacts(&job_output_dir) {
+                        Ok(_) => {
+                            if verbose {
+                                eprintln!("Manifest integrity verified.");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Manifest verification failed: {}", e);
+                        }
+                    }
+                }
+            }
+
+            println!("Artifacts fetched to: {}", job_output_dir.display());
+
+            // List files
+            if let Ok(entries) = std::fs::read_dir(&job_output_dir) {
+                let files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                if !files.is_empty() {
+                    println!("  Files: {}", files.join(", "));
+                }
+            }
+        }
+        Ok(status) => {
+            let _ = std::fs::remove_file(&temp_tar);
+            eprintln!("Failed to extract tar archive (exit code: {})", status);
+            process::exit(1);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_tar);
+            eprintln!("Failed to run tar command: {}", e);
+            process::exit(1);
+        }
     }
 }
