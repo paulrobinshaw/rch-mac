@@ -21,6 +21,7 @@ mod gc;
 mod indices;
 mod manifest;
 pub mod schema;
+pub mod signing;
 mod verify;
 
 pub use attestation::{
@@ -44,3 +45,9 @@ pub use schema::{
     SchemaError, SchemaId,
 };
 pub use gc::{ArtifactGc, ArtifactGcResult, ArtifactStats, RetentionPolicy};
+pub use signing::{
+    compute_key_fingerprint, decode_signing_key, decode_verifying_key, encode_signing_key,
+    encode_verifying_key, generate_keypair, AttestationVerification, SignedAttestation,
+    SigningError, SigningResult, VerificationResult as SignatureVerificationResult,
+    SIGNATURE_ALGORITHM, VERIFICATION_SCHEMA_ID, VERIFICATION_SCHEMA_VERSION,
+};

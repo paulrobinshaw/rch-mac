@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/attestation_verification@1",
+  "title": "Attestation Verification",
+  "description": "Result of verifying a signed attestation (host-side).",
+  "type": "object",
+  "required": ["schema_version", "schema_id", "created_at", "run_id", "job_id", "verification_result", "pubkey_fingerprint", "signature_algorithm"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version number"
+    },
+    "schema_id": {
+      "type": "string",
+      "const": "rch-xcode/attestation_verification@1",
+      "description": "Schema identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp when verification was performed"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "verification_result": {
+      "type": "string",
+      "enum": ["pass", "fail"],
+      "description": "Verification result"
+    },
+    "pubkey_fingerprint": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 fingerprint of the signing public key"
+    },
+    "pinned_fingerprint": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Pinned fingerprint from worker inventory (if configured)"
+    },
+    "signature_algorithm": {
+      "type": "string",
+      "const": "Ed25519",
+      "description": "Signature algorithm used"
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Error message if verification failed"
+    }
+  }
+}

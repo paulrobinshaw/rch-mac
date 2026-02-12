@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rch-xcode/signed_attestation@1",
+  "title": "Signed Attestation",
+  "description": "Attestation with Ed25519 signature for cryptographic verification.",
+  "type": "object",
+  "required": ["attestation", "signature", "signature_algorithm", "pubkey_fingerprint"],
+  "properties": {
+    "attestation": {
+      "$ref": "attestation.schema.json",
+      "description": "The attestation content being signed"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Base64-encoded Ed25519 signature over canonical attestation JSON"
+    },
+    "signature_algorithm": {
+      "type": "string",
+      "const": "Ed25519",
+      "description": "Signature algorithm identifier"
+    },
+    "pubkey_fingerprint": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 fingerprint of the signing public key"
+    }
+  }
+}
