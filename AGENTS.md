@@ -87,3 +87,19 @@ If README.md conflicts with PLAN.md, PLAN.md wins.
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+
+## Keep Moving (Between Beads)
+
+When you finish a bead, DO NOT STOP. Immediately:
+
+1. Reread AGENTS.md so it is fresh in your mind
+2. Use `bv --robot-triage` or `bv --robot-next` to find the most impactful bead to work on next
+3. Mark the bead as in-progress with `bd start <bead-id>`
+4. Start coding on it immediately
+5. Communicate what you are working on to fellow agents via Agent Mail
+6. When done, do a self-review pass: carefully read all new code and modified code, fix anything you find
+7. Commit, push, mark bead closed, then GO BACK TO STEP 1
+
+Do NOT get stuck in "communication purgatory" where nothing gets done. Be proactive. If you are not sure what to do next, use bv to prioritise and pick the next bead you can usefully work on.
+
+After context compaction: reread AGENTS.md immediately so your tools and workflow knowledge is restored.
