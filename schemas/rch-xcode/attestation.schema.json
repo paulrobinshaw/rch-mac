@@ -4,7 +4,7 @@
   "title": "Attestation",
   "description": "Cryptographic binding of job execution to artifacts.",
   "type": "object",
-  "required": ["schema_version", "schema_id", "created_at", "job_id", "run_id", "manifest_sha256", "worker", "backend"],
+  "required": ["schema_version", "schema_id", "created_at", "job_id", "job_key", "run_id", "source_sha256", "manifest_sha256", "worker", "capabilities_digest", "backend"],
   "properties": {
     "schema_version": {
       "type": "integer",
@@ -21,38 +21,47 @@
       "format": "date-time",
       "description": "RFC3339 timestamp"
     },
-    "job_id": {
-      "type": "string",
-      "description": "Unique job identifier"
-    },
     "run_id": {
       "type": "string",
       "description": "Unique run identifier"
     },
-    "manifest_sha256": {
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "job_key": {
+      "type": "string",
+      "description": "Deterministic job key for caching"
+    },
+    "source_sha256": {
       "type": "string",
       "pattern": "^[a-f0-9]{64}$",
-      "description": "SHA256 hash of manifest.json"
+      "description": "SHA256 hash of source bundle"
     },
     "worker": {
       "type": "object",
-      "required": ["hostname", "worker_id"],
+      "required": ["name", "fingerprint"],
       "properties": {
-        "hostname": {
+        "name": {
           "type": "string",
-          "description": "Worker hostname"
+          "description": "Worker name (e.g., macmini-01)"
         },
-        "worker_id": {
+        "fingerprint": {
           "type": "string",
-          "description": "Worker identifier"
+          "description": "Stable worker fingerprint (e.g., SSH host key fingerprint)"
         }
       }
     },
+    "capabilities_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 hash of capabilities.json content"
+    },
     "backend": {
       "type": "object",
-      "required": ["type", "version"],
+      "required": ["name", "version"],
       "properties": {
-        "type": {
+        "name": {
           "type": "string",
           "enum": ["xcodebuild", "mcp"],
           "description": "Build backend type"
@@ -63,9 +72,19 @@
         }
       }
     },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA256 hash of manifest.json"
+    },
     "signature": {
       "type": "string",
-      "description": "Optional Ed25519 signature (base64)"
+      "description": "Base64-encoded Ed25519 signature (present when signing is enabled)"
+    },
+    "pubkey_fingerprint": {
+      "type": "string",
+      "pattern": "^SHA256:[a-f0-9]{64}$",
+      "description": "SHA256 fingerprint of signing public key (present when signing is enabled)"
     }
   }
 }
