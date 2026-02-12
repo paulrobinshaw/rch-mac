@@ -11,7 +11,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -116,7 +115,7 @@ impl ArtifactCommitter {
     }
 
     /// Check available disk space
-    pub fn check_disk_space(&self, path: &Path) -> ArtifactCommitResult<()> {
+    pub fn check_disk_space(&self, _path: &Path) -> ArtifactCommitResult<()> {
         // Use statfs to check available space
         #[cfg(target_os = "macos")]
         {

@@ -11,7 +11,6 @@
 //! The pipeline supports both multi-step verify (build + test) and
 //! single-step run (--action build/test).
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -19,26 +18,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::artifact::verify_artifacts;
 use crate::bundle::{Bundler, BundleMode, BundleError, BundleResult, SourceManifest};
-use crate::classifier::{Classifier, ClassifierConfig, ClassifierResult, RepoConfig};
-use crate::config::{EffectiveConfig, ConfigSource};
-use crate::destination::{resolve_destination, DestinationConstraint, ResolvedDestination};
-use crate::host::rpc::{RpcClient, RpcClientConfig, RpcError, TailResponse, CancelReason};
-use crate::host::transport::{SshConfig, SshTransport, Transport, TransportError};
+use crate::classifier::{Classifier, RepoConfig};
+use crate::host::rpc::{RpcClient, RpcError, CancelReason};
+use crate::host::transport::{SshConfig, SshTransport, TransportError};
 use crate::inventory::WorkerInventory;
-use crate::job::{Action, JobSpec, JobSpecBuilder, JobKeyInputs, JobKeyToolchain, JobKeyDestination};
+use crate::job::Action;
 use crate::run::{RunPlan, RunPlanBuilder, RunExecution, PlanStep, StepResult, ExecutionState};
-use crate::run::streaming::{LogStreamer, LogStreamerConfig, StreamMode, has_tail_feature, is_terminal_state};
-use crate::selection::{select_worker, SelectionConstraints, WorkerSelection, SelectionError};
-use crate::signal::{SignalHandler, SignalAction, CancellationCoordinator};
-use crate::state::{RunState, RunStateData, JobState, JobStateData};
-use crate::summary::{Status, RunSummary, JobSummary, FailureKind, FailureSubkind, ExitCode};
-use crate::toolchain::{resolve_toolchain, ToolchainIdentity, XcodeConstraint};
-use crate::worker::Capabilities;
+use crate::run::streaming::{LogStreamer, LogStreamerConfig, has_tail_feature, is_terminal_state};
+use crate::selection::{WorkerSelection, SelectionError};
+use crate::state::{RunState, RunStateData};
+use crate::summary::{Status, RunSummary, JobSummary, FailureKind, FailureSubkind};
 
 /// Pipeline errors
 #[derive(Debug, Error)]
@@ -405,7 +398,7 @@ impl Pipeline {
         let inventory = match &self.config.inventory_path {
             Some(path) => WorkerInventory::load(path),
             None => WorkerInventory::load_default(),
-        }.map_err(|e| PipelineError::NoWorkers)?;
+        }.map_err(|_e| PipelineError::NoWorkers)?;
 
         // Filter by tags for Xcode
         let candidates: Vec<_> = inventory.filter_by_tags(&["macos", "xcode"]);
@@ -523,7 +516,7 @@ impl Pipeline {
         let inventory = match &self.config.inventory_path {
             Some(path) => WorkerInventory::load(path),
             None => WorkerInventory::load_default(),
-        }.map_err(|e| PipelineError::NoWorkers)?;
+        }.map_err(|_e| PipelineError::NoWorkers)?;
 
         let worker = inventory.get(&selection.selected_worker)
             .ok_or_else(|| PipelineError::NoWorkers)?;
@@ -793,7 +786,7 @@ impl Pipeline {
 
             // Not terminal - stream logs if supported
             if has_tail {
-                let (cursor, max_bytes, max_events) = streamer.tail_request_params();
+                let (cursor, max_bytes, _max_events) = streamer.tail_request_params();
                 let cursor_u64 = cursor.and_then(|c| c.parse().ok());
 
                 if let Ok(tail_response) = client.tail(&step.job_id, cursor_u64, max_bytes) {
@@ -808,7 +801,7 @@ impl Pipeline {
 
                     let next_cursor = tail_response.next_cursor.map(|c| c.to_string());
 
-                    let update = streamer.process_tail_response(next_cursor, log_chunk.clone(), vec![]);
+                    let _update = streamer.process_tail_response(next_cursor, log_chunk.clone(), vec![]);
 
                     // Print logs to stdout
                     if let Some(chunk) = log_chunk {

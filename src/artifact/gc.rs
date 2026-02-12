@@ -6,7 +6,6 @@
 //! - MUST NOT delete artifacts for RUNNING runs
 //! - Acquire filesystem lock before scanning/deleting
 
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

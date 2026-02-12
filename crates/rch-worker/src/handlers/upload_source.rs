@@ -44,6 +44,8 @@ pub fn handle(request: &RpcRequest, config: &WorkerConfig, state: &MockState) ->
     let response = UploadSourceResponse {
         accepted: true,
         source_sha256: req.source_sha256,
+        upload_id: None,    // Full upload completed, no resumption needed
+        next_offset: None,  // Full upload completed, no resumption needed
     };
 
     serde_json::to_value(response).map_err(|e| {

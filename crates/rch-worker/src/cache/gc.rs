@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use super::{CacheConfig, CacheError, CacheResult};
+use super::{CacheConfig, CacheResult};
 use super::lock::CacheLock;
 use super::result::ResultCacheEntry;
 

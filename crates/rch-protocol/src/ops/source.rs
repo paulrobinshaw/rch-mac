@@ -27,6 +27,19 @@ pub struct UploadSourceRequest {
     pub source_sha256: String,
     /// Stream metadata for the binary payload.
     pub stream: UploadStream,
+    /// Resume information for resumable uploads (M7 feature).
+    /// Only present when resuming an interrupted upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeInfo>,
+}
+
+/// Resume information for resumable uploads (M7 feature).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeInfo {
+    /// Upload ID from the previous partial upload response.
+    pub upload_id: String,
+    /// Byte offset to resume from.
+    pub offset: u64,
 }
 
 /// Stream metadata for upload_source.
@@ -51,4 +64,12 @@ pub struct UploadSourceResponse {
     pub accepted: bool,
     /// The source SHA-256 (echoed).
     pub source_sha256: String,
+    /// Upload ID for resumption if the upload was partial (M7 feature).
+    /// Present when worker supports resumable uploads and the transfer was interrupted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+    /// Byte offset for resumption (M7 feature).
+    /// Indicates how many bytes were successfully received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
 }
