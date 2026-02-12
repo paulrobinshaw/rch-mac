@@ -1032,14 +1032,565 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Run the doctor command (stub - to be implemented in rch-mac-b7s.8)
+// === Doctor command implementation ===
+
+#[derive(serde::Serialize)]
+struct DoctorReport {
+    checks: Vec<DoctorCheck>,
+    summary: DoctorSummary,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    category: String,
+    name: String,
+    status: CheckStatus,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CheckStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+}
+
+impl CheckStatus {
+    fn symbol(&self) -> &'static str {
+        match self {
+            CheckStatus::Pass => "✓",
+            CheckStatus::Warn => "⚠",
+            CheckStatus::Fail => "✗",
+            CheckStatus::Skip => "○",
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DoctorSummary {
+    total: usize,
+    passed: usize,
+    warnings: usize,
+    failed: usize,
+    skipped: usize,
+    healthy: bool,
+}
+
 fn run_doctor(
-    _config: Option<PathBuf>,
-    _inventory: Option<PathBuf>,
-    _worker: Option<String>,
-    _json: bool,
-    _verbose: bool,
+    config_path: Option<PathBuf>,
+    inventory_path: Option<PathBuf>,
+    worker_filter: Option<String>,
+    json_output: bool,
+    verbose: bool,
 ) {
-    eprintln!("rch xcode doctor: not yet implemented (see bead rch-mac-b7s.8)");
-    process::exit(1);
+    let mut checks = Vec::new();
+
+    // Check 1: Repo configuration
+    let repo_config_path = config_path.unwrap_or_else(|| PathBuf::from(".rch/xcode.toml"));
+    let repo_config = check_repo_config(&repo_config_path, &mut checks);
+
+    // Check 2: Worker inventory
+    let inventory = check_worker_inventory(&inventory_path, &mut checks);
+
+    // Check 3: Worker reachability and protocol compatibility
+    if let Some(ref inv) = inventory {
+        let workers_to_check: Vec<_> = if let Some(ref name) = worker_filter {
+            inv.workers.iter().filter(|w| w.name == *name).collect()
+        } else {
+            inv.workers.iter().collect()
+        };
+
+        if workers_to_check.is_empty() && worker_filter.is_some() {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}'", worker_filter.as_ref().unwrap()),
+                status: CheckStatus::Fail,
+                message: "Worker not found in inventory".to_string(),
+                details: None,
+            });
+        }
+
+        for worker in workers_to_check {
+            check_worker_reachability(worker, &mut checks);
+        }
+    }
+
+    // Check 4: Xcode toolchain (if we have workers and config)
+    if let (Some(ref _cfg), Some(ref inv)) = (&repo_config, &inventory) {
+        let workers: Vec<_> = if let Some(ref name) = worker_filter {
+            inv.workers.iter().filter(|w| w.name == *name).collect()
+        } else {
+            inv.workers.iter().take(1).collect()  // Just check first worker for Xcode
+        };
+
+        for worker in workers {
+            check_xcode_availability(worker, &mut checks);
+        }
+    }
+
+    // Check 5: Destination availability (if we have config)
+    if let Some(ref cfg) = repo_config {
+        check_destinations(cfg, &mut checks);
+    }
+
+    // Compute summary
+    let summary = DoctorSummary {
+        total: checks.len(),
+        passed: checks.iter().filter(|c| c.status == CheckStatus::Pass).count(),
+        warnings: checks.iter().filter(|c| c.status == CheckStatus::Warn).count(),
+        failed: checks.iter().filter(|c| c.status == CheckStatus::Fail).count(),
+        skipped: checks.iter().filter(|c| c.status == CheckStatus::Skip).count(),
+        healthy: checks.iter().all(|c| c.status != CheckStatus::Fail),
+    };
+
+    let report = DoctorReport { checks, summary };
+
+    // Output
+    if json_output {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing output: {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        println!("RCH Xcode Lane Doctor\n");
+
+        for check in &report.checks {
+            if !verbose && check.status == CheckStatus::Pass {
+                continue;
+            }
+            println!(
+                "{} [{}] {}: {}",
+                check.status.symbol(),
+                check.category,
+                check.name,
+                check.message
+            );
+            if verbose {
+                if let Some(ref details) = check.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(details) {
+                        for line in pretty.lines() {
+                            println!("    {}", line);
+                        }
+                    }
+                }
+            }
+        }
+
+        println!();
+        println!(
+            "Summary: {} passed, {} warnings, {} failed, {} skipped",
+            report.summary.passed,
+            report.summary.warnings,
+            report.summary.failed,
+            report.summary.skipped
+        );
+
+        if report.summary.healthy {
+            println!("\n✓ All critical checks passed.");
+        } else {
+            println!("\n✗ Some checks failed. Fix the issues above before running.");
+        }
+    }
+
+    if report.summary.healthy {
+        process::exit(0);
+    } else {
+        process::exit(1);
+    }
+}
+
+fn check_repo_config(path: &PathBuf, checks: &mut Vec<DoctorCheck>) -> Option<RepoConfig> {
+    if !path.exists() {
+        checks.push(DoctorCheck {
+            category: "config".to_string(),
+            name: "Repo config".to_string(),
+            status: CheckStatus::Warn,
+            message: format!("Config file not found: {}", path.display()),
+            details: None,
+        });
+        return None;
+    }
+
+    match RepoConfig::from_file(path) {
+        Ok(cfg) => {
+            checks.push(DoctorCheck {
+                category: "config".to_string(),
+                name: "Repo config".to_string(),
+                status: CheckStatus::Pass,
+                message: format!("Valid config at {}", path.display()),
+                details: Some(serde_json::json!({
+                    "workspace": cfg.workspace,
+                    "project": cfg.project,
+                    "schemes": cfg.schemes,
+                    "verify_actions": cfg.verify.len(),
+                })),
+            });
+
+            // Check for schemes
+            if cfg.schemes.is_empty() {
+                checks.push(DoctorCheck {
+                    category: "config".to_string(),
+                    name: "Schemes".to_string(),
+                    status: CheckStatus::Warn,
+                    message: "No schemes configured".to_string(),
+                    details: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    category: "config".to_string(),
+                    name: "Schemes".to_string(),
+                    status: CheckStatus::Pass,
+                    message: format!("{} scheme(s) configured", cfg.schemes.len()),
+                    details: None,
+                });
+            }
+
+            // Check for verify actions
+            if cfg.verify.is_empty() {
+                checks.push(DoctorCheck {
+                    category: "config".to_string(),
+                    name: "Verify actions".to_string(),
+                    status: CheckStatus::Warn,
+                    message: "No verify actions configured".to_string(),
+                    details: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    category: "config".to_string(),
+                    name: "Verify actions".to_string(),
+                    status: CheckStatus::Pass,
+                    message: format!("{} verify action(s)", cfg.verify.len()),
+                    details: None,
+                });
+            }
+
+            Some(cfg)
+        }
+        Err(e) => {
+            checks.push(DoctorCheck {
+                category: "config".to_string(),
+                name: "Repo config".to_string(),
+                status: CheckStatus::Fail,
+                message: format!("Invalid config: {}", e),
+                details: None,
+            });
+            None
+        }
+    }
+}
+
+fn check_worker_inventory(
+    inventory_path: &Option<PathBuf>,
+    checks: &mut Vec<DoctorCheck>,
+) -> Option<WorkerInventory> {
+    let result = match inventory_path {
+        Some(path) => WorkerInventory::load(path),
+        None => WorkerInventory::load_default(),
+    };
+
+    match result {
+        Ok(inv) => {
+            if inv.workers.is_empty() {
+                checks.push(DoctorCheck {
+                    category: "inventory".to_string(),
+                    name: "Worker inventory".to_string(),
+                    status: CheckStatus::Warn,
+                    message: "No workers configured".to_string(),
+                    details: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    category: "inventory".to_string(),
+                    name: "Worker inventory".to_string(),
+                    status: CheckStatus::Pass,
+                    message: format!("{} worker(s) configured", inv.workers.len()),
+                    details: Some(serde_json::json!({
+                        "workers": inv.workers.iter().map(|w| &w.name).collect::<Vec<_>>(),
+                    })),
+                });
+            }
+            Some(inv)
+        }
+        Err(e) => {
+            checks.push(DoctorCheck {
+                category: "inventory".to_string(),
+                name: "Worker inventory".to_string(),
+                status: CheckStatus::Fail,
+                message: format!("Could not load inventory: {}", e),
+                details: None,
+            });
+            None
+        }
+    }
+}
+
+fn check_worker_reachability(
+    worker: &rch_xcode_lane::WorkerEntry,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    // Build SSH command for probe
+    let mut ssh_args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+
+    if let Some(ref key_path) = worker.ssh_key_path {
+        let expanded = if key_path.starts_with("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                format!("{}/{}", home, &key_path[2..])
+            } else {
+                key_path.clone()
+            }
+        } else {
+            key_path.clone()
+        };
+        ssh_args.push("-i".to_string());
+        ssh_args.push(expanded);
+    }
+
+    if worker.port != 22 {
+        ssh_args.push("-p".to_string());
+        ssh_args.push(worker.port.to_string());
+    }
+
+    ssh_args.push(format!("{}@{}", worker.user, worker.host));
+
+    // Send probe request
+    let probe_request = RpcRequest {
+        protocol_version: 0,
+        request_id: format!("doctor-probe-{}", uuid_simple()),
+        op: rch_xcode_lane::Operation::Probe,
+        payload: serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    let request_json = match serde_json::to_string(&probe_request) {
+        Ok(json) => json,
+        Err(_) => {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}'", worker.name),
+                status: CheckStatus::Fail,
+                message: "Failed to serialize probe request".to_string(),
+                details: None,
+            });
+            return;
+        }
+    };
+
+    let start = std::time::Instant::now();
+
+    let mut child = match Command::new("ssh")
+        .args(&ssh_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}' connectivity", worker.name),
+                status: CheckStatus::Fail,
+                message: format!("Failed to spawn SSH: {}", e),
+                details: None,
+            });
+            return;
+        }
+    };
+
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = writeln!(stdin, "{}", request_json);
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = BufReader::new(stdout);
+    let mut response_line = String::new();
+
+    let read_result = reader.read_line(&mut response_line);
+    let elapsed = start.elapsed();
+
+    let status = child.wait();
+
+    match read_result {
+        Ok(0) => {
+            // No response
+            let mut stderr_content = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut stderr, &mut stderr_content);
+            }
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}' connectivity", worker.name),
+                status: CheckStatus::Fail,
+                message: format!("No response from worker ({})", worker.host),
+                details: if !stderr_content.is_empty() {
+                    Some(serde_json::json!({ "stderr": stderr_content.trim() }))
+                } else {
+                    None
+                },
+            });
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}' connectivity", worker.name),
+                status: CheckStatus::Fail,
+                message: format!("Failed to read response: {}", e),
+                details: None,
+            });
+            return;
+        }
+    }
+
+    if let Ok(exit_status) = status {
+        if !exit_status.success() {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}' connectivity", worker.name),
+                status: CheckStatus::Fail,
+                message: format!("SSH failed with exit code: {}", exit_status),
+                details: None,
+            });
+            return;
+        }
+    }
+
+    // Parse response
+    let response: serde_json::Value = match serde_json::from_str(&response_line) {
+        Ok(v) => v,
+        Err(e) => {
+            checks.push(DoctorCheck {
+                category: "worker".to_string(),
+                name: format!("Worker '{}' connectivity", worker.name),
+                status: CheckStatus::Fail,
+                message: format!("Invalid probe response: {}", e),
+                details: Some(serde_json::json!({ "raw": response_line.trim() })),
+            });
+            return;
+        }
+    };
+
+    // Connection successful
+    checks.push(DoctorCheck {
+        category: "worker".to_string(),
+        name: format!("Worker '{}' connectivity", worker.name),
+        status: CheckStatus::Pass,
+        message: format!("Reachable ({:.0}ms)", elapsed.as_millis()),
+        details: None,
+    });
+
+    // Check protocol version
+    if let Some(payload) = response.get("payload") {
+        let min_ver = payload.get("protocol_version_min").and_then(|v| v.as_u64());
+        let max_ver = payload.get("protocol_version_max").and_then(|v| v.as_u64());
+
+        if let (Some(min), Some(max)) = (min_ver, max_ver) {
+            // Current host protocol version is 1
+            let host_version = 1u64;
+            if host_version >= min && host_version <= max {
+                checks.push(DoctorCheck {
+                    category: "worker".to_string(),
+                    name: format!("Worker '{}' protocol", worker.name),
+                    status: CheckStatus::Pass,
+                    message: format!("Compatible (worker: {}-{}, host: {})", min, max, host_version),
+                    details: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    category: "worker".to_string(),
+                    name: format!("Worker '{}' protocol", worker.name),
+                    status: CheckStatus::Fail,
+                    message: format!(
+                        "Incompatible (worker: {}-{}, host: {})",
+                        min, max, host_version
+                    ),
+                    details: None,
+                });
+            }
+        }
+
+        // Check features
+        if let Some(features) = payload.get("features").and_then(|v| v.as_array()) {
+            let feature_list: Vec<&str> = features
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+
+            let required_features = ["submit", "status", "tail", "has_source", "upload_source"];
+            let missing: Vec<_> = required_features
+                .iter()
+                .filter(|f| !feature_list.contains(*f))
+                .collect();
+
+            if missing.is_empty() {
+                checks.push(DoctorCheck {
+                    category: "worker".to_string(),
+                    name: format!("Worker '{}' features", worker.name),
+                    status: CheckStatus::Pass,
+                    message: format!("{} features available", feature_list.len()),
+                    details: Some(serde_json::json!({ "features": feature_list })),
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    category: "worker".to_string(),
+                    name: format!("Worker '{}' features", worker.name),
+                    status: CheckStatus::Fail,
+                    message: format!("Missing required features: {:?}", missing),
+                    details: None,
+                });
+            }
+        }
+    }
+}
+
+fn check_xcode_availability(
+    worker: &rch_xcode_lane::WorkerEntry,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    // This would require a full probe with Xcode version checking
+    // For now, mark as skipped since we need capabilities data
+    checks.push(DoctorCheck {
+        category: "toolchain".to_string(),
+        name: format!("Worker '{}' Xcode", worker.name),
+        status: CheckStatus::Skip,
+        message: "Xcode version check requires cached capabilities".to_string(),
+        details: None,
+    });
+}
+
+fn check_destinations(cfg: &RepoConfig, checks: &mut Vec<DoctorCheck>) {
+    if cfg.destinations.is_empty() {
+        checks.push(DoctorCheck {
+            category: "destination".to_string(),
+            name: "Destinations".to_string(),
+            status: CheckStatus::Warn,
+            message: "No destinations configured (will use defaults)".to_string(),
+            details: None,
+        });
+    } else {
+        checks.push(DoctorCheck {
+            category: "destination".to_string(),
+            name: "Destinations".to_string(),
+            status: CheckStatus::Pass,
+            message: format!("{} destination(s) configured", cfg.destinations.len()),
+            details: Some(serde_json::json!({
+                "destinations": cfg.destinations,
+            })),
+        });
+    }
 }
